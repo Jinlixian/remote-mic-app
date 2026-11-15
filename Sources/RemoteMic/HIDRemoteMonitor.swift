@@ -1738,7 +1738,7 @@ final class HIDRemoteMonitor {
                 preflightProfileID,
                 button,
                 .doubleClick
-            )
+            ) || settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick)
             let preflightRecognizesLongPress = settings.configuredAction(
                 for: button,
                 trigger: .longPress,
@@ -1747,12 +1747,13 @@ final class HIDRemoteMonitor {
                 preflightProfileID,
                 button,
                 .longPress
-            )
+            ) || settings.applicationButtonOverrideExists(for: button, trigger: .longPress)
             let preflightAction = settings.action(for: button, profileID: preflightProfileID)
             // An explicit binding owns the click even when it resolves to the same arrow.
             let preflightHasSingleClickOverride = settings.configuredActionOverride?(
                 preflightProfileID, button, .singleClick
-            ) != nil || hasOverrideBinding(preflightProfileID, button, .singleClick)
+            ) != nil || hasOverrideBinding(preflightProfileID, button, .singleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .singleClick)
             let usesNativePassthrough = preflightProfileID != nil &&
                 (settings.buttonInteractionSettings(profileID: preflightProfileID).modes[button.rawValue] == nil ||
                  settings.buttonInteractionSettings(profileID: preflightProfileID).migratedRepeatButtons?.contains(button.rawValue) == true) &&
@@ -1790,7 +1791,8 @@ final class HIDRemoteMonitor {
             // Discovery may associate an existing configured device during the callback.
             let hasSingleClickOverride = settings.configuredActionOverride?(
                 profileID, button, .singleClick
-            ) != nil || hasOverrideBinding(profileID, button, .singleClick)
+            ) != nil || hasOverrideBinding(profileID, button, .singleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .singleClick)
 
             if onRuntimeButton?(profileID, button, .press, reportMilliseconds) == true {
                 if !activeDeviceIsSeized, usesNativePassthrough { eventSuppressor.arm(button: button, edge: .down) }
@@ -1800,12 +1802,14 @@ final class HIDRemoteMonitor {
                 for: button,
                 trigger: .doubleClick,
                 profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .doubleClick)
+            ).action != .disabled || hasOverrideBinding(profileID, button, .doubleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick)
             let recognizesLongPress = settings.configuredAction(
                 for: button,
                 trigger: .longPress,
                 profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .longPress)
+            ).action != .disabled || hasOverrideBinding(profileID, button, .longPress) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .longPress)
             let action = settings.action(for: button, profileID: profileID)
             if button == .back, handlePendingLayerCloseBack() {
                 continue
@@ -1869,6 +1873,8 @@ final class HIDRemoteMonitor {
                     allowsRapidPress: hasSingleClickOverride ||
                         settings.configuredActionOverride?(profileID, button, .doubleClick) != nil ||
                         settings.configuredActionOverride?(profileID, button, .longPress) != nil ||
+                        settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick) ||
+                        settings.applicationButtonOverrideExists(for: button, trigger: .longPress) ||
                         snapshot.single.allowsSingleClickRepeat ||
                         settings.allowsRapidPress(for: button, profileID: profileID),
                     frontmostBundleIdentifier: frontmostBundleIdentifier()) else {

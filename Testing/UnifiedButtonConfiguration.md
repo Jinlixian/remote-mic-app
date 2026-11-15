@@ -817,3 +817,21 @@ swift test --disable-keychain --filter 'ButtonBindingConfigurationTests|RemoteBu
 | 方案显式禁用 | 中文卡片显示「本方案禁用」，英文显示 `Disabled here`；不得只显示无法辨认的截断前缀。 |
 | 中文/英文、浅色/深色、1020×772 | 常见动作名在卡片中保持可读；英文不得只剩 `This Profile · ...` 或 `Default · No...`。继承的超长动作名允许截断，但编辑区和悬停必须给完整文案。 |
 | 800×650 离屏压力 | 只记录压力布局；生产最小窗口是 1020×772，不把该尺寸的交叠当作生产验收。 |
+
+## 按 APP 普通按键动作覆盖
+
+本用例验证 APP 档案详情里的「按 APP 设置按键」二级页。产品规则以 [按 APP 自定义普通按键动作产品规范](../feature/application-button-overrides/PRODUCT_SPEC.md) 为准。
+
+| 步骤 | 预期结果 | 失败判定 |
+| --- | --- | --- |
+| 选中一个已添加 APP，打开二级页 | 同窗口显示返回按钮、`<App 名> 的按键`、已覆盖项目数；只显示 10 个普通按键，不显示语音键、按住和键位方案 | 新增侧边栏页或独立窗口、语音键出现、普通按键缺项 |
+| 未设置任何覆盖时点一个按键的单击/双击/长按 | 显示「使用全局」和当前全局动作只读摘要；执行时与全局一致 | 二级页保存了隐式覆盖、执行结果与全局不同 |
+| 给一个 APP 的 OK 单击设置独立动作 | 目标 APP 前台第一次按下即执行独立动作；切到未配置 APP 第一次按下即执行全局动作 | 第二次才生效、切 APP 后仍执行旧 APP 动作 |
+| 同一 APP 分别覆盖单击/双击/长按 | 各手势独立生效；未覆盖手势继续继承全局 | 覆盖串到其它手势、禁用动作回退全局 |
+| 存在当前生效键位方案时设置 APP 覆盖 | APP 覆盖优先；逐项恢复全局后原键位方案立即恢复 | 私有方案动作抢先执行、恢复后仍执行 APP 覆盖 |
+| 选择「全部恢复全局」并确认/取消 | 确认后计数归零并立即回退；取消不写数据 | 取消也清空、确认后仍残留覆盖 |
+| 快速连续按、前台切换、断连、权限撤销、自定义映射关闭 | 无旧 APP 覆盖残留；前台切换取消未完成手势；全局稳定基线不退化 | 旧覆盖混入新 APP、按键卡住、需要重启才恢复 |
+| 语音键按下/释放、短句和连续会话 | 首字低延迟、正常松键尾字完整、连续会话无回退 | 语音键出现双击/长按动作、首段缺失或尾字丢失 |
+| 中英文、浅色/深色、`1067 × 760` 生产最小窗口 | 返回按钮完整可点（至少 `72 × 44pt`），中文不小于 `12pt`，无横向滚动或裁切 | 文字截断、卡片命中区域不一致、窗口几何改变 |
+
+自动化覆盖显式覆盖优先级、逐项继承、显式禁用、旧配置缺省、非法导入拒绝、清空恢复和双击/长按 preflight。离屏截图使用生产 `SettingsScreenshotRenderer`：`REMOTE_MIC_SETTINGS_SCREENSHOT_SECTION=applications`、`REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATIONS_FIXTURE=1`、`REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTONS=1`；另用 `REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_EDITOR=1` 展示动作编辑器，用 `REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_CLEAR=1` 展示页面内清空确认。截图只证明静态 UI。真实实体遥控器、iPhone/网页/Watch、第三方 APP 前台切换和语音稳定基线仍需现场验收，未完成时不得称为已通过真机验收。
