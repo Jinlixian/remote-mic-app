@@ -54,6 +54,117 @@ enum HIDReportClock {
     }
 }
 
+enum HIDReportCallbackPath {
+    case manager
+    case device
+    case simulated
+
+    var logName: String {
+        switch self {
+        case .manager: "manager"
+        case .device: "device"
+        case .simulated: "simulated"
+        }
+    }
+}
+
+struct HIDReportDeduplicationKey: Equatable {
+    let devicePointer: UInt
+    let reportID: UInt32
+    let data: Data
+}
+
+/// macOS 27 会同时投递 manager 与 device 两条回调。只要其中一个通道还能工作，
+/// 就必须让同一份物理报告只执行一次。这里按“实际到达的报告”去重，而不是按
+/// “回调是否注册”去重；注册成功但不再投递时，另一条通道仍可继续工作。
+struct HIDReportDeduplicationCache {
+    struct Entry {
+        let key: HIDReportDeduplicationKey
+        let timestampNanoseconds: UInt64
+    }
+
+    static let duplicateWindowNanoseconds: UInt64 = 50_000_000
+    private static let retentionNanoseconds: UInt64 = 250_000_000
+    private static let maximumEntries = 8
+
+    private(set) var entries: [Entry] = []
+
+    mutating func shouldDrop(
+        key: HIDReportDeduplicationKey,
+        timestampNanoseconds: UInt64
+    ) -> Bool {
+        entries.removeAll {
+            Self.distance($0.timestampNanoseconds, timestampNanoseconds) > Self.retentionNanoseconds
+        }
+        if entries.contains(where: {
+            $0.key == key &&
+                Self.distance($0.timestampNanoseconds, timestampNanoseconds) <=
+                    Self.duplicateWindowNanoseconds
+        }) {
+            return true
+        }
+        entries.append(Entry(key: key, timestampNanoseconds: timestampNanoseconds))
+        if entries.count > Self.maximumEntries {
+            entries.removeFirst(entries.count - Self.maximumEntries)
+        }
+        return false
+    }
+
+    private static func distance(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        lhs >= rhs ? lhs - rhs : rhs - lhs
+    }
+}
+
+private func processHIDReportCallback(
+    context: UnsafeMutableRawPointer?,
+    result: IOReturn,
+    sender: UnsafeMutableRawPointer?,
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    reportLength: CFIndex,
+    timeStamp: UInt64,
+    path: HIDReportCallbackPath
+) {
+    guard let context else { return }
+    let monitor = Unmanaged<HIDRemoteMonitor>.fromOpaque(context).takeUnretainedValue()
+    guard result == kIOReturnSuccess else {
+        monitor.reportCallbackRejected(
+            reason: "io_error",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    guard let sender else {
+        monitor.reportCallbackRejected(
+            reason: "missing_sender",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    guard reportLength > 0 else {
+        monitor.reportCallbackRejected(
+            reason: "empty_report",
+            result: result,
+            reportLength: reportLength,
+            path: path
+        )
+        return
+    }
+    let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
+    let data = Data(bytes: report, count: reportLength)
+    monitor.handleReport(
+        from: device,
+        reportID: reportID,
+        data: data,
+        timestampNanoseconds: HIDReportClock.uptimeNanoseconds(fromMachTime: timeStamp),
+        path: path
+    )
+}
+
 private func hidInputReportWithTimeStamp(
     context: UnsafeMutableRawPointer?,
     result: IOReturn,
@@ -64,27 +175,37 @@ private func hidInputReportWithTimeStamp(
     reportLength: CFIndex,
     timeStamp: UInt64
 ) {
-    guard let context else { return }
-    let monitor = Unmanaged<HIDRemoteMonitor>.fromOpaque(context).takeUnretainedValue()
-    guard result == kIOReturnSuccess else {
-        monitor.reportCallbackRejected(reason: "io_error", result: result, reportLength: reportLength)
-        return
-    }
-    guard let sender else {
-        monitor.reportCallbackRejected(reason: "missing_sender", result: result, reportLength: reportLength)
-        return
-    }
-    guard reportLength > 0 else {
-        monitor.reportCallbackRejected(reason: "empty_report", result: result, reportLength: reportLength)
-        return
-    }
-    let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
-    let data = Data(bytes: report, count: reportLength)
-    monitor.handleReport(
-        from: device,
+    processHIDReportCallback(
+        context: context,
+        result: result,
+        sender: sender,
         reportID: reportID,
-        data: data,
-        timestampNanoseconds: HIDReportClock.uptimeNanoseconds(fromMachTime: timeStamp)
+        report: report,
+        reportLength: reportLength,
+        timeStamp: timeStamp,
+        path: .manager
+    )
+}
+
+private func hidDeviceInputReportWithTimeStamp(
+    context: UnsafeMutableRawPointer?,
+    result: IOReturn,
+    sender: UnsafeMutableRawPointer?,
+    type: IOHIDReportType,
+    reportID: UInt32,
+    report: UnsafeMutablePointer<UInt8>,
+    reportLength: CFIndex,
+    timeStamp: UInt64
+) {
+    processHIDReportCallback(
+        context: context,
+        result: result,
+        sender: sender,
+        reportID: reportID,
+        report: report,
+        reportLength: reportLength,
+        timeStamp: timeStamp,
+        path: .device
     )
 }
 
@@ -97,6 +218,57 @@ enum HIDDeviceMatchDecision: Equatable {
     case activate(String)
     case probe
     case rejected(String)
+}
+
+/// 切换器会话期间的诊断限流。
+///
+/// 会话打开后有两处会跟着定时器节奏产生日志，而且都不封顶：
+///
+/// - 方向键连发每 100ms 成功一次就写一行，且每次成功都会重置 15 秒会话超时，
+///   所以按住不放就是一直写；
+/// - 500ms 的 HUD 状态轮询每 tick 写一行，而它的两个信号本身会在区间内来回跳
+///   （见 `startAppSwitcherLifecycle` 里的注释），单纯去重挡不住。
+///
+/// 这里把两处都收敛成「会话期间只累加计数，收尾时写一行汇总」：连发是同一次会话内的
+/// 重复动作，逐条写没有诊断价值；状态行保留真正的状态变化，并且单次会话封顶。
+struct AppSwitcherDiagnosticPolicy {
+    /// 单次会话最多写多少行状态。切换器正常只在开/关之间变一次，20 行足够覆盖
+    /// 抖动的极端情况，又不会因为信号乱跳而写满整个日志。
+    static let maximumStateLines = 20
+
+    private(set) var repeatCount = 0
+    private(set) var repeatCounts: [String: Int] = [:]
+    private(set) var statePollCount = 0
+    private(set) var stateLineCount = 0
+    private var lastStateSignature: String?
+
+    /// 连发不逐条写日志，只按按钮累加；收尾汇总里给出准确次数与分布。
+    mutating func recordRepeat(button: String) {
+        repeatCount += 1
+        repeatCounts[button, default: 0] += 1
+    }
+
+    /// 按按钮的连发分布，例如 `left:12,right:3`；没有连发时给 `none`。
+    var repeatBreakdown: String {
+        guard !repeatCounts.isEmpty else { return "none" }
+        return repeatCounts.keys.sorted()
+            .map { "\($0):\(repeatCounts[$0] ?? 0)" }
+            .joined(separator: ",")
+    }
+
+    /// 返回这一份状态是否需要写成日志。
+    ///
+    /// `signature` 只应该包含稳定信号（例如「切换器是否可见」），不要把会跳动的
+    /// 前台 App 拼进去，否则去重会退化成每 tick 一行。
+    mutating func recordStatePoll(signature: String) -> Bool {
+        statePollCount += 1
+        guard stateLineCount < Self.maximumStateLines, signature != lastStateSignature else {
+            return false
+        }
+        lastStateSignature = signature
+        stateLineCount += 1
+        return true
+    }
 }
 
 final class HIDRemoteMonitor {
@@ -148,6 +320,45 @@ final class HIDRemoteMonitor {
     private var manager: IOHIDManager?
     private let reportRunLoop = HIDReportRunLoop()
     private var scheduledReportRunLoop: CFRunLoop?
+    private struct DeviceReportRegistration {
+        let device: IOHIDDevice
+        let buffer: UnsafeMutablePointer<UInt8>
+        let length: CFIndex
+    }
+
+    private var deviceReportCallbackRunLoop: CFRunLoop?
+    private var deviceReportRegistrations: [DeviceReportRegistration] = []
+    private var deviceReportPointers = Set<UInt>()
+    private var retiredDeviceReportBuffers: [
+        (buffer: UnsafeMutablePointer<UInt8>, length: CFIndex)
+    ] = []
+    private let deviceReportLock = NSLock()
+    private let reportDeduplicationLock = NSLock()
+    private var reportDeduplicationCache = HIDReportDeduplicationCache()
+    private var pathWindowStartNanoseconds: UInt64?
+    private var lastPathReportNanoseconds: UInt64?
+    private var lastDeviceReportNanoseconds: UInt64?
+    private var pathWindowDeviceReports = 0
+    private var pathWindowManagerReports = 0
+    private var pathWindowDuplicateReports = 0
+    private var pathWindowFallbackReports = 0
+    private var consecutiveManagerOnlyWindows = 0
+    private var didLogDeviceDeliveryConfirmed = false
+    private var didLogManagerFallback = false
+    private var lastDeviceCallbackRecoveryNanoseconds: UInt64?
+    private var deviceCallbackRecoveryAttempts = 0
+    private var didLogDeviceCallbackRecoveryExhausted = false
+    private static let maximumDeviceCallbackRecoveryAttempts = 3
+
+    /// macOS 27 can stop delivering manager-level reports after the native key
+    /// mapping is written. Per-device callbacks provide another path, so keep
+    /// both and deduplicate actual deliveries. Do not drop manager reports only
+    /// because a device callback is registered: registration does not prove
+    /// that the callback is still delivering.
+    private var usesDeviceReportCallback: Bool {
+        if #available(macOS 27, *) { return true }
+        return false
+    }
     private var activeDevice: IOHIDDevice?
     private var probedDevices: [IOHIDDevice] = []
     private(set) var deviceFingerprint: String? {
@@ -219,6 +430,8 @@ final class HIDRemoteMonitor {
     private var appSwitcherArrowCheck: HIDRemoteScheduledTask?
     /// 打开切换器之后核对它是否真的出现了的任务。
     private var appSwitcherOpenProbe: HIDRemoteScheduledTask?
+    /// 本次会话的连发次数与状态行计数，收尾时汇总输出。
+    private var appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()
     /// 本次会话里是否确实见过切换器打开（用 Dock 窗口数判断）。
     private var appSwitcherObservedOpen = false
     /// 本次会话里用户是否已经用方向键选过东西。
@@ -241,6 +454,9 @@ final class HIDRemoteMonitor {
     /// 算进相邻边沿的间隔里。
     var onRuntimeButton: ((UUID?, RemoteButton, RemoteButtonPhase, Int) -> Bool)?
     var claimsRuntimeButton: ((UUID?, RemoteButton) -> Bool)?
+    /// 设备已匹配、但原生键映射校验没有通过。绝大多数是 HID 服务尚未枚举出来，
+    /// 重连后重试一次即可；由上层决定重试节奏，监视器本身不排程。
+    var onNativeMappingVerificationFailed: (() -> Void)?
     var onInputReset: ((UUID?) -> Void)?
     var onInternalAction: ((UUID?, ButtonAction) -> Void)?
 
@@ -455,6 +671,7 @@ final class HIDRemoteMonitor {
         IOHIDManagerSetDeviceMatching(manager, matching)
 
         let context = Unmanaged.passUnretained(self).toOpaque()
+        let usesDeviceReportCallback = self.usesDeviceReportCallback
         IOHIDManagerRegisterDeviceMatchingCallback(manager, hidDeviceMatched, context)
         IOHIDManagerRegisterDeviceRemovalCallback(manager, hidDeviceRemoved, context)
         IOHIDManagerRegisterInputReportWithTimeStampCallback(
@@ -473,6 +690,9 @@ final class HIDRemoteMonitor {
             dedicatedReportRunLoop == nil
                 ? "HID REPORT runloop mode=main reason=dedicated_thread_unavailable"
                 : "HID REPORT runloop mode=dedicated thread=sayall.hid.reports"
+        )
+        AppLogger.shared.write(
+            "HID REPORT path=\(usesDeviceReportCallback ? "device+manager" : "manager")"
         )
         IOHIDManagerScheduleWithRunLoop(
             manager,
@@ -533,6 +753,7 @@ final class HIDRemoteMonitor {
         resetInputState()
         nativeKeysNeutralized = false
         if ownsEventSuppressor { eventSuppressor.stop() }
+        unregisterAllDeviceReportCallbacks()
         probedDevices.forEach {
             IOHIDDeviceClose($0, IOOptionBits(kIOHIDOptionsTypeNone))
         }
@@ -553,7 +774,145 @@ final class HIDRemoteMonitor {
             self.manager = nil
         }
         scheduledReportRunLoop = nil
-        reportRunLoop.stop()
+        if reportRunLoop.stop() {
+            releaseRetiredDeviceReportBuffers()
+        }
+    }
+
+    deinit {
+        if reportRunLoop.stop(waitTimeout: 0.5) {
+            releaseRetiredDeviceReportBuffers()
+        }
+    }
+
+    private static func deviceReportPointer(_ device: IOHIDDevice) -> UInt {
+        UInt(bitPattern: Unmanaged.passUnretained(device).toOpaque())
+    }
+
+    /// macOS 27 needs a per-device callback because the manager-level callback
+    /// stops delivering after the native key mapping is written. The manager
+    /// callback remains registered for devices that cannot be opened directly.
+    private func registerDeviceReportCallbackIfNeeded(_ device: IOHIDDevice) {
+        guard usesDeviceReportCallback else { return }
+        let pointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        guard !deviceReportPointers.contains(pointer) else {
+            deviceReportLock.unlock()
+            return
+        }
+        deviceReportPointers.insert(pointer)
+        let runLoop = deviceReportCallbackRunLoop
+            ?? scheduledReportRunLoop
+            ?? RunLoop.main.getCFRunLoop()
+        deviceReportCallbackRunLoop = runLoop
+        let maxLength = (IOHIDDeviceGetProperty(
+            device,
+            kIOHIDMaxInputReportSizeKey as CFString
+        ) as? NSNumber)?.intValue ?? 4_096
+        let length = CFIndex(max(64, maxLength))
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(length))
+        buffer.initialize(repeating: 0, count: Int(length))
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+            device,
+            buffer,
+            length,
+            hidDeviceInputReportWithTimeStamp,
+            Unmanaged.passUnretained(self).toOpaque()
+        )
+        IOHIDDeviceScheduleWithRunLoop(
+            device,
+            runLoop,
+            CFRunLoopMode.commonModes.rawValue
+        )
+        deviceReportRegistrations.append(
+            DeviceReportRegistration(device: device, buffer: buffer, length: length)
+        )
+        deviceReportLock.unlock()
+        diagnosticLogger("HID REPORT device_callback registered path=device")
+    }
+
+    @discardableResult
+    private func unregisterDeviceReportCallback(_ device: IOHIDDevice) -> Bool {
+        let pointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        guard let index = deviceReportRegistrations.firstIndex(where: {
+            Self.deviceReportPointer($0.device) == pointer
+        }) else {
+            deviceReportLock.unlock()
+            return false
+        }
+        let registration = deviceReportRegistrations[index]
+        deviceReportLock.unlock()
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+            registration.device,
+            registration.buffer,
+            registration.length,
+            nil,
+            nil
+        )
+        if let runLoop = deviceReportCallbackRunLoop {
+            IOHIDDeviceUnscheduleFromRunLoop(
+                registration.device,
+                runLoop,
+                CFRunLoopMode.commonModes.rawValue
+            )
+        }
+        deviceReportLock.lock()
+        if let currentIndex = deviceReportRegistrations.firstIndex(where: {
+            Self.deviceReportPointer($0.device) == pointer
+        }) {
+            let current = deviceReportRegistrations.remove(at: currentIndex)
+            deviceReportPointers.remove(pointer)
+            // The report thread may still be inside a callback. Keep the
+            // buffer alive until the run loop has stopped.
+            retiredDeviceReportBuffers.append((current.buffer, current.length))
+        }
+        deviceReportLock.unlock()
+        return true
+    }
+
+    private func unregisterAllDeviceReportCallbacks() {
+        deviceReportLock.lock()
+        let registrations = deviceReportRegistrations
+        deviceReportRegistrations.removeAll()
+        deviceReportLock.unlock()
+        for registration in registrations {
+            IOHIDDeviceRegisterInputReportWithTimeStampCallback(
+                registration.device,
+                registration.buffer,
+                registration.length,
+                nil,
+                nil
+            )
+            if let runLoop = deviceReportCallbackRunLoop {
+                IOHIDDeviceUnscheduleFromRunLoop(
+                    registration.device,
+                    runLoop,
+                    CFRunLoopMode.commonModes.rawValue
+                )
+            }
+        }
+        // Keep the device pointers until callbacks are unregistered so a
+        // manager report in flight during shutdown cannot run a second time.
+        deviceReportLock.lock()
+        for registration in registrations {
+            let pointer = Self.deviceReportPointer(registration.device)
+            deviceReportPointers.remove(pointer)
+            retiredDeviceReportBuffers.append((registration.buffer, registration.length))
+        }
+        deviceReportLock.unlock()
+        deviceReportCallbackRunLoop = nil
+    }
+
+    private func releaseRetiredDeviceReportBuffers() {
+        deviceReportLock.lock()
+        let buffers = retiredDeviceReportBuffers
+        retiredDeviceReportBuffers.removeAll()
+        deviceReportLock.unlock()
+        for entry in buffers {
+            entry.buffer.deinitialize(count: Int(entry.length))
+            entry.buffer.deallocate()
+        }
     }
 
     /// 设备匹配回调在 HID 报告线程上执行，设置、界面和状态必须回到主线程。
@@ -629,6 +988,7 @@ final class HIDRemoteMonitor {
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             return
         }
+        registerDeviceReportCallbackIfNeeded(device)
         probedDevices.append(device)
         diagnosticLogger("HID DEVICE probing mode=monitored")
     }
@@ -640,6 +1000,7 @@ final class HIDRemoteMonitor {
         guard prepareNativeKeyMapping() else { return false }
         let selectedDevice = probedDevices.remove(at: selectedIndex)
         probedDevices.forEach {
+            unregisterDeviceReportCallback($0)
             IOHIDDeviceClose($0, IOOptionBits(kIOHIDOptionsTypeNone))
         }
         probedDevices.removeAll()
@@ -670,6 +1031,7 @@ final class HIDRemoteMonitor {
                 IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
                 return false
             }
+            registerDeviceReportCallbackIfNeeded(device)
             activeDevice = device
             deviceFingerprint = fingerprint
             activeDeviceIsSeized = true
@@ -705,6 +1067,9 @@ final class HIDRemoteMonitor {
                 IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             }
             return false
+        }
+        if monitorResult == kIOReturnSuccess {
+            registerDeviceReportCallbackIfNeeded(device)
         }
         activeDevice = device
         deviceFingerprint = fingerprint
@@ -756,6 +1121,7 @@ final class HIDRemoteMonitor {
 
     private func deviceDidRemoveOnMain(device: IOHIDDevice) {
         if let activeDevice, CFEqual(activeDevice, device) {
+            unregisterDeviceReportCallback(activeDevice)
             IOHIDDeviceClose(activeDevice, IOOptionBits(kIOHIDOptionsTypeNone))
             self.activeDevice = nil
             deviceFingerprint = nil
@@ -770,6 +1136,7 @@ final class HIDRemoteMonitor {
             return
         }
         let probedDevice = probedDevices.remove(at: probeIndex)
+        unregisterDeviceReportCallback(probedDevice)
         IOHIDDeviceClose(probedDevice, IOOptionBits(kIOHIDOptionsTypeNone))
         diagnosticLogger("HID DEVICE probe_removed")
     }
@@ -778,13 +1145,38 @@ final class HIDRemoteMonitor {
         from device: IOHIDDevice,
         reportID: UInt32,
         data: Data,
-        timestampNanoseconds: UInt64? = nil
+        timestampNanoseconds: UInt64? = nil,
+        path: HIDReportCallbackPath
     ) {
+        // macOS 27 同时投递 manager 与 device 回调。按实际到达的报告去重：
+        // 注册成功但不再投递的通道不能阻止另一条通道继续工作。
+        let reportUptime = timestampNanoseconds ?? monotonicNow()
+        let diagnosticsNow = monotonicNow()
+        let devicePointer = Self.deviceReportPointer(device)
+        deviceReportLock.lock()
+        let hasDeviceCallback = deviceReportPointers.contains(devicePointer)
+        deviceReportLock.unlock()
+        // 只有已经为这个设备注册 device 回调的 monitor 才需要双路径去重和健康诊断。
+        // 其他 monitor 只走 manager 通道，不能把它们误报成 device_silent。
+        if path != .simulated, hasDeviceCallback {
+            let key = HIDReportDeduplicationKey(
+                devicePointer: devicePointer,
+                reportID: reportID,
+                data: data
+            )
+            reportDeduplicationLock.lock()
+            let duplicate = reportDeduplicationCache.shouldDrop(
+                key: key,
+                timestampNanoseconds: diagnosticsNow
+            )
+            reportDeduplicationLock.unlock()
+            recordPathReport(path: path, duplicate: duplicate, nowNanoseconds: diagnosticsNow)
+            if duplicate { return }
+        }
         // 登记必须在本线程立刻完成：系统原生音量事件可能早于主线程处理报告。
         prearmManagedNativeEvents(from: device, reportID: reportID, data: data)
         // 报告时刻在进入主线程之前定下来：主线程一旦排队，处理时刻就不再代表
         // 用户真正按下或松开的时间。
-        let reportUptime = timestampNanoseconds ?? monotonicNow()
         let retained = Unmanaged.passRetained(device)
         DispatchQueue.main.async { [weak self] in
             guard let self else {
@@ -795,8 +1187,151 @@ final class HIDRemoteMonitor {
                 from: retained.takeRetainedValue(),
                 reportID: reportID,
                 data: data,
-                timestampNanoseconds: reportUptime
+                timestampNanoseconds: reportUptime,
+                path: path
             )
+        }
+    }
+
+    private func recordPathReport(
+        path: HIDReportCallbackPath,
+        duplicate: Bool,
+        nowNanoseconds: UInt64
+    ) {
+        guard path != .simulated else { return }
+        if let last = lastPathReportNanoseconds, nowNanoseconds >= last,
+           nowNanoseconds - last > 10_000_000_000 {
+            resetPathWindow(nowNanoseconds: nowNanoseconds)
+        }
+        if pathWindowStartNanoseconds == nil {
+            pathWindowStartNanoseconds = nowNanoseconds
+        }
+        lastPathReportNanoseconds = nowNanoseconds
+
+        switch path {
+        case .device:
+            pathWindowDeviceReports += 1
+            lastDeviceReportNanoseconds = nowNanoseconds
+            if !didLogDeviceDeliveryConfirmed {
+                didLogDeviceDeliveryConfirmed = true
+                if !didLogManagerFallback {
+                    diagnosticLogger("HID REPORT PATH device_delivery=confirmed")
+                }
+            }
+            if didLogManagerFallback {
+                didLogManagerFallback = false
+                diagnosticLogger("HID REPORT PATH device_delivery=recovered")
+            }
+        case .manager:
+            pathWindowManagerReports += 1
+        case .simulated:
+            return
+        }
+
+        if duplicate {
+            pathWindowDuplicateReports += 1
+        } else if path == .manager {
+            let deviceIsRecent = lastDeviceReportNanoseconds.map {
+                nowNanoseconds >= $0 && nowNanoseconds - $0 <= 2_000_000_000
+            } ?? false
+            if !deviceIsRecent {
+                pathWindowFallbackReports += 1
+                if !didLogManagerFallback {
+                    didLogManagerFallback = true
+                    diagnosticLogger("HID REPORT PATH fallback=manager reason=device_silent")
+                }
+            }
+        }
+        logPathWindowIfNeeded(nowNanoseconds: nowNanoseconds)
+    }
+
+    private func resetPathWindow(nowNanoseconds: UInt64) {
+        pathWindowStartNanoseconds = nowNanoseconds
+        pathWindowDeviceReports = 0
+        pathWindowManagerReports = 0
+        pathWindowDuplicateReports = 0
+        pathWindowFallbackReports = 0
+    }
+
+    /// 每 10 秒最多一行汇总，避免逐报告记录路径造成日志爆炸。
+    private func logPathWindowIfNeeded(nowNanoseconds: UInt64) {
+        guard let start = pathWindowStartNanoseconds,
+              nowNanoseconds >= start,
+              nowNanoseconds - start >= 10_000_000_000
+        else { return }
+        let deviceReports = pathWindowDeviceReports
+        let managerReports = pathWindowManagerReports
+        let duplicateReports = pathWindowDuplicateReports
+        let fallbackReports = pathWindowFallbackReports
+        let windowMilliseconds = Int((nowNanoseconds - start) / 1_000_000)
+        diagnosticLogger(
+            "HID REPORT PATH WINDOW window_ms=\(windowMilliseconds) " +
+                "device_reports=\(deviceReports) manager_reports=\(managerReports) " +
+                "duplicates=\(duplicateReports) manager_fallback=\(fallbackReports) " +
+                "device_healthy=\(deviceReports > 0)"
+        )
+        if managerReports > 0, deviceReports == 0 {
+            consecutiveManagerOnlyWindows += 1
+        } else {
+            consecutiveManagerOnlyWindows = 0
+        }
+        resetPathWindow(nowNanoseconds: nowNanoseconds)
+        if consecutiveManagerOnlyWindows >= 2 {
+            requestDeviceCallbackRecovery(
+                nowNanoseconds: nowNanoseconds,
+                managerReports: managerReports
+            )
+        }
+    }
+
+    /// manager 仍在投递、device 连续两个窗口没有投递时，重挂一次 device 回调。
+    /// 60 秒内最多尝试一次；即使重挂失败，manager 通道仍会继续处理报告。
+    private func requestDeviceCallbackRecovery(
+        nowNanoseconds: UInt64,
+        managerReports: Int
+    ) {
+        if let last = lastDeviceCallbackRecoveryNanoseconds,
+           nowNanoseconds >= last,
+           nowNanoseconds - last < 60_000_000_000 {
+            return
+        }
+        if deviceCallbackRecoveryAttempts >= Self.maximumDeviceCallbackRecoveryAttempts {
+            if !didLogDeviceCallbackRecoveryExhausted {
+                didLogDeviceCallbackRecoveryExhausted = true
+                diagnosticLogger(
+                    "HID REPORT PATH watchdog result=exhausted reason=device_silent " +
+                        "attempts=\(deviceCallbackRecoveryAttempts)"
+                )
+            }
+            return
+        }
+        lastDeviceCallbackRecoveryNanoseconds = nowNanoseconds
+        consecutiveManagerOnlyWindows = 0
+        guard usesDeviceReportCallback else { return }
+        deviceCallbackRecoveryAttempts += 1
+        diagnosticLogger(
+            "HID REPORT PATH watchdog result=candidate reason=device_silent " +
+                "attempt=\(deviceCallbackRecoveryAttempts) manager_reports=\(managerReports)"
+        )
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.usesDeviceReportCallback, let device = self.activeDevice else {
+                self?.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=unavailable reason=no_active_device"
+                )
+                return
+            }
+            let removed = self.unregisterDeviceReportCallback(device)
+            self.deviceReportCallbackRunLoop = nil
+            if removed {
+                self.registerDeviceReportCallbackIfNeeded(device)
+                self.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=callback_reregistered reason=device_silent"
+                )
+            } else {
+                self.diagnosticLogger(
+                    "HID REPORT PATH watchdog result=skipped reason=registration_missing"
+                )
+            }
         }
     }
 
@@ -917,14 +1452,15 @@ final class HIDRemoteMonitor {
         from device: IOHIDDevice,
         reportID: UInt32,
         data: Data,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
         guard manager != nil else {
-            diagnosticLogger("HID REPORT rejected reason=monitor_inactive")
+            diagnosticLogger("HID REPORT rejected reason=monitor_inactive path=\(path.logName)")
             return
         }
         guard settings.customMappingEnabled || backOnlyMode else {
-            diagnosticLogger("HID REPORT rejected reason=mapping_disabled")
+            diagnosticLogger("HID REPORT rejected reason=mapping_disabled path=\(path.logName)")
             return
         }
         guard Self.isLocationAllowed(
@@ -935,7 +1471,7 @@ final class HIDRemoteMonitor {
                 "HID REPORT rejected reason=unsafe_location " +
                     "report_id=\(reportID) bytes=\(data.count) " +
                     "has_location=\(Self.locationID(for: device) != nil) " +
-                    "allowlist_configured=\(allowedLocationIDs != nil)"
+                    "allowlist_configured=\(allowedLocationIDs != nil) path=\(path.logName)"
             )
             return
         }
@@ -950,18 +1486,24 @@ final class HIDRemoteMonitor {
         case let .accepted(value):
             fingerprint = value
         case let .rejected(reason):
-            diagnosticLogger("HID REPORT rejected reason=\(reason)")
+            diagnosticLogger("HID REPORT rejected reason=\(reason) path=\(path.logName)")
             return
         }
         let discoveryUsages: Set<UInt16>?
         if deviceFingerprint == nil, targetFingerprint == nil {
-            guard let usages = parsedUsages(reportID: reportID, data: data, source: "device") else {
+            guard let usages = parsedUsages(
+                reportID: reportID,
+                data: data,
+                source: "device",
+                path: path
+            ) else {
                 return
             }
             guard Self.shouldPromoteDiscoveryReport(usages: usages) else {
                 diagnosticLogger(
                     "HID REPORT deferred reason=discovery_no_known_button source=device " +
-                        "id=\(reportID) bytes=\(data.count) usage_count=\(usages.count)"
+                        "id=\(reportID) bytes=\(data.count) usage_count=\(usages.count) " +
+                        "path=\(path.logName)"
                 )
                 return
             }
@@ -976,13 +1518,17 @@ final class HIDRemoteMonitor {
                     fingerprint: fingerprint,
                     allowManagerFallback: true
                 ) else {
-                    diagnosticLogger("HID REPORT rejected reason=device_activation_failed")
+                    diagnosticLogger(
+                        "HID REPORT rejected reason=device_activation_failed path=\(path.logName)"
+                    )
                     return
                 }
             }
         }
         guard runtimePermissionsAreValid() else {
-            diagnosticLogger("HID REPORT rejected reason=runtime_permission_revoked")
+            diagnosticLogger(
+                "HID REPORT rejected reason=runtime_permission_revoked path=\(path.logName)"
+            )
             releaseForRevokedPermissions()
             return
         }
@@ -992,14 +1538,16 @@ final class HIDRemoteMonitor {
                 data: data,
                 source: "device",
                 usages: discoveryUsages,
-                timestampNanoseconds: timestampNanoseconds
+                timestampNanoseconds: timestampNanoseconds,
+                path: path
             )
         } else {
             parseAndProcess(
                 reportID: reportID,
                 data: data,
                 source: "device",
-                timestampNanoseconds: timestampNanoseconds
+                timestampNanoseconds: timestampNanoseconds,
+                path: path
             )
         }
     }
@@ -1007,11 +1555,12 @@ final class HIDRemoteMonitor {
     fileprivate func reportCallbackRejected(
         reason: String,
         result: IOReturn,
-        reportLength: CFIndex
+        reportLength: CFIndex,
+        path: HIDReportCallbackPath
     ) {
         diagnosticLogger(
             "HID REPORT callback_rejected reason=\(reason) result=\(result) " +
-                "bytes=\(max(0, reportLength))"
+                "bytes=\(max(0, reportLength)) path=\(path.logName)"
         )
     }
 
@@ -1041,18 +1590,24 @@ final class HIDRemoteMonitor {
         timestampNanoseconds: UInt64?
     ) {
         guard settings.customMappingEnabled || backOnlyMode else {
-            diagnosticLogger("HID REPORT rejected reason=mapping_disabled source=simulated")
+            diagnosticLogger(
+                "HID REPORT rejected reason=mapping_disabled source=simulated path=simulated"
+            )
             return
         }
         guard runtimePermissionsAreValid() else {
-            diagnosticLogger("HID REPORT rejected reason=runtime_permission_revoked source=simulated")
+            diagnosticLogger(
+                "HID REPORT rejected reason=runtime_permission_revoked " +
+                    "source=simulated path=simulated"
+            )
             return
         }
         parseAndProcess(
             reportID: reportID,
             data: data,
             source: "simulated",
-            timestampNanoseconds: timestampNanoseconds ?? monotonicNow()
+            timestampNanoseconds: timestampNanoseconds ?? monotonicNow(),
+            path: .simulated
         )
     }
 
@@ -1067,9 +1622,15 @@ final class HIDRemoteMonitor {
         reportID: UInt32,
         data: Data,
         source: String,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
-        guard let usages = parsedUsages(reportID: reportID, data: data, source: source) else {
+        guard let usages = parsedUsages(
+            reportID: reportID,
+            data: data,
+            source: source,
+            path: path
+        ) else {
             return
         }
         processParsedReport(
@@ -1077,15 +1638,21 @@ final class HIDRemoteMonitor {
             data: data,
             source: source,
             usages: usages,
-            timestampNanoseconds: timestampNanoseconds
+            timestampNanoseconds: timestampNanoseconds,
+            path: path
         )
     }
 
-    private func parsedUsages(reportID: UInt32, data: Data, source: String) -> Set<UInt16>? {
+    private func parsedUsages(
+        reportID: UInt32,
+        data: Data,
+        source: String,
+        path: HIDReportCallbackPath
+    ) -> Set<UInt16>? {
         guard let usages = RemoteHIDReportParser.usages(reportID: reportID, data: data) else {
             diagnosticLogger(
                 "HID REPORT rejected reason=parse_failed source=\(source) " +
-                    "id=\(reportID) bytes=\(data.count)"
+                    "id=\(reportID) bytes=\(data.count) path=\(path.logName)"
             )
             return nil
         }
@@ -1097,7 +1664,8 @@ final class HIDRemoteMonitor {
         data: Data,
         source: String,
         usages: Set<UInt16>,
-        timestampNanoseconds: UInt64
+        timestampNanoseconds: UInt64,
+        path: HIDReportCallbackPath
     ) {
         // TV and volume are always managed, unlike intentional left/right passthrough.
         // Register before diagnostics, UI callbacks and configuration lookups.
@@ -1111,7 +1679,8 @@ final class HIDRemoteMonitor {
         }
         diagnosticLogger(
             "HID REPORT accepted source=\(source) id=\(reportID) bytes=\(data.count) " +
-                "usage_count=\(usages.count) buttons=\(Self.buttonList(for: usages))"
+                "usage_count=\(usages.count) buttons=\(Self.buttonList(for: usages)) " +
+                "path=\(path.logName)"
         )
         if backOnlyMode {
             processBackOnly(usages: usages.intersection([RemoteButton.back.hidUsage]))
@@ -1169,7 +1738,7 @@ final class HIDRemoteMonitor {
                 preflightProfileID,
                 button,
                 .doubleClick
-            )
+            ) || settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick)
             let preflightRecognizesLongPress = settings.configuredAction(
                 for: button,
                 trigger: .longPress,
@@ -1178,12 +1747,13 @@ final class HIDRemoteMonitor {
                 preflightProfileID,
                 button,
                 .longPress
-            )
+            ) || settings.applicationButtonOverrideExists(for: button, trigger: .longPress)
             let preflightAction = settings.action(for: button, profileID: preflightProfileID)
             // An explicit binding owns the click even when it resolves to the same arrow.
             let preflightHasSingleClickOverride = settings.configuredActionOverride?(
                 preflightProfileID, button, .singleClick
-            ) != nil || hasOverrideBinding(preflightProfileID, button, .singleClick)
+            ) != nil || hasOverrideBinding(preflightProfileID, button, .singleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .singleClick)
             let usesNativePassthrough = preflightProfileID != nil &&
                 (settings.buttonInteractionSettings(profileID: preflightProfileID).modes[button.rawValue] == nil ||
                  settings.buttonInteractionSettings(profileID: preflightProfileID).migratedRepeatButtons?.contains(button.rawValue) == true) &&
@@ -1221,7 +1791,8 @@ final class HIDRemoteMonitor {
             // Discovery may associate an existing configured device during the callback.
             let hasSingleClickOverride = settings.configuredActionOverride?(
                 profileID, button, .singleClick
-            ) != nil || hasOverrideBinding(profileID, button, .singleClick)
+            ) != nil || hasOverrideBinding(profileID, button, .singleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .singleClick)
 
             if onRuntimeButton?(profileID, button, .press, reportMilliseconds) == true {
                 if !activeDeviceIsSeized, usesNativePassthrough { eventSuppressor.arm(button: button, edge: .down) }
@@ -1231,12 +1802,14 @@ final class HIDRemoteMonitor {
                 for: button,
                 trigger: .doubleClick,
                 profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .doubleClick)
+            ).action != .disabled || hasOverrideBinding(profileID, button, .doubleClick) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick)
             let recognizesLongPress = settings.configuredAction(
                 for: button,
                 trigger: .longPress,
                 profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .longPress)
+            ).action != .disabled || hasOverrideBinding(profileID, button, .longPress) ||
+                settings.applicationButtonOverrideExists(for: button, trigger: .longPress)
             let action = settings.action(for: button, profileID: profileID)
             if button == .back, handlePendingLayerCloseBack() {
                 continue
@@ -1300,6 +1873,8 @@ final class HIDRemoteMonitor {
                     allowsRapidPress: hasSingleClickOverride ||
                         settings.configuredActionOverride?(profileID, button, .doubleClick) != nil ||
                         settings.configuredActionOverride?(profileID, button, .longPress) != nil ||
+                        settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick) ||
+                        settings.applicationButtonOverrideExists(for: button, trigger: .longPress) ||
                         snapshot.single.allowsSingleClickRepeat ||
                         settings.allowsRapidPress(for: button, profileID: profileID),
                     frontmostBundleIdentifier: frontmostBundleIdentifier()) else {
@@ -2157,9 +2732,7 @@ final class HIDRemoteMonitor {
                 self.finishAppSwitcherLifecycle(reason: "navigate_failed", confirmed: false)
                 return
             }
-            self.diagnosticLogger(
-                "HID APP SWITCHER button=\(button.rawValue) phase=repeat success=true"
-            )
+            self.appSwitcherDiagnostics.recordRepeat(button: button.rawValue)
             self.scheduleAppSwitcherTimeout()
         }
         repeatTimers[usage] = timer
@@ -2183,6 +2756,7 @@ final class HIDRemoteMonitor {
         appSwitcherObservedOpen = false
         appSwitcherReopenCount = 0
         appSwitcherHasNavigated = false
+        appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()
         installAppSwitcherDismissObserver()
         appSwitcherFrontmostMonitor = scheduler.schedule(
             afterMilliseconds: HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds,
@@ -2203,12 +2777,21 @@ final class HIDRemoteMonitor {
             let state = self.appSwitcherHudState()
             let dockWindows = self.appSwitcherDockWindowCount()
             let baseline = self.appSwitcherDockWindowBaseline ?? -1
-            self.diagnosticLogger(
-                "HID APP SWITCHER switcher_state ax=\(state.logLabel) " +
-                    "dock_windows=\(dockWindows) " +
-                    "baseline=\(baseline) " +
-                    "front=\(self.frontmostBundleIdentifier() ?? "-")"
-            )
+            // 只在稳定信号真的变化时写一行。前台 App 不参与判定：它在“高亮 App”
+            // 和“我们自己的菜单栏 App”之间来回跳，拼进签名等于每 tick 一行。
+            let relation = dockWindows > baseline
+                ? "above"
+                : (dockWindows == baseline ? "at" : "below")
+            if self.appSwitcherDiagnostics.recordStatePoll(
+                signature: "\(state.logLabel)|\(relation)"
+            ) {
+                self.diagnosticLogger(
+                    "HID APP SWITCHER switcher_state ax=\(state.logLabel) " +
+                        "dock_windows=\(dockWindows) " +
+                        "baseline=\(baseline) " +
+                        "front=\(self.frontmostBundleIdentifier() ?? "-")"
+                )
+            }
             // 见过切换器打开、之后又不见了：说明它被系统自己关掉了
             // （部分系统上原生键码或切换器自身行为会关掉它）。
             // 补发一次 Tab 把它拉回来，让“切换器定住”这件事成立。
@@ -2350,7 +2933,11 @@ final class HIDRemoteMonitor {
             _ = appSwitcherSession.cancel(dismissSwitcher: !switcherAlreadyDismissed)
         }
         diagnosticLogger(
-            "HID APP SWITCHER ended reason=\(reason) confirmed=\(confirmed)"
+            "HID APP SWITCHER ended reason=\(reason) confirmed=\(confirmed) " +
+                "repeat_count=\(appSwitcherDiagnostics.repeatCount) " +
+                "repeat_buttons=\(appSwitcherDiagnostics.repeatBreakdown) " +
+                "state_polls=\(appSwitcherDiagnostics.statePollCount) " +
+                "state_lines=\(appSwitcherDiagnostics.stateLineCount)"
         )
         if confirmed {
             let origin = appSwitcherOriginBundleIdentifier
@@ -2543,6 +3130,10 @@ final class HIDRemoteMonitor {
         guard prepareNativeKeys() else {
             updateStatus(LocalizedMessage("button_mapping.error.native_mapping_failed"))
             diagnosticLogger("HID DEVICE rejected reason=native_mapping_not_verified")
+            // 设备匹配先于 HID 服务可枚举是重连时的常态：`RemoteNativeKeyMapper` 的
+            // `prepare()` 因此写成「每次设备激活重新枚举」，但校验失败后没有任何重试，
+            // 于是一次 `reason=no_service` 就让设备永久不被接管。
+            onNativeMappingVerificationFailed?()
             return false
         }
         nativeKeysNeutralized = true

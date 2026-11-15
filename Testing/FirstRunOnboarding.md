@@ -2,6 +2,21 @@
 
 > 执行本手册或修改 Onboarding 前，先完整阅读跨平台产品规范 [`feature/first-run-onboarding/PRODUCT_SPEC.md`](../feature/first-run-onboarding/PRODUCT_SPEC.md) 和 [macOS 平台适配](../feature/first-run-onboarding/platform-macos.md)。未来 Windows 测试应从同一产品规范出发，并使用 [Windows 平台适配](../feature/first-run-onboarding/platform-windows.md) 建立独立测试手册。
 
+## 欢迎页隐藏 AI 配置提示入口（2026-11-15）
+
+适用版本为包含本修改的 `main` 或对应候选；验证分支为 `codex/hide-onboarding-ai-prompt-20261115`。本次只隐藏欢迎页底部的“让 AI 工具帮我配置”按钮，不改无屏配置命令、提示词生成逻辑、步骤顺序、完成门禁、持久化或语音链路。影响分类为局部 UI 变化。
+
+1. 使用生产 `OnboardingView` 离屏入口分别生成中文、英文、浅色和深色的欢迎页。预期：`01-welcome.png` 底部只有“开始设置”主按钮，不显示“让 AI 工具帮我配置”、复制成功或复制失败文案，也不留下空白按钮位。
+2. 在真实窗口进入欢迎页，按 Tab 检查可聚焦控件。预期：只能聚焦“开始设置”；不存在隐藏的 AI 配置按钮，焦点顺序和窗口几何不变。
+3. 从欢迎页进入控制设备页，再返回欢迎页。预期：AI 配置入口仍不显示；返回、步骤进度和恢复位置保持原行为。
+4. 运行 `swift test --disable-keychain --filter OnboardingFlowTests` 和生产离屏控件回归。预期：欢迎页可交互控件集合只有 `continue`；无屏配置命令、提示词生成和原有步骤门禁测试仍通过。
+
+失败判定：欢迎页仍显示 AI 配置入口、出现空白按钮位、残留复制成功或失败提示、键盘焦点落到不可见控件，或步骤导航、门禁和持久化发生变化，均判定失败。
+
+验证范围：自动化覆盖欢迎页可交互控件集合与既有配置门禁；离屏截图覆盖中英文、浅色和深色的欢迎页布局。真实窗口键盘操作和外部 AI 工具对提示词的实际完成能力仍须现场验收；本次隐藏入口不代表提示词质量已经通过验收。
+
+本轮结果：`SAYALL_PRIVATE_PLATFORM_MODE=public swift test --disable-keychain --filter OnboardingFlowTests` 通过 111 项测试，`swift build --disable-keychain` 构建通过。生产离屏入口生成中文浅色、中文深色、英文浅色和英文深色欢迎页，均为 PNG、2040 × 1600；逐张查看确认底部只保留右侧“开始设置”，没有 AI 配置入口、复制结果文案、空白按钮位、裁切或错位。四张图按中文浅色、中文深色、英文浅色、英文深色顺序的 SHA-256 分别为 `75f718f5518c0d1c7c2cb25eb80bbab492d16182aa22d086daa4ada4afe3116b`、`916df2367362ec5c029d7815547eadb3eeee9a24fc9789bbe2db095c10955ce8`、`93004a9c8e4797aad61ebfdcb1085aa8b50e830119a115f37bae47adef57ce1a` 和 `f7c19c58f4dd1c68b1d6d9adba18e0e51982c8b025f0464ca0be273c560c19a4`，原始文件保存在仓库外持久目录 `.screenshot-workdir/onboarding-hide-ai-prompt-20261115/`（位于本仓库父目录）。真实窗口 Tab 焦点、返回恢复和外部 AI 工具实际完成能力未在本轮验证；本次只证明入口已隐藏，不代表提示词质量通过验收。
+
 ## 附近连接等待的系统睡眠回归（2026-11-12）
 
 适用版本为包含本修复的 `main` 或对应版本 / Build；当前真机记录为 build 352。影响分类为连接生命周期变化。自动化验证附近资源暂停/恢复，并运行现有引导流程回归。生产完成门槛保持原定义。
@@ -656,7 +671,7 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 
 流程自动化必须分为两层：进程内离屏交互和真实环境验收。进程内层复用生产 `OnboardingView`，在屏幕外的 `NSWindow` 中加载页面，并通过仅供测试注入的 action probe 驱动生产 `Button`、`Link`、`Toggle` action，检查状态更新和导航断言；它不使用屏幕坐标、`CGEvent` 或外部辅助功能点击，因此锁屏、屏幕熄灭或当前用户未登录都不应阻止这层测试。`真实环境` 仍记录需要权限、遥控器、手机或第三方工具的结果；它不能用离屏测试替代。
 
-当前 PR 的 `OnboardingFlowTests.offscreenOnboardingRegistersAndDrivesEveryInteractiveControl` 逐页覆盖生产 Onboarding 中的所有可点击控件：欢迎、AI 配置提示复制、返回/继续、实体设备、更多控制方式展开、备用来源、按住/按一次、五个输入工具、权限行、音频设备、语音测试确认、重新打开、失败恢复、诊断复制和完成动作。系统设置、真实硬件、第三方 App 启动结果和真实文字上屏仍按下表进入现场层。
+当前 PR 的 `OnboardingFlowTests.offscreenOnboardingRegistersAndDrivesEveryInteractiveControl` 逐页覆盖生产 Onboarding 中的所有可点击控件：欢迎、返回/继续、实体设备、更多控制方式展开、备用来源、按住/按一次、五个输入工具、权限行、音频设备、语音测试确认、重新打开、失败恢复、诊断复制和完成动作。系统设置、真实硬件、第三方 App 启动结果和真实文字上屏仍按下表进入现场层。
 
 如果外部 UI 自动化工具报告“Mac 已锁定”或无法取得辅助功能权限，只能将其记录为该自动化通道不可用，不能把“解锁 Mac”列为 Onboarding 的产品前置条件，也不能因此修改用户流程。需要屏幕级坐标、系统权限弹窗、真实蓝牙/音频或第三方 App 文字上屏的用例，单独安排在已登录的现场验收中。
 
@@ -1094,7 +1109,7 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 
 1. 保持 Mac 锁屏或不依赖当前屏幕读取权限。
 2. 使用生产隐藏入口构建一次 App，并通过 `REMOTE_MIC_ONBOARDING_SCREENSHOT_DIR`、`REMOTE_MIC_ONBOARDING_SCREENSHOT_APPEARANCE=light|dark` 生成截图；第 2 页为 `02-control-source.png`，第 6 页为 `06-voice-tool.png`。
-3. 公开构建设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote`，按生产页面清单生成适用语言和外观集合。
+3. 公开构建设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote`，按生产页面清单生成适用语言和外观集合；需要指定小米型号真机图时设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL=rc001|rc003`。
 4. 包含 Siri 的截图构建可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_INSTALLED=1|0` 注入收据存在/缺失；可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_TRIAL=1` 渲染非会员临时启用的完成提示；这些值仅用于隔离截图，不写入系统。完整 Package 构建分别设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote|siri_remote|chromecast_remote|apple_companion|web_remote`；Apple 来源再用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_APPLE_REMOTE_GENERATION=generation_6|generation_7` 分开生成。按本次构建实际支持的来源、语言和外观生成完整集合，数量由清单推导。
 5. 对输入工具页额外覆盖豆包、微信、Typeless、Vokie、其他工具，以及 available/not-installed/unknown；每个工具用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_STEP=0...3` 覆盖右栏四项步骤，Vokie 必须分别生成浅色/深色步骤截图。语音测试页另覆盖 Vokie/Typeless 未运行与运行中状态。引导图放大层用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_ZOOM=<资源名>` 单独出图，横版与竖版各一组。
 6. 分别覆盖五个输入工具，确认固定排序、单行卡片标题、Fn staged 配置和右栏步骤无裁切。
@@ -1112,6 +1127,8 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 当前完整包截图记录（2026-09-23）：使用包含小米遥控器、Siri Remote、Chromecast 遥控器、iPhone / Apple Watch App 与 Web 遥控器入口的生产 `OnboardingView` 隐藏离屏入口，为五个来源分别生成浅色和深色各 9 张，共 90 张。输出目录为 `历史截图证据已按仓库清理规则移出`；每张 PNG 均为 `2040 × 1608`，按文件名排序后对逐文件 SHA-256 清单再次计算得到组合 SHA-256 `53982846f8d396a8cb3ad6ff0987c2b43e4c736169bd8d65b6a6fc74c3a96938`。90 张图片已逐张查看窗口 chrome、标题、阶段导航、状态卡、右栏、底部导航、裁切、对比度和中文字号；同时重点复核 Chromecast 浅色/深色 `05-remote.png`、来源专属恢复文案、Apple Watch 状态、Web 二维码内容、权限说明和普通用户页面中的内部测试术语，静态页面检查通过。该记录只证明本次构建的静态布局、外观和文案，不替代 TCC 权限弹窗与恢复、真实遥控器、iPhone / Apple Watch Nearby、Web WSS、MiRemoteV / BlackHole 音频、第三方输入工具快捷键与运行状态，以及松开语音键后文字真实保留在输入框中的现场验收。
 
 当前公开构建增益布局复核记录（2026-09-24）：使用公开能力构建的生产 `OnboardingView` 隐藏离屏入口生成小米遥控器分支浅色/深色各 9 张，共 18 张。输出目录为 `Screenshots/design-drafts/onboarding-tool-binding-fixes/ui-audit-light-2` 与 `ui-audit-dark-2`；每张 PNG 均为 `2040 × 1608`，逐张检查了标题、阶段导航、左侧内容、右栏真实遥控器图片、继续按钮、底部提示、浅深色对比度和中文字号，重点确认语音测试页的输入框、增益说明、滑块、当前 dB 值及底部导航均未裁切；欢迎页中文标题也已调整为自然两行，避免孤立单字。按文件名排序后的 SHA-256 清单组合哈希为 `c169997869333b24884a282c59122c3f0e19e5a6a28f2b64a27516799f5e50f3`。该记录仍不替代真实遥控器、权限、音频和第三方输入工具文字上屏验收。
+
+RC001 真机图切换复核记录（2026-11-14）：生产公开包 `2.0.0 (320)` 使用 `OnboardingScreenshotRenderer`，设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL=rc001`、`REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote`，生成简体中文浅色/深色各 9 张。窗口内容为 `1020 × 772`，每张 PNG 为 `2040 × 1600`；逐张检查了 `02-control-source.png` 的来源卡缩略图和 `04-remote.png` 的右栏主图，确认显示 RC001 的红色电源键、无外圈麦克风键和底部 NFC 标识，标题、导航、状态卡、裁切、对比度和中文字号正常。浅色 `02-control-source.png` / `04-remote.png` 的 SHA-256 分别为 `77729d1c8cb470471e653a25f292074d581997f3b385251ff514c8ee4eabfb8a` / `6a18d05fecd5d8e12570fde1756c0edd7702baefc623587910b394790def036e`；深色分别为 `d4ba71e150cd2c73cf22357b6ed16420500f1124154f760a09f1a985f979dee9` / `1591385015f1436efdbee13d3a588e41d84ac6ed732a82adbf487909c0290871`。RC003 基线继续显示描边电源键与麦克风外圈，浅色 `04-remote.png` 的 SHA-256 为 `6839b2c9089451e7c7b5e6771a2bc4cdc25dba949915b094aee04731a74c89ec`。截图字节保存在仓库外持久证据目录，PR 附件待补；该记录只证明静态 UI，真实 RC001/RC003 连接后的 DIS 型号识别与图片切换仍需现场验收。
 
 历史候选截图记录（2026-08-31，非当前门禁结果）：实体遥控器浅色/深色各 9 张，iPhone App 浅色/深色各 10 张，网页版浅色/深色各 10 张，共 58 张；均由生产 `OnboardingView` 离屏入口生成并逐张查看。设置页另生成中文/英文、浅色/深色各 7 张（`800 × 650` 离屏压力尺寸），用于检查主设置页布局和按键模式相关内容。截图均保存在当时的本地证据目录，不代表当前 PR 已完成这些检查。
 

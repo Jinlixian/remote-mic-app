@@ -69,6 +69,10 @@ enum SettingsScreenshotRenderer {
         let opensActionEditor = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_OPEN_ACTION_EDITOR"
         ] == "1"
+        // 动作编辑区与按住编辑区一样可以针对任意按键截图，证据才能覆盖快捷键和 focus 绑定。
+        let actionEditorButton = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_ACTION_BUTTON"
+        ].flatMap(RemoteButton.init(rawValue:)) ?? .ok
         let opensHoldEditor = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_OPEN_HOLD_EDITOR"
         ] == "1"
@@ -103,7 +107,19 @@ enum SettingsScreenshotRenderer {
         ] == "1"
         let onlySection = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_SECTION"]
         let interactive = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_INTERACTIVE"] == "1"
+        let showsApplicationButtons = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTONS"
+        ] == "1"
+        let opensApplicationButtonEditor = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_EDITOR"
+        ] == "1"
+        let showsApplicationButtonClearConfirmation = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_CLEAR"
+        ] == "1"
         let mappingScenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_MAPPING_SCENARIO"]
+        let membershipAccess = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_MEMBERSHIP_ACCESS"
+        ]
         if mappingScenario != nil {
             guard let storage = ProcessInfo.processInfo.environment["SAYALL_MACRO_STORAGE_ROOT"],
                   URL(fileURLWithPath: storage).standardizedFileURL.path.hasPrefix(outputDirectory.standardizedFileURL.path + "/")
@@ -118,18 +134,31 @@ enum SettingsScreenshotRenderer {
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             throw RenderingError.bitmapCreationFailed
         }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            _ = defaults.synchronize()
+            TemporaryUserDefaults.removeSuite(suiteName)
+        }
 
         let settings = AppSettings(defaults: defaults)
         settings.applicationLanguage = language
         settings.completeOnboarding()
+        if let modelName = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_MODEL"
+        ], let remoteModel = XiaomiRemoteModel(rawValue: modelName) {
+            let profileID = settings.registerHIDRemote(
+                fingerprint: "settings-screenshot-\(remoteModel.rawValue)"
+            )
+            settings.updateRemoteProfileModel(profileID, model: remoteModel)
+            settings.selectRemoteProfile(profileID)
+        }
         if showsGestureTiming, let profileID = settings.selectedRemoteProfileID {
             settings.updateRemoteProfileModel(profileID, model: .rc003)
         }
         if ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATIONS_FIXTURE"
         ] == "1" {
-            // 空路径和旧机器路径都要能显示本机 App 图标，供「APP 适配」页取证。
+            // 空路径和旧机器路径都要能显示本机 App 图标，供「聚焦与翻页」页面取证。
             settings.addCustomApplicationProfile(CustomApplicationProfile(
                 displayName: language == .english ? "Notes" : "备忘录",
                 bundleIdentifier: "com.apple.Notes",
@@ -140,11 +169,19 @@ enum SettingsScreenshotRenderer {
                 bundleIdentifier: "com.apple.Safari",
                 applicationPath: "/Applications/Does Not Exist.app"
             ))
-            settings.addCustomApplicationProfile(CustomApplicationProfile(
+            let finderID = settings.addCustomApplicationProfile(CustomApplicationProfile(
                 displayName: "Finder",
                 bundleIdentifier: "com.apple.finder",
                 applicationPath: "/Applications/Does Not Exist.app"
             ))
+            if showsApplicationButtons {
+                _ = settings.setApplicationButtonOverride(
+                    ConfiguredButtonAction(action: .commandCopy, shortcut: nil),
+                    applicationProfileID: finderID,
+                    button: .ok,
+                    trigger: .singleClick
+                )
+            }
         }
         if ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_MISSING_ROUTINE"] == "1" {
             // Isolated upgrade fixture for the production cleanup page.
@@ -251,7 +288,9 @@ enum SettingsScreenshotRenderer {
         }
         let model = BridgeAppModel(
             settings: settings,
-            membershipFeature: mappingScenario == nil ? MembershipFeatureIntegration() : MembershipFeatureIntegration(configuration: nil),
+            membershipFeature: mappingScenario == nil && membershipAccess == nil
+                ? MembershipFeatureIntegration()
+                : MembershipFeatureIntegration(configuration: nil),
             transcriptArchiveStore: transcriptStore,
             recordingAssetStore: recordingStore
         )
@@ -264,6 +303,11 @@ enum SettingsScreenshotRenderer {
         }
         if let state = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_MAC_MICROPHONE"] {
             model.configureMacMicrophoneForSettingsScreenshot(state)
+        }
+        if let state = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_VOICE_OUTPUT"
+        ] {
+            model.configureVoiceOutputForSettingsScreenshot(state)
         }
         if showsRemoteCards {
             model.configureRemoteCardsForSettingsScreenshot(
@@ -304,6 +348,13 @@ enum SettingsScreenshotRenderer {
                     copying: nil, bindings: [binding], holdModes: [RemoteButton.ok.rawValue: "once"])
             }
             if mappingScenario == "viewer" { model.macroFeature.updateButtonProfilesAccess(.requiresPlus) }
+        }
+        if membershipAccess == "requiresPlus" {
+            model.macroFeature.updateButtonProfilesAccess(.requiresPlus)
+            model.membershipFeature.applyScreenshotState(
+                isFeatureVisible: true,
+                accessDecision: .requiresPlus
+            )
         }
         model.membershipFeature.updateLocaleIdentifier(localization.locale.identifier)
         // 加载方案会按方案重写按住设置，按住相关的种子必须落在加载之后。
@@ -349,7 +400,7 @@ enum SettingsScreenshotRenderer {
                 updateInformation: updateInformation,
                 initialSection: section,
                 initialShareSection: section == .statistics && expandsShare ? section : nil,
-                initialMappingEditingButton: section == .mapping && opensMappingEditor ? .ok : nil,
+                initialMappingEditingButton: section == .mapping && opensMappingEditor ? actionEditorButton : nil,
                 initialMappingHoldEditingButton: section == .mapping && opensHoldEditor
                     ? holdEditorButton
                     : nil,
@@ -359,6 +410,10 @@ enum SettingsScreenshotRenderer {
                 initialMappingActionFilter: initialActionFilter,
                 initialMappingScrollsToGestureTiming: section == .mapping && showsGestureTiming,
                 initialMappingVoiceSettingsPresented: section == .mapping && opensVoiceSettings,
+                initialApplicationButtonSettingsProfileID: showsApplicationButtons
+                    ? settings.customApplicationProfiles.last?.id : nil,
+                initialApplicationButtonEditingButton: opensApplicationButtonEditor ? .ok : nil,
+                initialApplicationButtonClearConfirmationPresented: showsApplicationButtonClearConfirmation,
                 supplementalSettings: supplementalSettings,
                 sidebarAccountDisplayName: sidebarAccountDisplayName
             ).environmentObject(localization))
@@ -390,7 +445,7 @@ enum SettingsScreenshotRenderer {
                 initialSection: section,
                 initialShareSection: section == .statistics && expandsShare ? section : nil,
                 initialMappingEditingButton: section == .mapping && opensMappingEditor
-                    ? .ok
+                    ? actionEditorButton
                     : nil,
                 initialMappingHoldEditingButton: section == .mapping && opensHoldEditor
                     ? holdEditorButton
@@ -401,6 +456,10 @@ enum SettingsScreenshotRenderer {
                 initialMappingActionFilter: initialActionFilter,
                 initialMappingScrollsToGestureTiming: section == .mapping && showsGestureTiming,
                 initialMappingVoiceSettingsPresented: section == .mapping && opensVoiceSettings,
+                initialApplicationButtonSettingsProfileID: showsApplicationButtons
+                    ? settings.customApplicationProfiles.last?.id : nil,
+                initialApplicationButtonEditingButton: opensApplicationButtonEditor ? .ok : nil,
+                initialApplicationButtonClearConfirmationPresented: showsApplicationButtonClearConfirmation,
                 supplementalSettings: supplementalSettings,
                 sidebarAccountDisplayName: sidebarAccountDisplayName,
                 minimumContentSize: .zero
@@ -492,6 +551,19 @@ enum SettingsScreenshotRenderer {
                     applicationName: "Notes", bundleIdentifier: "com.apple.Notes")
             }
         }
+        if ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_OLDER_HISTORY"
+        ] == "1",
+            let olderDate = calendar.date(byAdding: .day, value: -8, to: now) {
+            try transcriptStore.append(TranscriptRecord(
+                sessionID: UUID(),
+                startedAt: olderDate.addingTimeInterval(-60),
+                endedAt: olderDate,
+                applicationName: "Notes", bundleIdentifier: "com.apple.Notes",
+                source: .bluetoothRemote, originalTranscript: "更早记录测试 / Older history fixture",
+                calendar: calendar
+            ))
+        }
     }
 
     private static func seedAvailableUpdate(
@@ -505,13 +577,41 @@ enum SettingsScreenshotRenderer {
         case .system, .english:
             notes = "Refined the Settings layout\nCentralized permissions and logs\nFixed known issues"
         }
+        // The screenshot fixture must stay newer than the host app. Otherwise the
+        // About page shows an update to an older version after every release.
+        let candidate = demoUpdateCandidate(
+            currentVersion: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleShortVersionString"
+            ) as? String ?? "",
+            currentBuild: Bundle.main.object(
+                forInfoDictionaryKey: "CFBundleVersion"
+            ) as? String ?? ""
+        )
         updateInformation.setAvailable(
-            displayVersion: "1.9.22",
-            buildVersion: "183",
+            displayVersion: candidate.displayVersion,
+            buildVersion: candidate.buildVersion,
             archiveURL: nil,
             fallbackDescription: notes,
             localeIdentifier: language.rawValue
         )
+    }
+
+    static func demoUpdateCandidate(
+        currentVersion: String,
+        currentBuild: String
+    ) -> (displayVersion: String, buildVersion: String) {
+        let fallback = (displayVersion: "999.0.0", buildVersion: "999999999")
+        guard let normalizedVersion = UpdateVersion.normalized(currentVersion) else {
+            return fallback
+        }
+        var components = normalizedVersion.split(separator: ".").compactMap { Int($0) }
+        guard let lastComponent = components.last else { return fallback }
+        components[components.count - 1] = lastComponent + 1
+        let displayVersion = components.map(String.init).joined(separator: ".")
+        let buildVersion = Int(currentBuild).map { build in
+            build == Int.max ? String(build) : String(build + 1)
+        } ?? fallback.buildVersion
+        return (displayVersion: displayVersion, buildVersion: buildVersion)
     }
 
     private static func seedStatisticsForScreenshot(_ settings: AppSettings) {

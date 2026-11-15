@@ -16,6 +16,31 @@ struct RemoteButtonInteractionTests {
               allowsKeyHold: true)
     }
 
+    @Test func actionChangeClearsOnlyTheDependentOrBrokenHold() {
+        let base = snapshot(.once)
+        #expect(base.shouldClearHold(afterChanging: .singleClick, previousHold: .repeatSingle))
+        #expect(base.shouldClearHold(afterChanging: .singleClick, previousHold: .singleHold))
+        #expect(!base.shouldClearHold(afterChanging: .singleClick, previousHold: .once))
+        #expect(!base.shouldClearHold(afterChanging: .longPress, previousHold: .repeatSingle))
+        #expect(!base.shouldClearHold(afterChanging: .doubleClick, previousHold: .repeatSingle))
+
+        let longConfigured = {
+            var value = snapshot(.once, long: true)
+            value.holdableSingle = value.single
+            value.holdableLong = value.long
+            return value
+        }()
+        #expect(longConfigured.shouldClearHold(afterChanging: .longPress, previousHold: .repeatLong))
+        #expect(longConfigured.shouldClearHold(afterChanging: .longPress, previousHold: .longHold))
+        #expect(!longConfigured.shouldClearHold(afterChanging: .singleClick, previousHold: .repeatLong))
+        #expect(!longConfigured.shouldClearHold(afterChanging: .singleClick, previousHold: .longHold))
+
+        // A stored mode unrelated to the changed trigger still has to be cleared once its
+        // blockers appear; it can no longer run.
+        let broken = snapshot(.repeatSingle, long: true)
+        #expect(broken.shouldClearHold(afterChanging: .doubleClick, previousHold: .repeatSingle))
+    }
+
     @Test func doubleWindowStartsAtReleaseAndUsesCapturedTiming() {
         let clock = InteractionClock()
         let controller = RemoteButtonInteractionController(scheduler: clock)
@@ -230,7 +255,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func holdChoiceIsASingleStoredMode() throws {
         let name = "SayAll.HoldExecution.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         settings.setAction(.arrowRight, for: .right, trigger: .singleClick)
@@ -270,7 +295,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingAndModeMigrationAreIdempotentAndInvalidOverridesStayInactive() throws {
         let name = "SayAll.InteractionMigration.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let legacy = RemoteDeviceProfile(model: .rc003, mappings: .init(
             buttonBindings: AppSettings.defaultBindings, buttonShortcuts: [:], secondaryButtonBindings: [:]))
@@ -337,7 +362,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func changingAnActionClearsAHoldChoiceItCanNoLongerRun() throws {
         let name = "SayAll.HoldConflict.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let profileID = try #require(settings.selectedRemoteProfileID)
@@ -373,7 +398,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func changingTheModelSeedsTheNewModelTimingFromTheLegacyFieldsOnce() throws {
         let name = "SayAll.ModelTiming.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let device = settings.registerBluetoothRemote(identifier: UUID())
@@ -405,7 +430,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func invalidHoldModesAndTimingsAreRejectedOnImportWithoutChangingTheRest() throws {
         let name = "SayAll.InteractionImport.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         settings.setHoldMode(.repeatSingle, for: .back)
@@ -456,7 +481,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func unrecordedShortcutNeverReadsAsABinding() throws {
         let name = "SayAll.UnrecordedShortcut.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let profileID = settings.selectedRemoteProfileID
@@ -480,7 +505,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingChangesDoNotCancelButModeAndMappingChangesDo() throws {
         let name = "SayAll.InteractionChanges.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         var cancelled = 0
@@ -497,7 +522,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func timingIsPerModelWhileModesRemainPerDeviceAndBackupRoundTrips() throws {
         let name = "SayAll.Interaction.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let settings = AppSettings(defaults: defaults)
         let first = settings.registerBluetoothRemote(identifier: UUID())
@@ -551,7 +576,7 @@ struct RemoteButtonInteractionTests {
 
     @Test func unknownModelTimingIsRejectedDuringLoadAndImport() throws {
         let name = "SayAll.Interaction.UnknownModel.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
+        let defaults = try #require(TestUserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let timing = RemoteButtonGestureTiming(
             doubleClickMilliseconds: 150,

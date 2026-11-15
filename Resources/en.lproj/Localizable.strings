@@ -6,11 +6,8 @@
 "audio.output.start_failed" = "Failed to start audio output: %1$@";
 "bluetooth.status.initializing" = "Initializing Bluetooth";
 "button_mapping.status.disabled" = "Button mapping is disabled";
-"audio.compatibility.checking" = "Checking for a compatible audio device";
 "voice_button.status.preparing" = "Setting up the remote voice button";
 "app.status.stopped" = "The app has stopped";
-"audio.compatibility.device_missing" = "%1$@ was not found. Install the compatibility driver first.";
-"audio.compatibility.device_selected" = "Remote audio will be sent to %1$@";
 "audio.test_tone.cancelled_device_changed" = "The device changed; the test tone was canceled";
 "audio.test_tone.ready" = "Ready to send a test tone";
 "audio.output.none_or_unavailable" = "No audio output device is selected, or the device is unavailable";
@@ -39,8 +36,6 @@
 "voice_button.status.waiting_for_input" = "Waiting for the text field to be ready";
 "voice_button.status.input_ready" = "Text field ready";
 "voice_button.status.input_unavailable" = "The text field was not ready. Voice input was canceled.";
-"audio.compatibility.device_detected" = "%1$@ detected";
-"audio.compatibility.device_not_detected" = "%1$@ was not found";
 "button_mapping.status.system_managed" = "Buttons are handled natively by macOS";
 "button_mapping.permission.input_monitoring_required" = "Allow Input Monitoring to use remote buttons.";
 "button_mapping.permission.accessibility_required" = "Allow Accessibility to run button actions.";
@@ -286,10 +281,10 @@
 "button_mapping.action_group.applications" = "Open an App";
 "button_mapping.action.disable_switch" = "Disable This Action";
 "button_mapping.focus_input.app_adaptation_hint.prefix" = "To learn a specific app's input field, go to the";
-"button_mapping.focus_input.app_adaptation_hint.action" = "Apps page";
+"button_mapping.focus_input.app_adaptation_hint.action" = "Focus & Scrolling page";
 "custom_application.target" = "Target app";
 "custom_application.not_configured" = "No app selected";
-"custom_application.page.subtitle" = "Input focus and page scrolling are set per app and work whenever the app is in the foreground.";
+"custom_application.page.subtitle" = "Input focus and page scrolling are set per app and work whenever the app is in the foreground. These settings do not change button bindings.";
 "custom_application.list.title" = "Added apps";
 "custom_application.empty_title" = "No apps yet";
 "custom_application.empty_hint" = "Add an app to set its input focus and page scrolling. Both work whenever the app is in the foreground.";
@@ -299,13 +294,13 @@
 "custom_application.focus.short.recorded" = "Recorded field";
 "custom_application.status.compact" = "%@ · %@";
 "custom_application.go_configure" = "Configure";
-"custom_application.bindings.title" = "Buttons bound to it";
+"custom_application.bindings.title" = "Buttons that open it";
 "custom_application.bindings.empty" = "No button opens this app yet. Pick it under Open an App on the Buttons page.";
 "custom_application.bindings.go_mapping" = "Open Buttons";
 "custom_application.remove" = "Delete this app's setup";
 "custom_application.remove_blocked" = "%d buttons still open it. Unbind them before deleting its setup.";
 "custom_application.remove_confirm_title" = "Delete the setup for “%@”?";
-"custom_application.remove_confirm_message" = "This only deletes the setup SayAll keeps for this app (recorded input field, focus shortcut). The app itself is not modified or uninstalled. Buttons that open it stay as they are and will show “No app selected”.";
+"custom_application.remove_confirm_message" = "This only deletes the setup SayAll keeps for this app (recorded input field, focus shortcut, and app-specific button actions). The app itself is not modified or uninstalled. Buttons that open it stay as they are and will show “No app selected”.";
 "custom_application.remove_confirm_action" = "Delete setup";
 "custom_application.add" = "Add App";
 "custom_application.focus_strategy" = "Focus method";
@@ -341,7 +336,8 @@
 "custom_application.error.open_failed" = "The target app could not be opened.";
 "settings.section.connection" = "Connection";
 "settings.section.buttons" = "Buttons";
-"settings.section.applications" = "Apps";
+"settings.section.applications" = "Focus & Scrolling";
+"settings.section.applications.sidebar" = "Focus/Scroll";
 "settings.section.permissions" = "Permissions";
 "permission.status.enabled" = "Enabled";
 "permission.status.pending" = "Needs Permission";
@@ -485,13 +481,8 @@
 "audio.action.learn_virtual_microphones" = "Get BlackHole";
 "audio.action.send_test_tone" = "Play Test Sound";
 "audio.output.privacy_help" = "Voice audio is sent to the selected device. When the last remote disconnects, macOS switches the Mac’s default microphone to a physical microphone if it was using this virtual device. On reconnect, SayAll restores the virtual microphone only if you have not changed that setting. The default speakers are never changed.";
-"audio.compatibility.title" = "Compatible Audio Device";
-"audio.compatibility.section_title" = "Voice Input & Compatibility";
-"audio.compatibility.microphone_label" = "Compatible virtual microphone";
-"audio.compatibility.select_microphone" = "Select %@";
 "audio.compatibility.open_install_guide" = "Open Driver Installation Guide";
-"audio.compatibility.help" = "Install the compatible microphone and select it here. New installations use SayAll. Existing installations keep MiRemoteV 2ch.";
-"audio.compatibility.help_plain" = "If your voice typing app receives no audio, select the compatible microphone included with the installer. Existing audio devices are not replaced.";
+"audio.compatibility.missing_notice" = "No compatible virtual microphone was found. Your voice tool may not receive remote audio.";
 "button_mapping.page.title" = "Button Mapping";
 "button_mapping.page.subtitle" = "Click a button to change its settings";
 "button_mapping.toggle.enabled" = "Custom Buttons";
@@ -512,7 +503,7 @@
 "button_mapping.voice_button.title" = "Voice Button";
 "button_mapping.voice_button.fixed" = "Voice Trigger Key";
 "button_mapping.voice_button.detail" = "Hold to talk. Choose Fn/Globe, Left or Right Command, or Left or Right Option as the trigger key. The voice button is separate from other button actions.";
-"button_mapping.action.not_set" = "Not Set";
+"button_mapping.action.not_set" = "No action";
 "button_mapping.single_click.help" = "Runs after one press. It waits briefly when a double-click action is set.";
 "button_mapping.double_click.effect" = "A single press waits briefly to distinguish it from a double press. Hold-to-repeat is disabled.";
 "button_mapping.long_press.effect" = "Setting a long-press action disables hold-to-repeat for this button.";
@@ -1090,7 +1081,6 @@
 "statistics.transcripts.all_records" = "All Entries";
 "statistics.transcripts.expand_applications" = "Expand";
 "statistics.transcripts.collapse_applications" = "Collapse";
-"statistics.transcripts.view_more_by_application" = "View older entries by app";
 "statistics.transcripts.no_recent_records" = "No entries from the last 7 days. Select an app above to view older history.";
 "statistics.transcripts.entry_count" = "%@ entries";
 "statistics.transcripts.copy" = "Copy this entry";
@@ -1395,18 +1385,19 @@
 "configuration.import.cancel" = "Cancel";
 
 /* Mac microphone: explicit, per-session capture. */
-"audio.mac_microphone.input" = "Mac Microphone";
+"audio.mac_microphone.input" = "Microphone";
+"audio.mac_microphone.none" = "None";
 "audio.mac_microphone.current" = "Current input:";
 "audio.mac_microphone.current.remote" = "Remote microphone";
 "audio.mac_microphone.fallback" = "Fallback microphone";
-"audio.mac_microphone.fallback_help" = "Talk into the Mac microphone when the remote isn't in use; remote audio is unaffected.";
-"audio.mac_microphone.choose" = "Choose a Mac microphone";
-"audio.mac_microphone.start" = "Speak with Mac microphone";
-"audio.mac_microphone.stop" = "Stop using Mac microphone";
+"audio.mac_microphone.fallback_help" = "Talk into the selected microphone when the remote isn't in use; selecting one switches the macOS input device; remote audio is unaffected.";
+"audio.mac_microphone.start" = "Speak with %@";
+"audio.mac_microphone.stop" = "Stop using %@";
+"audio.mac_microphone.error.no_audio" = "The selected microphone produced no audio. Check the connection or choose another microphone.";
 "audio.mac_microphone.help" = "Use only when you are not using a remote";
 "audio.mac_microphone.idle" = "Not recording";
 "audio.mac_microphone.preparing" = "Preparing…";
-"audio.mac_microphone.recording" = "Mac microphone is recording";
+"audio.mac_microphone.recording" = "Selected microphone is recording";
 "audio.mac_microphone.stopping" = "Stopping recording…";
 "audio.mac_microphone.shortcut" = "Switch shortcut";
 "audio.mac_microphone.shortcut_set" = "Set shortcut";
@@ -1423,7 +1414,7 @@
 "audio.mac_microphone.error.accessibility" = "Allow Accessibility access in System Settings.";
 
 // Device gesture timing and hold behavior
-"button_mapping.hold_button_unavailable" = "Only the remote’s left and right buttons can hold down arrow keys.";
+"button_mapping.hold_button_unavailable" = "This button cannot hold an arrow key; only the remote’s left and right buttons can. Choose a repeat mode or clear the hold setting.";
 "button_mapping.hold.wait_double" = "Double-click is configured, so this waits briefly before starting.";
 "button_mapping.hold.timing_help" = "The long-press time uses your saved button speed setting.";
 "button_mapping.hold.long_hold.description" = "Hold down %@ after the configured long-press time. Release the button to release %@.";
@@ -1435,13 +1426,13 @@
 "button_mapping.hold.description" = "Run the selected behavior while held. Release to stop.";
 "button_mapping.hold.clear_long_to_enable" = "Clear long-press action";
 "button_mapping.hold.repeat_prefix" = "While held: repeat click action ";
-"button_mapping.hold.blocker.timing_invalid" = "The recognition time is invalid";
-"button_mapping.hold.blocker.profile_owned" = "A button profile owns this button";
-"button_mapping.hold.blocker.action_unset" = "This trigger has no action yet";
-"button_mapping.hold.blocker.action_not_repeatable" = "“%@” cannot be repeated";
-"button_mapping.hold.blocker.action_not_holdable" = "\"%@\" is not an arrow key, so it cannot be held down";
-"button_mapping.hold.blocker.long_configured" = "Long press is set to “%@”. Clear that action to enable this option.";
-"button_mapping.hold.blocker.long_owned_by_profile" = "A button profile owns the long press";
+"button_mapping.hold.blocker.timing_invalid" = "The interaction timing is invalid, so hold cannot be recognized. Restore the default timing or relearn it.";
+"button_mapping.hold.blocker.profile_owned" = "A button profile owns this button. Clear the profile override or choose a runnable action.";
+"button_mapping.hold.blocker.action_unset" = "This trigger has no action yet. Set an action first or clear the hold setting.";
+"button_mapping.hold.blocker.action_not_repeatable" = "“%@” cannot repeat. Choose a repeatable action or clear the hold setting.";
+"button_mapping.hold.blocker.action_not_holdable" = "“%@” is not an arrow key and cannot be held. Choose an arrow-key action or a repeat mode.";
+"button_mapping.hold.blocker.long_configured" = "Long press is set to “%@”. To enable Repeat Single, clear the long-press action; or choose Repeat Long Press.";
+"button_mapping.hold.blocker.long_owned_by_profile" = "A key profile owns the long press. Clear the profile override or choose another hold mode.";
 "button_mapping.hold.target" = "Choose one behavior";
 "button_mapping.hold.clear" = "Clear setting";
 "button_mapping.hold.clear.help" = "After clearing, the button runs its click, double-click and long-press actions as configured.";
@@ -1483,6 +1474,7 @@
 "button_mapping.timing_save_hint" = "Learning results fill the controls and are kept across relaunches, so they still show as learned. They only affect the buttons after you save.";
 "button_mapping.timing_saved" = "Saved. The new times apply from the next ordinary button press.";
 "button_mapping.hold_profile_unavailable" = "This component version cannot save hold modes in button profiles. Update the component.";
+"button_mapping.hold.profile_repeat_only" = "Profiles only save repeat behaviors; set arrow-key hold in the default profile.";
 "audio.mac_microphone.armed" = "Standby";
 "audio.mac_microphone.voice_key" = "Voice shortcut";
 "audio.mac_microphone.voice_hold" = "Hold to speak; release to finish";
@@ -1501,6 +1493,9 @@
 "button_mapping.profile.create" = "Create New Key Profile";
 "button_mapping.profile.copy" = "Copy to New Key Profile";
 "button_mapping.profile.copy_suffix" = " Copy";
+"button_mapping.profile.membership.create_hint" = "Membership unlocks new profiles";
+"button_mapping.profile.membership.copy_hint" = "Membership unlocks profile copies";
+"button_mapping.profile.membership.open" = "Open membership";
 "button_mapping.profile.source" = "Source";
 "button_mapping.save.automatic" = "Auto-save";
 "button_mapping.save.success" = "Auto-save succeeded";
@@ -1509,12 +1504,37 @@
 "button_mapping.save.read_only" = "Read-only";
 "button_mapping.save.membership" = "View membership";
 "button_mapping.save.unsupported" = "Read-only configuration";
-"button_mapping.binding.inherited" = "Inherits base mapping";
-"button_mapping.binding.overridden" = "Overrides base mapping";
-"button_mapping.binding.clear_override" = "Clear Override";
+"button_mapping.binding.inherited" = "Inherits default profile";
+"button_mapping.binding.clear_override" = "Restore Default";
 "button_mapping.save.unavailable" = "Configuration unavailable";
 "button_mapping.save.retry" = "Retry";
 "button_mapping.save.partial" = "Action saved. Hold not saved.";
 "button_mapping.save.hold_failed" = "Hold not saved";
-"button_mapping.action.no_action" = "No action";
+"button_mapping.hold.cleared_by_action" = "Hold setting cleared because the action changed.";
+"button_mapping.hold.clear_failed_by_action" = "Action saved, but clearing the hold setting failed.";
+"button_mapping.action.no_action" = "Disabled";
+"button_mapping.action.profile_disabled" = "Disabled here";
+"button_mapping.source.profile" = "This Profile · %@";
 "button_mapping.profile.created" = "Key profile created";
+
+"application_buttons.back" = "Back";
+"application_buttons.entry.title" = "App-Specific Buttons";
+"application_buttons.entry.summary" = "%d items set for this app";
+"application_buttons.entry.hint" = "Items you do not set here keep using the global button configuration.";
+"application_buttons.entry.open" = "Set Buttons for This App";
+"application_buttons.page.title" = "Buttons for %@";
+"application_buttons.page.subtitle" = "Set ordinary button actions only while this app is in the foreground. Unset items use the global configuration; the voice button is unchanged.";
+"application_buttons.page.count" = "%d items set for this app";
+"application_buttons.page.clear_all" = "Restore All to Global";
+"application_buttons.editor.inherited" = "Uses global";
+"application_buttons.editor.overridden" = "Set for this app";
+"application_buttons.editor.restore" = "Restore Global";
+"application_buttons.clear.title" = "Restore all buttons to global?";
+"application_buttons.clear.message" = "App-specific button actions will be deleted. Every item will use the original global button configuration.";
+"application_buttons.clear.action" = "Restore All to Global";
+
+"application_buttons.short.global" = "Global";
+"application_buttons.short.app" = "App";
+
+"application_buttons.target.title" = "Open a Custom App";
+"application_buttons.target.hint" = "Choose an app to open. Its focus behavior is still defined by that app’s settings.";

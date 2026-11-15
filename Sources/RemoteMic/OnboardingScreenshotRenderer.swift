@@ -97,7 +97,11 @@ enum OnboardingScreenshotRenderer {
         guard let defaults = UserDefaults(suiteName: suiteName) else {
             throw RenderingError.bitmapCreationFailed
         }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            _ = defaults.synchronize()
+            TemporaryUserDefaults.removeSuite(suiteName)
+        }
 
         let settings = AppSettings(defaults: defaults)
         settings.applicationLanguage = screenshotLanguage.appLanguage
@@ -149,6 +153,15 @@ enum OnboardingScreenshotRenderer {
         }
         settings.setOnboardingVoiceTool(requestedVoiceTool ?? .doubao)
         settings.setOnboardingControlSource(controlSource)
+        if let modelName = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL"
+        ], let remoteModel = XiaomiRemoteModel(rawValue: modelName) {
+            let profileID = settings.registerHIDRemote(
+                fingerprint: "onboarding-screenshot-\(remoteModel.rawValue)"
+            )
+            settings.updateRemoteProfileModel(profileID, model: remoteModel)
+            settings.selectRemoteProfile(profileID)
+        }
         if controlSource == .siriRemote {
             settings.setOnboardingAppleRemoteGeneration(
                 requestedAppleRemoteGeneration ?? .generation7

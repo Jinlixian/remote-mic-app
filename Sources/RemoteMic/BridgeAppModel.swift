@@ -124,6 +124,24 @@ enum HIDMappingRecoveryPolicy {
         else { return nil }
         return retryDelays[attempt]
     }
+
+    /// 设备已经匹配、但它的 HID 服务还枚举不出来时的重试间隔。
+    ///
+    /// 与 `retryDelay` 共用同一组退避间隔，但不要求蓝牙桥已经 ready：设备已经匹配
+    /// 本身就是它在位的证据，而重连时设备总是先于服务出现。2026-11-13 的 Intel 现场
+    /// 只有一次 `HID NATIVE MAPPING phase=prepare result=pending reason=no_service`，
+    /// 之后不再重试，F5→Fn 映射再也没写回去，语音键的原生 F5 直接进了系统。
+    static func deviceVerificationRetryDelay(
+        forAttempt attempt: Int,
+        started: Bool,
+        hasMatchingServices: Bool
+    ) -> TimeInterval? {
+        guard started,
+              !hasMatchingServices,
+              retryDelays.indices.contains(attempt)
+        else { return nil }
+        return retryDelays[attempt]
+    }
 }
 
 enum MobileVoiceStopDisposition: Equatable {
@@ -414,6 +432,41 @@ struct AudioRecoveryCoalescingState {
     }
 }
 
+enum AudioConfigurationCompletionPolicy {
+    static func reportsReady(configured: Bool, readyNow: Bool) -> Bool {
+        configured && readyNow
+    }
+}
+
+enum AudioRecoveryBackoffPolicy {
+    static let retryDelays: [TimeInterval] = [2, 4, 8]
+
+    static func retryDelay(forRetry retry: Int) -> TimeInterval? {
+        guard retry >= 0, retryDelays.indices.contains(retry) else { return nil }
+        return retryDelays[retry]
+    }
+}
+
+struct AudioRecoveryBackoffState {
+    private(set) var retryCount = 0
+
+    mutating func nextRetryDelay() -> TimeInterval? {
+        guard let delay = AudioRecoveryBackoffPolicy.retryDelay(forRetry: retryCount) else {
+            return nil
+        }
+        retryCount += 1
+        return delay
+    }
+
+    mutating func reset() {
+        retryCount = 0
+    }
+
+    var exhausted: Bool {
+        AudioRecoveryBackoffPolicy.retryDelay(forRetry: retryCount) == nil
+    }
+}
+
 struct BluetoothVoiceTailSnapshot: Equatable {
     let sampleCount: Int
     let durationMilliseconds: Int
@@ -537,7 +590,6 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     @Published private(set) var connectionStatus = LocalizedMessage("bluetooth.status.initializing")
     @Published private(set) var hidStatus = LocalizedMessage("button_mapping.status.disabled")
     @Published private(set) var audioStatus = LocalizedMessage("audio.output.none_selected")
-    @Published private(set) var doubaoAudioStatus = LocalizedMessage("audio.compatibility.checking")
     @Published private(set) var isStreaming = false
     @Published private(set) var voiceSessionWarningLevel: VoiceSessionWarningLevel = .none
     @Published private(set) var isConnected = false
@@ -999,8 +1051,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private let audioHardwareListenerQueue = DispatchQueue(label: "RemoteMic.audioHardware")
     private var observedAudioHardwareAddresses: [AudioObjectPropertyAddress] = []
     private var audioRecoveryWorkItem: DispatchWorkItem?
+    private var audioRecoveryRetryWorkItem: DispatchWorkItem?
+    private var audioRecoveryInFlightGeneration: UInt64?
+    private var audioRecoveryRetryExhausted = false
     private var audioRecoveryGeneration: UInt64 = 0
     private var audioRecoveryCoalescingState = AudioRecoveryCoalescingState()
+    private var audioRecoveryBackoffState = AudioRecoveryBackoffState()
     private var virtualAudioReleaseGeneration: UInt64 = 0
     private var pendingVirtualAudioRelease: (generation: UInt64, reason: String)?
     private var idleVirtualAudioReleaseWorkItem: DispatchWorkItem?
@@ -1031,6 +1087,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         self.recordingAssetStore = recordingAssetStore
         self.diagnosticLogUploader = diagnosticLogUploader
         super.init()
+        settings.frontmostApplicationBundleIdentifier = {
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        }
         if settings.siriRemoteEnabled, settings.siriRemoteNeedsUserAction {
             siriRemoteAudioStatus = "unavailable:authorization_user_action_required"
         }
@@ -1494,6 +1553,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     transcriptCaptureCoordinator.cancel()
                 }
             }
+        recordingToggleCancellable = settings.$localOriginalAudioRecordingEnabled
+            .removeDuplicates()
+            .sink { [weak self] isEnabled in
+                guard let self else { return }
+                if !isEnabled {
+                    self.recordingAssetCoordinator.cancel(reason: "feature_disabled")
+                }
+                self.refreshRecordingAssets()
+            }
     }
 
     func startIfNeeded() {
@@ -1569,7 +1637,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         audioRecoveryGeneration &+= 1
         audioRecoveryWorkItem?.cancel()
         audioRecoveryWorkItem = nil
+        audioRecoveryRetryWorkItem?.cancel()
+        audioRecoveryRetryWorkItem = nil
+        audioRecoveryInFlightGeneration = nil
+        audioRecoveryRetryExhausted = false
         audioRecoveryCoalescingState.reset()
+        audioRecoveryBackoffState.reset()
         stopObservingAudioHardware()
         cancelTestToneIfNeeded(
             statusMessage: LocalizedMessage("app.status.stopped"),
@@ -1677,7 +1750,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             do {
                 let records = try transcriptArchiveStore.loadAll()
                 DispatchQueue.main.async { [weak self] in
-                    self?.transcriptRecords = records
+                    guard let self, self.transcriptRecords != records else { return }
+                    self.transcriptRecords = records
                 }
             } catch {
                 AppLogger.shared.write(
@@ -1686,16 +1760,6 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 )
             }
         }
-        refreshRecordingAssets()
-        recordingToggleCancellable = settings.$localOriginalAudioRecordingEnabled
-            .removeDuplicates()
-            .sink { [weak self] isEnabled in
-                guard let self else { return }
-                if !isEnabled {
-                    self.recordingAssetCoordinator.cancel(reason: "feature_disabled")
-                }
-                self.refreshRecordingAssets()
-            }
     }
 
     func refreshRecordingAssets() {
@@ -1704,7 +1768,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             do {
                 let assets = try self.recordingAssetStore.loadAll()
                 DispatchQueue.main.async { [weak self] in
-                    self?.recordingAssets = assets
+                    guard let self, self.recordingAssets != assets else { return }
+                    self.recordingAssets = assets
                 }
             } catch {
                 AppLogger.shared.write(
@@ -2743,12 +2808,44 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     transport != kAudioDeviceTransportTypeAggregate &&
                     VirtualAudioDeviceDiagnosticKind.classify(device) == .other
             }
-            let builtIn = inputs.first { CoreAudioDeviceCatalog.transportType(for: $0.id) == kAudioDeviceTransportTypeBuiltIn }
+            let builtInDeviceIDs = Set(inputs.compactMap { device in
+                CoreAudioDeviceCatalog.transportType(for: device.id) == kAudioDeviceTransportTypeBuiltIn ? device.id : nil
+            })
+            let defaultSelection = MacMicrophoneDefaultInputPolicy.select(
+                available: inputs,
+                systemDefault: CoreAudioDeviceCatalog.defaultInputDevice(),
+                builtInDeviceIDs: builtInDeviceIDs
+            )
+            let defaultUID = defaultSelection?.device.uid
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                let previousSelected = self.macMicrophoneDevices.first {
+                    $0.uid == self.settings.macMicrophoneInputUID
+                }
                 self.macMicrophoneDevices = inputs
-                if self.settings.macMicrophoneInputUID.isEmpty, let builtIn {
-                    self.settings.macMicrophoneInputUID = builtIn.uid
+                if self.settings.macMicrophoneInputUID.isEmpty, let defaultUID {
+                    self.settings.macMicrophoneInputUID = defaultUID
+                    AppLogger.shared.write(
+                        "MAC MICROPHONE INPUT phase=defaulted result=selected " +
+                            "source=\(defaultSelection?.source.rawValue ?? "unknown")"
+                    )
+                } else if !inputs.contains(where: {
+                    $0.uid == self.settings.macMicrophoneInputUID
+                }) {
+                    if let previousSelected,
+                       let replacement = inputs.first(where: { $0.name == previousSelected.name }) {
+                        self.settings.macMicrophoneInputUID = replacement.uid
+                        AppLogger.shared.write(
+                            "MAC MICROPHONE INPUT phase=migrated result=selected " +
+                                "reason=core_audio_roster_changed"
+                        )
+                    } else if let defaultUID {
+                        self.settings.macMicrophoneInputUID = defaultUID
+                        AppLogger.shared.write(
+                            "MAC MICROPHONE INPUT phase=fallback result=selected " +
+                                "reason=selected_unavailable"
+                        )
+                    }
                 }
                 if self.macMicrophoneEnabled,
                    !inputs.contains(where: { $0.uid == self.settings.macMicrophoneInputUID }) {
@@ -2757,7 +2854,6 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
         }
         audioDevices = devices
-        doubaoAudioStatus = DoubaoAudioDevicePolicy.status(in: devices)
     }
 
     private static func audioDevicesDiagnostic(_ devices: [AudioDeviceInfo]) -> String {
@@ -2765,24 +2861,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             CoreAudioDeviceCatalog.routeDiagnostic()
     }
 
-    var hasDoubaoAudioDevice: Bool {
-        DoubaoAudioDevicePolicy.device(in: audioDevices) != nil
-    }
-
-    func selectDoubaoAudioDevice() {
-        guard let device = DoubaoAudioDevicePolicy.device(in: audioDevices) else {
-            doubaoAudioStatus = LocalizedMessage(
-                "audio.compatibility.device_missing",
-                arguments: [DoubaoAudioDevicePolicy.deviceName]
-            )
-            return
-        }
-        settings.selectedAudioDeviceUID = device.uid
-        applyAudioSettings(reason: "doubao_device_selected")
-        doubaoAudioStatus = LocalizedMessage(
-            "audio.compatibility.device_selected",
-            arguments: [device.name]
-        )
+    var hasCompatibleVoiceOutputDevice: Bool {
+        VoiceOutputDevicePolicy.hasCompatibleDevice(in: audioDevices)
     }
 
     func openDoubaoDriverInstructions(using localization: LocalizationStore) {
@@ -2795,8 +2875,21 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         NSWorkspace.shared.open(instructions)
     }
 
-    var macMicrophoneButtonKey: String {
-        macMicrophoneEnabled ? "audio.mac_microphone.stop" : "audio.mac_microphone.start"
+    func macMicrophoneButtonTitle(using localization: LocalizationStore) -> String {
+        let name = macMicrophoneSelectedDevice?.name
+            ?? localization.text("audio.mac_microphone.input")
+        if macMicrophoneEnabled {
+            return String(
+                format: localization.text("audio.mac_microphone.stop"),
+                locale: localization.locale,
+                arguments: [name]
+            )
+        }
+        return String(
+            format: localization.text("audio.mac_microphone.start"),
+            locale: localization.locale,
+            arguments: [name]
+        )
     }
 
     var macMicrophoneVoiceGesture: VoiceGestureMode {
@@ -2809,8 +2902,40 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 VoiceToolAdapterProfile.profile(for: settings.onboardingVoiceTool).recommendedMode ?? .hold)
     }
 
+    var macMicrophoneSelectedDevice: AudioDeviceInfo? {
+        macMicrophoneDevices.first { $0.uid == settings.macMicrophoneInputUID }
+    }
+
+    var macMicrophoneSelectedDeviceIsReady: Bool {
+        macMicrophoneSelectedDevice != nil
+    }
+
+    /// Selecting a device also makes it macOS's default input. The picker only
+    /// offers input-ready devices, so this is a synchronous route request.
+    func selectMacMicrophoneInput(_ uid: String) {
+        guard settings.macMicrophoneInputUID != uid else { return }
+        settings.macMicrophoneInputUID = uid
+        guard let device = macMicrophoneDevices.first(where: { $0.uid == uid }) else { return }
+        // The Bluetooth route can be recreated while the picker is open.
+        let currentDevice = CoreAudioDeviceCatalog.inputDevices().first(where: {
+            $0.uid == device.uid
+        }) ?? device
+        let result = CoreAudioDeviceCatalog.setDefaultInputDevice(currentDevice)
+        AppLogger.shared.write(
+            "MAC MICROPHONE INPUT phase=switch_requested " +
+                "result=\(result == noErr ? "applied" : "failed")"
+        )
+        guard result != noErr else {
+            return
+        }
+    }
+
     func toggleMacMicrophone(from entry: MacMicrophoneEntry) {
         if !macMicrophoneSession.isEnabled {
+            guard macMicrophoneSelectedDeviceIsReady else {
+                AppLogger.shared.write("MAC MICROPHONE phase=rejected reason=input_unavailable")
+                return
+            }
             let mode = settings.voiceKeyMode
             let gesture = macMicrophoneVoiceGesture
             macMicrophoneVoiceKeyMonitor.onEdge = { [weak self] pressed, observedAt in
@@ -2845,7 +2970,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             guard let self, self.macMicrophoneSession.operationID == operation,
                   self.macMicrophoneState == .preparing else { return }
             guard granted else { completion(.permission); return }
-            guard self.macMicrophoneDevices.contains(where: { $0.uid == self.settings.macMicrophoneInputUID }) else {
+            guard self.macMicrophoneDevices.contains(where: {
+                $0.uid == self.settings.macMicrophoneInputUID
+            }) else {
                 completion(.inputUnavailable); return
             }
             let output = self.audioDevices.first { $0.uid == self.settings.selectedAudioDeviceUID }
@@ -2868,9 +2995,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func startMacMicrophoneCapture(completion: @escaping (MacMicrophoneFailure?) -> Void) {
-        guard let input = macMicrophoneDevices.first(where: { $0.uid == settings.macMicrophoneInputUID }),
-              !isStreaming, startPhoneVoice(source: .macMicrophone) == .started else {
-            completion(.busy); return
+        guard let input = macMicrophoneDevices.first(where: {
+            $0.uid == settings.macMicrophoneInputUID
+        }), !isStreaming, startPhoneVoice(source: .macMicrophone) == .started else {
+            completion(.inputUnavailable); return
         }
         let operation = macMicrophoneSession.operationID
         AppLogger.shared.write("MAC MICROPHONE operation_id=\(operation) phase=route_ready voice_operation_id=\(activeMobileVoiceOperationID ?? "none") mode=physical_voice_key voice_key_injection=none key_event_passthrough=true target_activation=none target_response=unknown")
@@ -2879,7 +3007,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 self?.macMicrophoneSession.observePCM(samples)
                 self?.receivePhoneAudio(samples, source: .macMicrophone)
             },
-            onFailure: { [weak self] in self?.macMicrophoneSession.stop(failure: .capture) },
+            onFailure: { [weak self] failure in self?.macMicrophoneSession.stop(failure: failure) },
             completion: completion)
     }
 
@@ -2991,6 +3119,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         cancelVirtualAudioReleaseIfPending(trigger: "rebind_\(reason)")
         virtualAudioReleaseGeneration &+= 1
         audioConfigurationGeneration &+= 1
+        if !reason.hasPrefix("recovery_") {
+            invalidatePendingAudioRecovery()
+        }
         let generation = audioConfigurationGeneration
         let deviceUID = settings.selectedAudioDeviceUID
         AppLogger.shared.write("AUDIO REBIND begin reason=\(reason) state={\(audioOutput.diagnosticState())}")
@@ -3011,7 +3142,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 }
                 self.audioStatus = self.audioOutput.status
                 self.isAudioOutputReady = self.audioOutput.isReadyForTestTone
-                self.testToneStatus = self.isAudioOutputReady
+                let reportsReady = AudioConfigurationCompletionPolicy.reportsReady(
+                    configured: configured,
+                    readyNow: self.isAudioOutputReady
+                )
+                self.testToneStatus = reportsReady
                     ? LocalizedMessage("audio.test_tone.ready")
                     : LocalizedMessage("audio.output.none_or_unavailable")
                 AppLogger.shared.write(
@@ -3033,23 +3168,42 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     component: "audio",
                     action: "configure",
                     phase: "completed",
-                    result: configured && self.isAudioOutputReady ? "ready" : "failed",
+                    result: reportsReady ? "ready" : "failed",
                     reason: publicReason,
                     source: "app"
                 )
+                if reportsReady {
+                    self.resetAudioRecoveryRetryState()
+                }
                 if configured {
                     self.restoreManagedDefaultInputIfAppropriate(reason: reason)
                     self.scheduleIdleVirtualAudioRelease()
                 }
-                completion(configured)
+                completion(reportsReady)
             }
         }
+    }
+
+    private func invalidatePendingAudioRecovery() {
+        audioRecoveryGeneration &+= 1
+        audioRecoveryWorkItem?.cancel()
+        audioRecoveryWorkItem = nil
+        audioRecoveryInFlightGeneration = nil
+        resetAudioRecoveryRetryState()
+    }
+
+    private func resetAudioRecoveryRetryState() {
+        audioRecoveryBackoffState.reset()
+        audioRecoveryRetryWorkItem?.cancel()
+        audioRecoveryRetryWorkItem = nil
+        audioRecoveryRetryExhausted = false
     }
 
     @discardableResult
     private func ensureVirtualAudioOutputReady(reason: String) -> Bool {
         isAudioOutputReady = audioOutput.isReadyForTestTone
         guard !isAudioOutputReady else {
+            invalidatePendingAudioRecovery()
             AppLogger.shared.write(
                 "AUDIO HEALTH ready reason=\(reason) state={\(audioOutput.diagnosticState())}"
             )
@@ -3068,6 +3222,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     ) {
         if audioOutput.isReadyForTestTone {
             isAudioOutputReady = true
+            invalidatePendingAudioRecovery()
             completion(true)
             return
         }
@@ -3160,6 +3315,38 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 )
                 return
             }
+            if reason == "engine_configuration_change", self.audioRecoveryInFlightGeneration != nil {
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) recovery_in_flight " +
+                        "retry_attempt=\(self.audioRecoveryBackoffState.retryCount) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                return
+            }
+            if reason == "engine_configuration_change", self.audioRecoveryRetryWorkItem != nil {
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) retry_pending " +
+                        "retry_attempt=\(self.audioRecoveryBackoffState.retryCount) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                return
+            }
+            if reason == "engine_configuration_change", self.audioRecoveryRetryExhausted {
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) retry_exhausted " +
+                        "retry_attempt=\(self.audioRecoveryBackoffState.retryCount) " +
+                        "active_audio=\(self.hasActiveVirtualAudioSource) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                return
+            }
+            if reason == "hardware_change" {
+                self.audioRecoveryBackoffState.reset()
+                self.audioRecoveryRetryWorkItem?.cancel()
+                self.audioRecoveryRetryWorkItem = nil
+                self.audioRecoveryInFlightGeneration = nil
+                self.audioRecoveryRetryExhausted = false
+            }
             self.audioRecoveryCoalescingState.recordEvent(reason: reason)
             self.audioRecoveryGeneration &+= 1
             let generation = self.audioRecoveryGeneration
@@ -3169,11 +3356,19 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                       self.started,
                       self.audioRecoveryGeneration == generation
                 else { return }
+                self.audioRecoveryInFlightGeneration = nil
                 let startedAtUptime = ProcessInfo.processInfo.systemUptime
                 let coalesced = self.audioRecoveryCoalescingState.consumePendingEvents()
                 let effectiveReason = coalesced.includesHardwareChange
                     ? "hardware_change"
                     : reason
+                if coalesced.includesHardwareChange {
+                    self.audioRecoveryBackoffState.reset()
+                    self.audioRecoveryRetryWorkItem?.cancel()
+                    self.audioRecoveryRetryWorkItem = nil
+                    self.audioRecoveryInFlightGeneration = nil
+                    self.audioRecoveryRetryExhausted = false
+                }
                 AppLogger.shared.write(
                     "AUDIO RECOVERY operation_id=\(generation) phase=started result=pending " +
                         "requested_reason=\(reason) effective_reason=\(effectiveReason) " +
@@ -3218,10 +3413,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                         "state={\(self.audioOutput.diagnosticState())}"
                 )
                 self.refreshAudioDevices()
+                self.audioRecoveryInFlightGeneration = generation
                 self.applyAudioSettings(reason: "recovery_\(effectiveReason)") { [weak self] _ in
                     guard let self,
                           self.audioRecoveryGeneration == generation
                     else { return }
+                    if self.audioRecoveryInFlightGeneration == generation {
+                        self.audioRecoveryInFlightGeneration = nil
+                    }
                     let completedSnapshot = self.audioOutput.diagnosticSnapshot()
                     let ready = completedSnapshot.engineRunning &&
                         completedSnapshot.playerPlaying &&
@@ -3238,11 +3437,139 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                             "state={\(self.audioOutput.diagnosticState())}"
                     )
                     self.audioRecoveryWorkItem = nil
+                    if ready {
+                        self.resetAudioRecoveryRetryState()
+                    } else if self.shouldKeepVirtualAudioActive,
+                              !self.systemAudioSuspensionState.isSuspended {
+                        self.scheduleAudioRecoveryRetry(reason: effectiveReason)
+                    } else {
+                        let reason = self.systemAudioSuspensionState.isSuspended
+                            ? "system_suspended"
+                            : "virtual_audio_inactive"
+                        self.skipAudioRecoveryRetry(reason: reason)
+                    }
                 }
             }
             self.audioRecoveryWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
         }
+    }
+
+    private func skipAudioRecoveryRetry(reason: String) {
+        let attempts = audioRecoveryBackoffState.retryCount
+        audioRecoveryRetryWorkItem?.cancel()
+        audioRecoveryRetryWorkItem = nil
+        audioRecoveryInFlightGeneration = nil
+        audioRecoveryBackoffState.reset()
+        AppLogger.shared.write(
+            "AUDIO RECOVERY retry_skipped reason=\(reason) " +
+                "attempt=\(attempts) state={\(audioOutput.diagnosticState())}"
+        )
+    }
+
+    private func scheduleAudioRecoveryRetry(reason: String) {
+        guard started else {
+            audioRecoveryRetryWorkItem = nil
+            return
+        }
+        guard !systemAudioSuspensionState.isSuspended else {
+            skipAudioRecoveryRetry(reason: "system_suspended")
+            return
+        }
+        guard shouldKeepVirtualAudioActive else {
+            skipAudioRecoveryRetry(reason: "virtual_audio_inactive")
+            return
+        }
+        guard !macMicrophoneState.isActive else {
+            skipAudioRecoveryRetry(reason: "mac_microphone_active")
+            return
+        }
+        guard let delay = audioRecoveryBackoffState.nextRetryDelay() else {
+            audioRecoveryRetryWorkItem = nil
+            audioRecoveryInFlightGeneration = nil
+            audioRecoveryRetryExhausted = true
+            AppLogger.shared.write(
+                "AUDIO RECOVERY retry_exhausted reason=\(reason) " +
+                    "attempts=\(audioRecoveryBackoffState.retryCount) " +
+                    "state={\(audioOutput.diagnosticState())}"
+            )
+            return
+        }
+        let attempt = audioRecoveryBackoffState.retryCount
+        audioRecoveryRetryWorkItem?.cancel()
+        let generation = audioRecoveryGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.started,
+                  self.audioRecoveryGeneration == generation
+            else { return }
+            self.audioRecoveryInFlightGeneration = nil
+            let snapshot = self.audioOutput.diagnosticSnapshot()
+            if snapshot.engineRunning,
+               snapshot.playerPlaying,
+               snapshot.boundToSelectedDevice == true {
+                self.audioRecoveryBackoffState.reset()
+                self.audioRecoveryRetryWorkItem = nil
+                self.audioRecoveryInFlightGeneration = nil
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY retry completed result=ready reason=already_healthy " +
+                        "attempt=\(attempt)"
+                )
+                return
+            }
+            guard self.systemAudioSuspensionState.isSuspended == false else {
+                self.skipAudioRecoveryRetry(reason: "system_suspended")
+                return
+            }
+            guard self.shouldKeepVirtualAudioActive else {
+                self.skipAudioRecoveryRetry(reason: "virtual_audio_inactive")
+                return
+            }
+            guard !self.macMicrophoneState.isActive else {
+                self.skipAudioRecoveryRetry(reason: "mac_microphone_active")
+                return
+            }
+            guard self.hasActiveVirtualAudioSource || snapshot.pendingBuffers > 0 else {
+                self.skipAudioRecoveryRetry(reason: "no_active_audio")
+                return
+            }
+            AppLogger.shared.write(
+                "AUDIO RECOVERY retry started attempt=\(attempt) " +
+                    "delay_ms=\(Int(delay * 1_000)) reason=\(reason) " +
+                    "state={\(self.audioOutput.diagnosticState())}"
+            )
+            self.audioRecoveryInFlightGeneration = generation
+            self.applyAudioSettings(reason: "recovery_retry") { [weak self] _ in
+                guard let self,
+                      self.audioRecoveryGeneration == generation
+                else { return }
+                if self.audioRecoveryInFlightGeneration == generation {
+                    self.audioRecoveryInFlightGeneration = nil
+                }
+                let completedSnapshot = self.audioOutput.diagnosticSnapshot()
+                let ready = completedSnapshot.engineRunning &&
+                    completedSnapshot.playerPlaying &&
+                    completedSnapshot.boundToSelectedDevice == true
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY retry completed " +
+                        "result=\(ready ? "ready" : "degraded") attempt=\(attempt) " +
+                        "reason=\(reason) " +
+                        "engine_running=\(completedSnapshot.engineRunning) " +
+                        "player_playing=\(completedSnapshot.playerPlaying) " +
+                        "bound_to_selected=\(self.optionalDiagnosticBool(completedSnapshot.boundToSelectedDevice)) " +
+                        "pending_buffers=\(completedSnapshot.pendingBuffers) " +
+                        "pending_samples=\(completedSnapshot.pendingSamples) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                if ready {
+                    self.resetAudioRecoveryRetryState()
+                } else {
+                    self.scheduleAudioRecoveryRetry(reason: reason)
+                }
+            }
+        }
+        audioRecoveryRetryWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private static func audioHardwarePropertyNames(
@@ -3567,23 +3894,37 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 #endif
     }
 
+    /// 排一次原生键映射的恢复重试。
+    ///
+    /// - Parameter requiresReadyBridge: 蓝牙桥是否必须 ready。语音键持久化分支要求
+    ///   ready；设备匹配失败引发的那次不要求——设备已经匹配说明它就在位，只是 HID
+    ///   服务还没枚举出来，而重连时蓝牙桥恰好可能还没回到 ready。
     private func scheduleHIDMappingRecoveryIfNeeded(
-        restartSiriRemote: Bool = true
+        restartSiriRemote: Bool = true,
+        requiresReadyBridge: Bool = true
     ) {
         guard hidMappingRecoveryWorkItem == nil else { return }
-        guard let delay = HIDMappingRecoveryPolicy.retryDelay(
-            forAttempt: hidMappingRecoveryAttempt,
-            started: started,
-            readyBridgeCount: readyBluetoothBridgeCount,
-            hasMatchingServices: voiceFunctionMapper.hasMatchingServices
-        ) else {
+        let hasMatchingServices = voiceFunctionMapper.hasMatchingServices
+        guard let delay = (requiresReadyBridge
+            ? HIDMappingRecoveryPolicy.retryDelay(
+                forAttempt: hidMappingRecoveryAttempt,
+                started: started,
+                readyBridgeCount: readyBluetoothBridgeCount,
+                hasMatchingServices: hasMatchingServices
+            )
+            : HIDMappingRecoveryPolicy.deviceVerificationRetryDelay(
+                forAttempt: hidMappingRecoveryAttempt,
+                started: started,
+                hasMatchingServices: hasMatchingServices
+            ))
+        else {
             if started,
-               readyBluetoothBridgeCount > 0,
-               !voiceFunctionMapper.hasMatchingServices,
+               !hasMatchingServices,
                hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
                 AppLogger.shared.write(
                     "HID MAPPING RECOVERY exhausted attempts=\(hidMappingRecoveryAttempt) " +
-                        "ready_bridges=\(readyBluetoothBridgeCount)"
+                        "ready_bridges=\(readyBluetoothBridgeCount) " +
+                        "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
                 )
             }
             return
@@ -3597,7 +3938,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             guard let self, self.hidMappingRecoveryGeneration == generation else { return }
             self.hidMappingRecoveryWorkItem = nil
             guard self.started,
-                  self.readyBluetoothBridgeCount > 0,
+                  !requiresReadyBridge || self.readyBluetoothBridgeCount > 0,
                   !self.voiceFunctionMapper.hasMatchingServices
             else {
                 self.cancelHIDMappingRecovery(reason: "conditions_changed")
@@ -3605,21 +3946,28 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
             AppLogger.shared.write(
                 "HID MAPPING RECOVERY applying attempt=\(attempt) " +
-                    "ready_bridges=\(self.readyBluetoothBridgeCount)"
+                    "ready_bridges=\(self.readyBluetoothBridgeCount) " +
+                    "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
             )
             self.applyHIDSettings(restartSiriRemote: restartSiriRemote)
             if !self.voiceFunctionMapper.hasMatchingServices {
                 self.scheduleHIDMappingRecoveryIfNeeded(
-                    restartSiriRemote: restartSiriRemote
+                    restartSiriRemote: restartSiriRemote,
+                    requiresReadyBridge: requiresReadyBridge
                 )
             }
         }
         hidMappingRecoveryWorkItem = workItem
         AppLogger.shared.write(
             "HID MAPPING RECOVERY scheduled attempt=\(attempt) " +
-                "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount)"
+                "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount) " +
+                "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
         )
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private static func hidMappingRecoveryTrigger(_ requiresReadyBridge: Bool) -> String {
+        requiresReadyBridge ? "bridge_ready" : "device_verification"
     }
 
     private func completeHIDMappingRecoveryIfNeeded() {
@@ -3720,7 +4068,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             ) {
                 return binding
             }
-            return settings.configuredAction(for: button, trigger: trigger, profileID: device)
+            return settings.configuredGlobalAction(for: button, trigger: trigger, profileID: device)
         }
         return (resolve(.singleClick), resolve(.longPress))
     }
@@ -3878,6 +4226,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             prepareNativeKeys: { [weak self] in self?.remoteNativeKeyMapper.prepare() == true },
             restoreNativeKeys: { [weak self] in self?.remoteNativeKeyMapper.restore() }
         )
+        // 设备匹配先于 HID 服务可枚举：重连时校验只跑一次就会得到 no_service，
+        // 不排一次重试的话设备永久不被接管，语音键的 F5→Fn 映射也再不会写回去。
+        monitor.onNativeMappingVerificationFailed = { [weak self] in
+            self?.scheduleHIDMappingRecoveryIfNeeded(
+                restartSiriRemote: false,
+                requiresReadyBridge: false
+            )
+        }
         monitor.claimsRuntimeButton = { [weak self] profileID, button in
             self?.claimsButtonGestureLearning(profileID: profileID) == true ||
             self?.membershipFeature.claimsCommonPhrase(
@@ -5222,6 +5578,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 profileID: profileID,
                 button: button,
                 trigger: .singleClick
+            ) || settings.applicationButtonOverrideExists(
+                for: button,
+                trigger: .singleClick
             ),
             frontmostBundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         ) else { return }
@@ -5263,6 +5622,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                       hasSingleActionOverride: self.macroFeature.hasActiveBinding(
                           profileID: profileID,
                           button: button,
+                          trigger: .singleClick
+                      ) || self.settings.applicationButtonOverrideExists(
+                          for: button,
                           trigger: .singleClick
                       ),
                       frontmostBundleIdentifier:
@@ -5332,7 +5694,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     profileID: profileID,
                     button: button,
                     trigger: trigger
-                )
+                ) || settings.applicationButtonOverrideExists(for: button, trigger: trigger)
             }
     }
 
@@ -7127,7 +7489,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 
     func configureMacMicrophoneForSettingsScreenshot(_ state: String) {
         guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
-        macMicrophoneDevices = [AudioDeviceInfo(id: 0, uid: "screenshot-mic", name: settings.applicationLanguage == .english ? "Mac microphone" : "Mac 麦克风")]
+        let builtInName = settings.applicationLanguage == .english
+            ? "MacBook Pro Microphone" : "MacBook Pro 麦克风"
+        macMicrophoneDevices = [
+            AudioDeviceInfo(id: 0, uid: "screenshot-mic", name: builtInName),
+        ]
         audioDevices = [AudioDeviceInfo(id: 0, uid: "MiRemoteV2ch_UID", name: "SayAll")]
         settings.macMicrophoneInputUID = "screenshot-mic"
         settings.selectedAudioDeviceUID = "MiRemoteV2ch_UID"
@@ -7138,8 +7504,38 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         case "preparing": macMicrophoneState = .preparing
         case "stopping": macMicrophoneState = .stopping
         case "permission": macMicrophoneState = .failed(.permission)
-        case "shortcut_unavailable": macMicrophoneShortcutAvailable = false
+        case "no_device":
+            macMicrophoneDevices = []
+            settings.macMicrophoneInputUID = ""
+            macMicrophoneState = .idle
         default: macMicrophoneState = .idle
+        }
+    }
+
+    func configureVoiceOutputForSettingsScreenshot(_ state: String) {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
+        switch state {
+        case "missing":
+            audioDevices = [AudioDeviceInfo(
+                id: 0,
+                uid: "screenshot-speaker",
+                name: settings.applicationLanguage == .english ? "Mac Speakers" : "Mac 扬声器"
+            )]
+            settings.selectedAudioDeviceUID = ""
+            audioStatus = LocalizedMessage("audio.output.none_selected")
+        case "compatible":
+            audioDevices = [AudioDeviceInfo(
+                id: 0,
+                uid: DoubaoAudioDevicePolicy.deviceUID,
+                name: DoubaoAudioDevicePolicy.deviceName
+            )]
+            settings.selectedAudioDeviceUID = DoubaoAudioDevicePolicy.deviceUID
+            audioStatus = LocalizedMessage(
+                "audio.output.current_format",
+                arguments: [DoubaoAudioDevicePolicy.deviceName]
+            )
+        default:
+            break
         }
     }
 
@@ -7545,6 +7941,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             button: button,
             trigger: trigger
         )
+        guard !settings.applicationButtonOverrideExists(for: button, trigger: trigger) else {
+            return false
+        }
         let handled = macroFeature.executeBoundAction(
             profileID: profileID,
             button: button,
@@ -8200,6 +8599,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         isAudioOutputReady = audioOutput.isReadyForTestTone
         guard !isAudioOutputReady else {
+            invalidatePendingAudioRecovery()
             AppLogger.shared.write(
                 "SYSTEM AUDIO resume_skipped reason=\(reason) already_ready=true " +
                     "state={\(audioOutput.diagnosticState())}"

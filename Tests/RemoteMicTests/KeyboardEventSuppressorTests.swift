@@ -313,7 +313,7 @@ struct KeyboardEventSuppressorTests {
         _ button: RemoteButton, _ isSeized: Bool
     ) throws {
         let suite = "KeyboardEventSuppressorTests.earlyVolume.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -357,7 +357,7 @@ struct KeyboardEventSuppressorTests {
         _ button: RemoteButton, _ disconnectWhileHeld: Bool
     ) throws {
         let suite = "KeyboardEventSuppressorTests.sourceNeutralized.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -403,7 +403,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.volumeUp, .volumeDown, .tv])
     func sourceMappingDoesNotDisableNativeSuppression(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.sourceMappingFallback.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -436,7 +436,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.left, .right])
     func sourceIsolatedDefaultArrowsAreExecutedInsteadOfWaitingForNativePassthrough(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.defaultArrows.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -464,7 +464,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.left, .right, .up, .down])
     func monitoredDirectionalPressOwnsItsLeakedNativeEvent(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.directionalLeak.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -510,7 +510,7 @@ struct KeyboardEventSuppressorTests {
     /// 原生事件执行。此时若抢先登记，唯一一次移动会被吞掉，按键完全没有反应。
     @Test func monitoredPassthroughKeepsTheNativeArrowAsTheOnlyMove() throws {
         let suite = "KeyboardEventSuppressorTests.directionalPassthrough.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -550,7 +550,7 @@ struct KeyboardEventSuppressorTests {
         _ button: RemoteButton
     ) throws {
         let suite = "KeyboardEventSuppressorTests.directionalFallbackOff.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -596,7 +596,7 @@ struct KeyboardEventSuppressorTests {
     @Test(arguments: [RemoteButton.left, .right])
     func unneutralizedDirectionalKeepsItsArmingWithoutTheFallback(_ button: RemoteButton) throws {
         let suite = "KeyboardEventSuppressorTests.unneutralizedDirectional.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let settings = AppSettings(defaults: defaults)
         settings.customMappingEnabled = true
@@ -667,6 +667,42 @@ struct KeyboardEventSuppressorTests {
         #expect(!HIDRemoteMonitor.prearmsNativeEvent(
             for: .home, seized: false, neutralized: true, directionalFallback: true
         ))
+    }
+
+    /// 设备匹配成功、但原生键映射校验没过时必须回报一次：上层靠它排重试。
+    /// 2026-11-13 的 Intel 现场只有一次 `reason=no_service`，之后设备永久不被接管，
+    /// 语音键的 F5→Fn 映射再也没写回去，原生 F5 直接进了系统。
+    @Test func nativeMappingVerificationFailureIsReportedOncePerAttempt() throws {
+        let suite = "KeyboardEventSuppressorTests.nativeMappingFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        let suppressor = KeyboardEventSuppressor(logger: { _ in })
+        var serviceReady = false
+        var failures = 0
+        let monitor = HIDRemoteMonitor(
+            settings: settings, eventSuppressor: suppressor, ownsEventSuppressor: false,
+            runtimePermissions: { true }, actionPerformer: { _, _, _ in true },
+            frontmostBundleIdentifier: { PresetApplication.safari.bundleIdentifier },
+            diagnosticLogger: { _ in },
+            prepareNativeKeys: { serviceReady }
+        )
+        monitor.onNativeMappingVerificationFailed = { failures += 1 }
+
+        // 服务还没枚举出来：连接被拒，同时回报一次。
+        #expect(!monitor.connectSimulatedDevice(
+            fingerprint: "service-pending", profileID: settings.selectedRemoteProfileID
+        ))
+        #expect(failures == 1)
+
+        // 服务就绪后校验通过，不应再回报——否则会无谓重启整套 HID 监视。
+        serviceReady = true
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "service-ready", profileID: settings.selectedRemoteProfileID
+        ))
+        #expect(failures == 1)
+        monitor.disconnectSimulatedDevice()
     }
 
     @Test(arguments: [Int32(0), Int32(1)])
@@ -983,5 +1019,79 @@ struct KeyboardEventSuppressorTests {
                 now: 12
             )
         )
+    }
+
+    // MARK: - 切换器会话的诊断量
+
+    @Test func switcherRepeatsAreCountedInsteadOfWrittenPerRepeat() {
+        // 方向键连发 100ms 一次，而且每次成功都会重置 15 秒会话超时，所以按住不放
+        // 就是一直写。这类重复动作没有逐条诊断价值，只应该累加到会话汇总里。
+        var policy = AppSwitcherDiagnosticPolicy()
+        for _ in 1...600 {
+            policy.recordRepeat(button: "left")
+        }
+        policy.recordRepeat(button: "right")
+        #expect(policy.repeatCount == 601)
+        // 「哪个方向」这个信息不能因为不逐条写就丢掉。
+        #expect(policy.repeatBreakdown == "left:600,right:1")
+        // 连发不产生任何状态行。
+        #expect(policy.stateLineCount == 0)
+        #expect(policy.statePollCount == 0)
+    }
+
+    @Test func switcherRepeatBreakdownIsStableWhenNothingRepeats() {
+        let policy = AppSwitcherDiagnosticPolicy()
+        #expect(policy.repeatCount == 0)
+        #expect(policy.repeatBreakdown == "none")
+    }
+
+    @Test func switcherStateIsWrittenOnlyWhenTheStableSignalChanges() {
+        var policy = AppSwitcherDiagnosticPolicy()
+        var written = 0
+        // 30 次轮询都报同一份状态：切换器可见、Dock 窗口数高于基线。
+        for _ in 1...30 {
+            if policy.recordStatePoll(signature: "visible|above") { written += 1 }
+        }
+        #expect(written == 1)
+        #expect(policy.statePollCount == 30)
+        #expect(policy.stateLineCount == 1)
+
+        // 真的变了才再写一行。
+        let changed = policy.recordStatePoll(signature: "hidden|at")
+        #expect(changed)
+        #expect(policy.stateLineCount == 2)
+    }
+
+    @Test func switcherStateLinesAreCappedPerSession() {
+        // 两个信号本身会在区间内来回跳（macOS 13 真机日志：19/22 次会话在 1 秒内
+        // 被误判成“已关闭”），所以只靠变化判定仍然可能每 tick 一行，必须有上限。
+        var policy = AppSwitcherDiagnosticPolicy()
+        var written = 0
+        for index in 1...200 {
+            let signature = index.isMultiple(of: 2) ? "visible|above" : "hidden|at"
+            if policy.recordStatePoll(signature: signature) { written += 1 }
+        }
+        #expect(written == AppSwitcherDiagnosticPolicy.maximumStateLines)
+        #expect(policy.statePollCount == 200)
+        #expect(policy.stateLineCount == AppSwitcherDiagnosticPolicy.maximumStateLines)
+    }
+
+    @Test func switcherEndedLineCarriesTheSessionTotals() throws {
+        // 连发与状态轮询都改成计数后，这些数字必须真的落到收尾那一行，
+        // 否则现场只剩一条「ended」，看不出会话里到底发生了什么。
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent(
+            "Sources/RemoteMic/HIDRemoteMonitor.swift"
+        ), encoding: .utf8)
+        #expect(source.contains("repeat_count=\\(appSwitcherDiagnostics.repeatCount)"))
+        #expect(source.contains("repeat_buttons=\\(appSwitcherDiagnostics.repeatBreakdown)"))
+        #expect(source.contains("state_polls=\\(appSwitcherDiagnostics.statePollCount)"))
+        #expect(source.contains("state_lines=\\(appSwitcherDiagnostics.stateLineCount)"))
+        // 逐条连发日志已经移除，别再被加回来。
+        #expect(!source.contains("phase=repeat success=true"))
+        // 状态轮询必须经过限流，不能直接写。
+        #expect(source.contains("appSwitcherDiagnostics.recordStatePoll("))
+        #expect(source.contains("appSwitcherDiagnostics = AppSwitcherDiagnosticPolicy()"))
     }
 }
