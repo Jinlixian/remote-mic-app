@@ -1,0 +1,4 @@
+{
+  "lldb-dap.executable-path": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
+  "debug.onTaskErrors": "abort"
+}
