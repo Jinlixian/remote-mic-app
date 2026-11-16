@@ -1538,3 +1538,4 @@
 
 "application_buttons.target.title" = "Open a Custom App";
 "application_buttons.target.hint" = "Choose an app to open. Its focus behavior is still defined by that app’s settings.";
+"button_mapping.profile.created.detail" = "Switched to the new profile";
