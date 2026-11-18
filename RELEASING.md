@@ -7,7 +7,7 @@
 - Preview：普通版本从精确 `origin/main` SHA 构建一次；紧急 Hotfix 只允许从当前稳定 Tag 派生的精确 `origin/hotfix/vX.Y.Z` SHA 构建。两者都必须完成真实 UI 升级后才能发布公开 Pre-release。
 - Stable：用户明确指定一个已经发布并验证通过的 Pre-release，将它改为正式版；不重新构建。
 - 本地测试包：只为验证、不发布时，可以从任意分支或工作树打包。它不参加 Preview/Stable 候选、不上传 Release、不冒用 Preview/Stable 的版本号与已冻结 Build 号；但它仍是「一次打包」，必须按下方 Build 号不变量先递增自己的 `CFBundleVersion`。基线约束的放宽只对「不发布」这一种用途成立。
-- Build 号不变量：任何打包前都必须先递增 `CFBundleVersion`，再执行构建、签名、公证或上传。Preview、Hotfix、本地测试包和私有内部 Draft 一律适用，不存在「先打包、需要时再补号」或「只有 Preview 才升号」的例外。递增必须写进源码并被记录：本地测试包和私有 Draft 在独立的打包 worktree 与打包分支里递增并提交，不把递增留在公开 `main` 工作区。**不得为了让工作区变干净而回滚、复用或跳回旧 Build 号**；一个 Build 号只能对应一个已产出的包，已经用掉的号即使没有对应源码提交也不能再次使用，需要继续往前递增。**Build 号的唯一记录是远端已发布的标签**：私有 Draft 的标签形如 `v<版本>-local.<build>`，下一次的起点取远端该形态标签的最大值加一。`Resources/Info.plist` 只保存源码里的起点值，不跟随打包递增，因此**不得**把 `plutil` 读到的数字当作基线——2026-11-02 就因为按 plist 的 270 递增，撞上了已被 `v2.0.0-local.271`–`280` 占用的号段。打包前用 private-draft-release skill 的 `increment_macos_build.sh --plist <Info.plist> --repo <分发仓库>`，它会取远端最大标签与 plist 的较大值再递增；远端不可查时必须先人工确认最大值，不得直接对 plist 加一。**Build 号跨版本连续递增**：升级 `CFBundleShortVersionString` 不重置它——Draft 取远端所有 `v*-local.<build>` 标签的最大值（不限版本），Preview 取 main 上当前 `CFBundleVersion` 之后的下一个可用号。Draft 的版本号同样取自打包 worktree 的 `Resources/Info.plist`，**不固定**为某个值：`v2.0.0-local.N` 只是主线当前恰好在 2.0.0，切到 2.1.0 后 Draft 就是 `v2.1.0-local.N`。
+- Build 号不变量：任何打包前都必须先递增 `CFBundleVersion`，再执行构建、签名、公证或上传。Preview、Hotfix、本地测试包和私有内部 Draft 一律适用，不存在「先打包、需要时再补号」或「只有 Preview 才升号」的例外。递增必须写进源码并被记录：本地测试包和私有 Draft 在独立的打包 worktree 与打包分支里递增并提交，不把递增留在公开 `main` 工作区。**不得为了让工作区变干净而回滚、复用或跳回旧 Build 号**；一个 Build 号只能对应一个已产出的包，已经用掉的号即使没有对应源码提交也不能再次使用，需要继续往前递增。**Build 号的唯一记录是远端已发布的标签**：私有 Draft 的标签形如 `v<版本>-local.<build>`，下一次的起点取远端该形态标签的最大值加一。`Resources/Info.plist` 只保存源码里的起点值，不跟随打包递增，因此**不得**把 `plutil` 读到的数字当作基线——2026-11-02 就因为按 plist 的 270 递增，撞上了已被 `v2.0.0-local.271`–`280` 占用的号段。打包前用 private-draft-release skill 的 `increment_macos_build.sh --plist <Info.plist> --repo <分发仓库>`，它会取远端最大标签与 plist 的较大值再递增；远端不可查时必须先人工确认最大值，不得直接对 plist 加一。**Build 号跨版本连续递增**：升级 `CFBundleShortVersionString` 不重置它——Draft 取远端所有 `v*-local.<build>` 标签的最大值（不限版本）加 1；Preview 取同一组远端标签最大值与 main 上当前 `CFBundleVersion` 的较大值加 10，为其间新增的私有 Draft 留出号段。私有 Draft 标签不可查时，Preview 元数据准备必须停止，不能退回只按 plist 递增。Draft 的版本号同样取自打包 worktree 的 `Resources/Info.plist`，**不固定**为某个值：`v2.0.0-local.N` 只是主线当前恰好在 2.0.0，切到 2.1.0 后 Draft 就是 `v2.1.0-local.N`。
 - 发布 Workflow 只能从精确 `origin/main` 运行。普通新候选源码只能来自 `main`；`hotfix/vX.Y.Z` 是唯一允许的新候选源码例外。`release-main` 冻结为只读历史，但已公开的旧 Pre-release 可按兼容晋升门禁完成正式化。
 - 发布基线：Draft 与 Pre-release 只能从最新 `origin/main`（外加只含 Build 号递增与 `packaging/**` 政策锁的打包提交）构建，入口门禁见 `scripts/verify-release-baseline.sh`。构建来源写进 App 的 `Info.plist`，发布说明的 `Commit：` 必须来自实际构建树，不得手写。
 - 私有内部 Draft：使用 private-draft-release skill 的独立路径，目标仓库固定为 GetSayAll/SayAll，不在公开源码仓库创建内部 Draft。
@@ -112,8 +112,10 @@ scripts/verify-release-baseline.sh --require <本次要发布的合并提交>
 
    scripts/prepare-preview-release.sh <requested-version> <build> <zh-notes> <en-notes>
 
-3. 脚本只修改这三个文件，并检查 Release Notes 不含内部入口、邀请码、凭据或实现细节。若 Tag、Release 或公开分发资产已经占用请求版本，只递增最后一位并选更高 Build；公开资产占用检查覆盖 10 个 CDN 固定路径，只有 HTTP 404 才算可用，2xx/3xx 视为占用，认证、权限、5xx、超时或其他未知响应 fail closed。单纯的 CI、Runner、GitHub、Apple 或网络故障不占用版本，不得升版本。
+3. 脚本只修改这三个文件，并检查 Release Notes 不含内部入口、邀请码、凭据或实现细节。Build 参数是最低请求值：脚本取私有 Draft 远端 `v*-local.<build>` 标签最大值与 main 当前 `CFBundleVersion` 的较大值加 10，再与请求值取较大者；私有 Draft 标签查询失败时停止。若 Tag、Release 或公开分发资产已经占用请求版本，只递增最后一位并选更高 Build；公开资产占用检查覆盖 10 个 CDN 固定路径，只有 HTTP 404 才算可用，2xx/3xx 视为占用，认证、权限、5xx、超时或其他未知响应 fail closed。单纯的 CI、Runner、GitHub、Apple 或网络故障不占用版本，不得升版本。
 4. 运行 git diff --check、Swift/脚本测试和必要的 UI/功能测试，创建普通 PR 合入 main。合入后重新 fetch，记录用于 staging 的精确 `origin/main` SHA；不再同步到其他发布分支。
+
+仅修改 `Resources/Info.plist` 的 `CFBundleShortVersionString`/`CFBundleVersion` 和两份 ReleaseHistory 的元数据 PR 走 `release_metadata_only` 快速通道：CI 只运行元数据校验，不执行 Swift 测试和双架构构建；main 就绪检查继承最近一次 first-parent 全量产品证明，并要求产品证明到该 SHA 的差异仍为 release-metadata-only。任何其他 Info.plist 键、Sources、Tests、Package、config、scripts、workflow 或依赖改动自动回到完整产品验证。staging 仍从该精确 `main` SHA 真实构建双架构并签名、公证，快速通道不生成发布字节。
 
 ReleaseHistory 的版本标题由 `scripts/sync-release-history-labels.mjs` 按 GitHub Release 状态统一标记：正式版使用“正式版 / Stable”，公开候选使用“预发布 / Pre-release”。同步工作流会在 Release 状态变化时运行，并每三天兜底检查一次，也可以手动触发；官网只同步这两份已标记的主仓库文件，不在官网单独判断版本渠道。
 
@@ -138,16 +140,17 @@ AI 整理在本次分发协议中保持关闭。`include_ai=true` 在接触发�
 - 对 App、Framework、XPC、Helper、Installer、PKG 和 ZIP 完成 Developer ID 签名、Apple 公证、staple、Gatekeeper 和权限/符号链接校验；DMG 可以作为内部构建中间产物，但不进入公开下载资产。
 - 使用独立 SwiftPM scratch/output，独立提交可并行的 PKG 公证；
 - 生成 canonical public bundle、staged-assets.json 和 stage record；
-- 上传不可变 payload artifact 与 stage record；
+- 上传不可变 payload artifact、UI 专用 payload artifact 与 stage record；
+- UI 专用 payload 只包含 Apple Silicon ZIP、appcast、双语说明和完整 `staged-assets.json`，用于减少本机 UI 验收下载；publication 仍只使用完整 payload。UI 恢复必须用 stage record 绑定的完整签名 artifact 身份核对，不能用 UI 子集替代签名身份；
 - 不创建 Tag、GitHub Release、appcast 公开地址或任何产品分支。
 
-签名阶段内部 supervisor 1200 秒，单个架构变体预算为 1140 秒，公证阶段预算为 600 秒，GitHub step 硬上限 1800 秒。超时只终止本次阶段并保留第一份错误日志；不静默重打或以升版本掩盖基础设施故障。
+签名阶段内部 supervisor 1200 秒，单个架构变体预算为 1140 秒，Swift 编译单架构预算 600 秒，App 组装预算 450 秒，公证阶段预算为 600 秒，GitHub step 硬上限 1800 秒。超时只终止本次阶段并保留第一份错误日志；不静默重打或以升版本掩盖基础设施故障。
 
 ## 真实 Sparkle UI 验收
 
 受保护 staging 成功后，在公开 Tag/Release 建立前执行：
 
-1. scripts/prepare-staged-preview-ui-test.sh 下载指定 Run、attempt 和 artifact ID，不使用 latest artifact；同时动态下载并验证发布开始时记录的 stable latest 公开归档。
+1. scripts/prepare-staged-preview-ui-test.sh 下载指定 Run、attempt 和 artifact ID，不使用 latest artifact；存在 UI 专用 payload 时优先使用，旧 Run 没有该 artifact 时回退到完整 payload。它同时动态下载并验证发布开始时记录的 stable latest 公开归档。
 2. 用本地固定 feed，只把生产 appcast 的不可变 URL 前缀替换为本地地址，确保 enclosure 是 staging 的同一 ZIP。
 3. 使用稳定版 App 的真实 Sparkle UI 完成 check、download、install、首次启动、退出和二次启动；验证版本/Build、Team ID L3QHLDRPAY、公证、Gatekeeper、Sparkle helper 的 0755 权限和 Versions/Current 链接。
 4. 检查没有新增崩溃报告、应用可以再次启动，并用 scripts/record-preview-ui-attestation.sh 生成结构化证明。仅运行 Sparkle CLI probe、单元测试或静态解压不能替代真实 UI 安装；该步骤未完成时不得公开 Preview。
@@ -175,7 +178,7 @@ BuildSigningTests 按相关源码、资源、构建、安装、依赖或 workflo
 
 仅修改开发启动入口 script/build_and_run.sh 时，不触发产品构建或发布检查；该入口不在 CI 中执行，其改动不能冒充新的产品验证证明。发布只允许继承经核对无产品变化的既有双架构证明。
 
-文档、上述手工入口及精确治理 allowlist（verify-repository-governance.sh、repository-governance.yml）的单类改动在 Ubuntu 分类和检查，不启动 Mac、Swift 或私有 checkout。required contexts 保持原名，但只表示适用检查通过，不表示产品重新构建。混合产品、未知路径、mac-ci.yml 和分类器自身改动仍走完整矩阵。发布遇到快速检查时，必须核对同分支 first-parent 的成功双架构产品证明及整个祖先差异；产品差异不得继承。PR 新提交可取消旧 PR CI；main/Hotfix 按 SHA 隔离并保留必要验证，不因新 Push 取消 running 或替换 pending。
+文档、上述手工入口及精确治理 allowlist（verify-repository-governance.sh、repository-governance.yml）的单类改动在 Ubuntu 分类和检查，不启动 Mac、Swift 或私有 checkout。required contexts 保持原名，但只表示适用检查通过，不表示产品重新构建。release-metadata-only 快速检查同样在 Ubuntu 运行元数据校验；发布继承产品证明时额外要求产品证明到候选 SHA 的整个差异为 release-metadata-only。混合产品、未知路径、mac-ci.yml 和分类器自身改动仍走完整矩阵。发布遇到快速检查时，必须核对同分支 first-parent 的成功双架构产品证明及整个祖先差异；产品差异不得继承。PR 新提交可取消旧 PR CI；main/Hotfix 按 SHA 隔离并保留必要验证，不因新 Push 取消 running 或替换 pending。
 
 2026-10-02 已移除 RC003 专用实验包构建、两个 RC003 启动器、Siri 手工蓝牙 trace、旧语音验收和 Chromecast 旧日志监听工具；这些一次性或过时工具不是当前产品、测试包或日志收集入口。现行测试包使用统一签名、公证流程，日志收集按 Testing/RuntimeLogging.md 执行。历史 Bug 文档中出现的旧工具名称只保留为当时的调查证据。
 

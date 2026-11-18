@@ -349,10 +349,10 @@
 "remote.device.model.rc001" = "Xiaomi Bluetooth Remote 2";
 "remote.device.model.rc003" = "Xiaomi Bluetooth Remote 2 Pro";
 "remote.device.model.unrecognized" = "Unrecognized remote";
-"remote.device.model.apple_siri_remote_a2854" = "Apple Remote (7th Generation)";
-"remote.device.model.apple_siri_remote_a2540" = "Apple Remote (6th Generation)";
+"remote.device.model.apple_siri_remote_a2854" = "Apple Remote Type-C";
+"remote.device.model.apple_siri_remote_a2540" = "Apple Remote Lightning";
 "remote.device.model.chromecast_voice_remote" = "Chromecast Remote";
-"remote.device.model.unknown" = "Xiaomi Remote";
+"remote.device.model.unknown" = "Unidentified remote";
 "remote.device.custom_name" = "Custom name";
 "remote.device.bind_button" = "Set Up Button Controls";
 "remote.device.binding_waiting" = "Press any button except the voice button on this remote";
@@ -480,9 +480,9 @@
 "audio.action.refresh_devices" = "Refresh Devices";
 "audio.action.learn_virtual_microphones" = "Get BlackHole";
 "audio.action.send_test_tone" = "Play Test Sound";
-"audio.output.privacy_help" = "Voice audio is sent to the selected device. When the last remote disconnects, macOS switches the Mac’s default microphone to a physical microphone if it was using this virtual device. On reconnect, SayAll restores the virtual microphone only if you have not changed that setting. The default speakers are never changed.";
+"audio.output.privacy_help" = "Voice audio is sent to the selected device. When the last device disconnects, macOS switches the Mac’s default microphone to a physical microphone if it was using this virtual device. On reconnect, SayAll restores the virtual microphone only if you have not changed that setting. The default speakers are never changed.";
 "audio.compatibility.open_install_guide" = "Open Driver Installation Guide";
-"audio.compatibility.missing_notice" = "No compatible virtual microphone was found. Your voice tool may not receive remote audio.";
+"audio.compatibility.missing_notice" = "No compatible virtual microphone was found. Your voice tool may not receive device audio.";
 "button_mapping.page.title" = "Button Mapping";
 "button_mapping.page.subtitle" = "Click a button to change its settings";
 "button_mapping.toggle.enabled" = "Custom Buttons";
@@ -1353,6 +1353,9 @@
 
 "custom_application.accessibility.needs_verification" = "Needs learning or verification";
 
+"button_mapping.action_failed.title" = "Button action did not complete";
+"button_mapping.action_failed.detail" = "This press did not run. Other buttons still work.";
+
 "settings.portable_configuration.title" = "Macros, app configurations, and button profiles";
 "connection.approval.title" = "Allow “%1$@” to connect to SayAll?";
 "connection.approval.watch_body" = "This Apple Watch will send button presses and microphone audio to SayAll. Check that its 2-digit code matches the code below. Allowing this connection saves this installation as a trusted device.";
@@ -1388,9 +1391,9 @@
 "audio.mac_microphone.input" = "Microphone";
 "audio.mac_microphone.none" = "None";
 "audio.mac_microphone.current" = "Current input:";
-"audio.mac_microphone.current.remote" = "Remote microphone";
+"audio.mac_microphone.current.remote" = "Device microphone";
 "audio.mac_microphone.fallback" = "Fallback microphone";
-"audio.mac_microphone.fallback_help" = "Talk into the selected microphone when the remote isn't in use; selecting one switches the macOS input device; remote audio is unaffected.";
+"audio.mac_microphone.fallback_help" = "Talk into the selected microphone when the device isn't in use; selecting one switches the macOS input device; device audio is unaffected.";
 "audio.mac_microphone.start" = "Speak with %@";
 "audio.mac_microphone.stop" = "Stop using %@";
 "audio.mac_microphone.error.no_audio" = "The selected microphone produced no audio. Check the connection or choose another microphone.";
@@ -1538,4 +1541,82 @@
 
 "application_buttons.target.title" = "Open a Custom App";
 "application_buttons.target.hint" = "Choose an app to open. Its focus behavior is still defined by that app’s settings.";
+/* Bounded remote recovery and per-device controls. */
+"connection.devices.title" = "Devices";
+"connection.devices.new.title" = "Connect a device";
+"connection.devices.new.detail" = "Run setup again to pair a new device.";
+"connection.devices.history.empty" = "No previously connected devices. New devices will appear here.";
+"connection.history.title" = "Previously connected devices";
+"connection.history.expanded" = "Expanded";
+"connection.history.collapsed" = "Collapsed";
+"connection.history.all_connected" = "These devices are connected";
+"connection.history.offline" = "Currently offline";
+"connection.history.empty" = "No device connected";
+"connection.history.keep_configuration" = "Your device settings are kept.";
+"connection.history.find" = "Find a device";
+"connection.history.connect" = "Connect";
+"connection.history.cancel" = "Cancel";
+"connection.history.open_bluetooth" = "Open Bluetooth settings";
+"connection.history.not_found_help" = "Make sure the device is on and nearby.";
+"connection.history.paused_help" = "Click Connect when you need this device.";
+"connection.history.status.waiting" = "Not connected";
+"connection.history.status.recovering" = "Connecting…";
+"connection.history.status.ready" = "Connected";
+"connection.history.status.paused" = "Auto-connect paused";
+"connection.history.status.not_found" = "Device not found";
+"connection.history.status.cancelled" = "Connection cancelled";
+"connection.history.retry" = "Retry";
+"connection.history.voice_key_ready" = "Voice button: Fn";
+"connection.history.cooldown" = "Wait a moment; manual attempts must be at least five seconds apart.";
 "button_mapping.profile.created.detail" = "Switched to the new profile";
+
+"remote.card.status.connected" = "Connected";
+"remote.card.detail.connected" = "Device connected. The button and voice functions that should be available are working normally.";
+
+"remote.card.status.disconnected" = "Not connected";
+"remote.card.detail.disconnected" = "The device is not connected.";
+
+"remote.card.status.checking" = "Checking";
+"remote.card.detail.checking" = "Device connected. Checking the buttons and entitled voice functions; not yet confirmed normal.";
+
+"remote.card.status.confirming" = "Confirming status";
+"remote.card.detail.confirming" = "Device connected. Confirming functional status; not marked normal until confirmed.";
+
+"remote.card.status.buttons_failed" = "Button issue";
+"remote.card.detail.buttons_failed" = "Device connected, but the buttons are not working.";
+
+"remote.card.status.voice_failed" = "Voice issue";
+"remote.card.detail.voice_failed" = "Device connected, but the entitled voice function is not working.";
+
+"remote.card.status.device_failed" = "Device issue";
+"remote.card.detail.device_failed" = "Device connected, but both the buttons and the entitled voice function are not working.";
+
+"remote.card.status.connecting" = "Connecting";
+"remote.card.detail.connecting" = "This connection attempt is bounded and can be cancelled.";
+
+"remote.card.status.not_found" = "Not found";
+"remote.card.detail.not_found" = "No device was found. Wake it nearby and click Connect.";
+
+"remote.card.status.paused" = "Auto-connect paused";
+"remote.card.detail.paused" = "Automatic recovery has stopped. Click Connect when needed.";
+
+"remote.card.status.cancelled" = "Cancelled";
+"remote.card.detail.cancelled" = "The connection attempt was cancelled. You can connect again when needed.";
+
+"remote.card.open_membership" = "Join";
+
+"remote.card.install.title" = "Install Apple remote component";
+
+"remote.card.install.detail" = "Apple remote support requires the optional component in the installer. Download the installer, select the Apple remote component, then return here to enable it. Enabling and ordinary buttons do not require membership.";
+
+"connection.siri_remote_component.title" = "Install Siri Remote component";
+
+"connection.siri_remote_component.detail" = "Installation requires one administrator authorization.";
+
+"connection.siri_remote_component.install" = "Install";
+
+"connection.siri_remote_component.retry" = "Retry";
+
+"connection.siri_remote_component.retry_detail" = "The previous installation did not finish. Retry is available; cancelling will not prompt again automatically.";
+
+"connection.siri_remote_component.installing" = "Waiting for administrator authorization…";

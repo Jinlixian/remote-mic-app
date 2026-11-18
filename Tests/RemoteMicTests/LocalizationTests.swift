@@ -21,6 +21,28 @@ struct LocalizationTests {
         }
     }
 
+    @Test func remoteCardStatusDetailsMatchTheApprovedDesign() throws {
+        let chinese = try strings(
+            at: repositoryRoot.appendingPathComponent("Resources/zh-Hans.lproj/Localizable.strings")
+        )
+        let english = try strings(
+            at: repositoryRoot.appendingPathComponent("Resources/en.lproj/Localizable.strings")
+        )
+        #expect(chinese["remote.card.detail.connected"] == "设备已连接，当前应当可用的按键和语音功能均正常。")
+        #expect(chinese["remote.card.detail.checking"] == "设备已连接，正在确认按键及已授权的语音功能；尚未确认一切正常。")
+        #expect(chinese["remote.card.detail.confirming"] == "设备已连接，正在确认功能状态；确认完成前不标记为正常。")
+        #expect(chinese["remote.card.detail.buttons_failed"] == "设备已连接，但按键功能出现问题。")
+        #expect(chinese["remote.card.detail.voice_failed"] == "设备已连接，但已授权的语音功能出现问题。")
+        #expect(chinese["remote.card.detail.device_failed"] == "设备已连接，但按键和已授权的语音功能均出现问题。")
+        #expect(chinese["remote.card.detail.connected"]?.contains("第三方 App") == false)
+        #expect(english["remote.card.detail.connected"] == "Device connected. The button and voice functions that should be available are working normally.")
+        #expect(english["remote.card.detail.checking"] == "Device connected. Checking the buttons and entitled voice functions; not yet confirmed normal.")
+        #expect(english["remote.card.detail.confirming"] == "Device connected. Confirming functional status; not marked normal until confirmed.")
+        #expect(english["remote.card.detail.buttons_failed"] == "Device connected, but the buttons are not working.")
+        #expect(english["remote.card.detail.voice_failed"] == "Device connected, but the entitled voice function is not working.")
+        #expect(english["remote.card.detail.device_failed"] == "Device connected, but both the buttons and the entitled voice function are not working.")
+    }
+
     @Test func screenshotResourceFallbackLoadsRepositoryLocalizations() throws {
         let suiteName = "RemoteMicTests.Localization.ScreenshotFallback.(UUID().uuidString)"
         let defaults = try #require(TestUserDefaults(suiteName: suiteName))
@@ -146,8 +168,8 @@ struct LocalizationTests {
                 entry.value.localizedCaseInsensitiveContains("voice tool")
         } == false)
         #expect(english["onboarding.voice_tool.system_fn.conflict"] == "The macOS Fn action needs to be changed")
-        #expect(english["remote.device.model.apple_siri_remote_a2854"] == "Apple Remote (7th Generation)")
-        #expect(english["remote.device.model.apple_siri_remote_a2540"] == "Apple Remote (6th Generation)")
+        #expect(english["remote.device.model.apple_siri_remote_a2854"] == "Apple Remote Type-C")
+        #expect(english["remote.device.model.apple_siri_remote_a2540"] == "Apple Remote Lightning")
         #expect(english["siri_remote.activation.open_membership"] == "Unlock membership feature")
         #expect(english["remote.button.full.play_pause"] == "Play/Pause")
         #expect(english["connection.web.title"] == "SayAll WeChat Mini Program")
@@ -184,8 +206,8 @@ struct LocalizationTests {
                 #expect(localized["onboarding.remote.voice_button_mistake.detail"] == "这一步检查普通控制键。请改为短按圆盘中间的确定键或任意方向键。")
                 #expect(localized["onboarding.voice_tool.weixin.title"] == "微信输入法")
                 #expect(localized["onboarding.voice_tool.system_fn.conflict"] == "系统仍在使用 Fn")
-                #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器第 7 代")
-                #expect(localized["remote.device.model.apple_siri_remote_a2540"] == "苹果遥控器第 6 代")
+                #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器 Type-C")
+                #expect(localized["remote.device.model.apple_siri_remote_a2540"] == "苹果遥控器 Lightning")
                 #expect(localized["siri_remote.activation.open_membership"] == "点击开通会员功能")
                 #expect(localized["connection.web.title"] == "无线麦 SayAll 微信小程序")
                 #expect(localized["connection.web.help_short"]?.contains("微信小程序") == false)

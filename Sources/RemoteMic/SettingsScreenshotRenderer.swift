@@ -297,6 +297,7 @@ enum SettingsScreenshotRenderer {
             transcriptArchiveStore: transcriptStore,
             recordingAssetStore: recordingStore
         )
+        model.configureSettingsScreenshotDefaults()
         if let rawModel = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_MODEL"
         ], let remoteModel = XiaomiRemoteModel(rawValue: rawModel) {
@@ -319,6 +320,17 @@ enum SettingsScreenshotRenderer {
                 batteryLevels: remoteCardBatteryLevels,
                 powerStates: remoteCardPowerStates
             )
+        }
+        if let scenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_RECOVERY"] {
+            model.configureRemoteRecoveryForSettingsScreenshot(scenario)
+        }
+        if let scenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_CARD_SCENARIO"] {
+            model.configureUnifiedRemoteCardsForSettingsScreenshot(scenario)
+        }
+        if let state = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLE_REMOTE_COMPONENT"
+        ] {
+            model.configureAppleRemoteComponentEntryForSettingsScreenshot(state)
         }
         let updateInformation = UpdateInformationStore(userDefaults: defaults)
         seedAvailableUpdate(updateInformation, language: language)
@@ -351,6 +363,9 @@ enum SettingsScreenshotRenderer {
                     copying: nil, bindings: [binding], holdModes: [RemoteButton.ok.rawValue: "once"])
             }
             if mappingScenario == "viewer" { model.macroFeature.updateButtonProfilesAccess(.requiresPlus) }
+        }
+        if membershipAccess == "allowed" {
+            model.membershipFeature.applyScreenshotState(isFeatureVisible: true, accessDecision: .allowed(validUntil: .distantFuture))
         }
         if membershipAccess == "requiresPlus" {
             model.macroFeature.updateButtonProfilesAccess(.requiresPlus)
@@ -430,7 +445,7 @@ enum SettingsScreenshotRenderer {
             window.isMovableByWindowBackground = false
             window.hidesOnDeactivate = false
             window.isReleasedWhenClosed = false
-            window.minSize = NSSize(width: 1020, height: 772)
+            window.minSize = size
             window.contentViewController = controller
             window.setContentSize(size)
             window.center()
@@ -530,15 +545,29 @@ enum SettingsScreenshotRenderer {
         section: SettingsSection,
         localization: LocalizationStore
     ) {
-        guard fixture == "profile-created", section == .mapping else { return }
-        NoticeCenter.shared.show(Notice(
-            tier: .tip,
-            title: localization.text("button_mapping.profile.created"),
-            text: localization.text("button_mapping.profile.created.detail"),
-            dismissal: .manual,
-            position: .bottom,
-            dismissible: false
-        ))
+        guard section == .mapping, let fixture else { return }
+        switch fixture {
+        case "profile-created":
+            NoticeCenter.shared.show(Notice(
+                tier: .tip,
+                title: localization.text("button_mapping.profile.created"),
+                text: localization.text("button_mapping.profile.created.detail"),
+                dismissal: .manual,
+                position: .bottom,
+                dismissible: false
+            ))
+        case "button-action-failed":
+            NoticeCenter.shared.show(Notice(
+                tier: .warning,
+                title: localization.text("button_mapping.action_failed.title"),
+                text: localization.text("button_mapping.action_failed.detail"),
+                dismissal: .manual,
+                position: .bottom,
+                dismissible: false
+            ))
+        default:
+            return
+        }
     }
 
     private static func seedMixedHistory(

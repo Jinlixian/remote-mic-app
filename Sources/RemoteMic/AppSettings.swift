@@ -375,6 +375,13 @@ final class AppSettings: ObservableObject {
     static let agentConfigurationPendingKey = Keys.onboardingAgentConfigurationPending
 
     private let defaults: UserDefaults
+    /// Suppresses persistence while stored settings are being decoded. A decode failure must
+    /// never overwrite the raw profile array that a newer app version wrote.
+    private var isLoadingStoredSettings = true
+    /// Raw profile data that could not be decoded. It is copied to a recovery key before the
+    /// first later save replaces the live value.
+    private var unreadableStoredRemoteProfiles: Data?
+    static let unreadableRemoteProfilesBackupKey = "remoteDeviceProfilesUnreadableBackup"
     private lazy var localUsageLedger = LocalUsageLedger(defaults: defaults,
         buttonCount: totalButtonPressCount, voiceDuration: totalVoiceDuration,
         longestVoice: voiceSessionRanking.map(\.duration).max() ?? 0)
@@ -1253,6 +1260,7 @@ final class AppSettings: ObservableObject {
             buttonRapidPressEnabled: buttonRapidPressEnabled,
             interactionSettings: interactionSettings
         )
+        let storedRemoteProfilesData = defaults.data(forKey: Keys.remoteDeviceProfiles)
         if
             let decoded = Self.decodeSetting(
                 [RemoteDeviceProfile].self,
@@ -1294,6 +1302,16 @@ final class AppSettings: ObservableObject {
                 interactionSettings = selected.mappings.interactionSettings ?? RemoteButtonInteractionSettings()
             }
         } else {
+            // A newer app version may have written a model or action this build cannot decode.
+            // Keep the original bytes instead of replacing the whole array with one fallback
+            // profile. Otherwise opening an older build silently deletes every newer profile.
+            if let storedRemoteProfilesData, !storedRemoteProfilesData.isEmpty {
+                unreadableStoredRemoteProfiles = storedRemoteProfilesData
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILES phase=completed result=preserved_unreadable " +
+                        "reason=stored_decode_failed"
+                )
+            }
             var original = RemoteDeviceProfile(
                 bluetoothIdentifier: defaults.string(forKey: Keys.peripheralIdentifier).flatMap(UUID.init(uuidString:)),
                 mappings: legacyMappings
@@ -1342,12 +1360,14 @@ final class AppSettings: ObservableObject {
             catch { corruptedKeys.append("unifiedBaseBindings") }
         }
         corruptedSettingKeys = corruptedKeys
-        if let data = try? JSONEncoder().encode(remoteDeviceProfiles) {
+        if unreadableStoredRemoteProfiles == nil,
+           let data = try? JSONEncoder().encode(remoteDeviceProfiles) {
             defaults.set(data, forKey: Keys.remoteDeviceProfiles)
         }
         if let data = try? JSONEncoder().encode(interactionSettings) {
             defaults.set(data, forKey: "buttonInteractionSettings")
         }
+        isLoadingStoredSettings = false
         _ = localUsageLedger
     }
 
@@ -1970,7 +1990,7 @@ final class AppSettings: ObservableObject {
         }
         let profile = RemoteDeviceProfile(
             bluetoothIdentifier: identifier,
-            mappings: mappingsForNewRemote()
+            mappings: Self.defaultRemoteMappings()
         )
         remoteDeviceProfiles.append(profile)
         return profile.id
@@ -1985,23 +2005,12 @@ final class AppSettings: ObservableObject {
             $0.id == selectedRemoteProfileID && $0.hidFingerprint == nil
         })
         if let index = selectedUnboundIndex ?? remoteDeviceProfiles.firstIndex(where: { $0.hidFingerprint == nil }) {
-            let defaultMappings = RemoteDeviceMappings(
-                buttonBindings: Self.defaultBindings,
-                buttonShortcuts: [:],
-                secondaryButtonBindings: [:]
-            )
-            if remoteDeviceProfiles[index].mappings == defaultMappings,
-               let configured = remoteDeviceProfiles.first(where: {
-                   $0.id != remoteDeviceProfiles[index].id && $0.mappings != defaultMappings
-               }) {
-                remoteDeviceProfiles[index].mappings = configured.mappings
-            }
             remoteDeviceProfiles[index].hidFingerprint = fingerprint
             return remoteDeviceProfiles[index].id
         }
         let profile = RemoteDeviceProfile(
             hidFingerprint: fingerprint,
-            mappings: mappingsForNewRemote()
+            mappings: Self.defaultRemoteMappings()
         )
         remoteDeviceProfiles.append(profile)
         return profile.id
@@ -2031,7 +2040,7 @@ final class AppSettings: ObservableObject {
         let profile = RemoteDeviceProfile(
             model: model,
             hidFingerprint: fingerprint,
-            mappings: mappingsForNewRemote()
+            mappings: mappingsForNewRemote(model: model)
         )
         remoteDeviceProfiles.append(profile)
         ensureGestureTiming(for: model, profileID: profile.id)
@@ -2058,7 +2067,7 @@ final class AppSettings: ObservableObject {
         }
         let profile = RemoteDeviceProfile(
             model: .chromecastVoiceRemote,
-            mappings: mappingsForNewRemote()
+            mappings: mappingsForNewRemote(model: .chromecastVoiceRemote)
         )
         remoteDeviceProfiles.append(profile)
         ensureGestureTiming(for: .chromecastVoiceRemote, profileID: profile.id)
@@ -2081,15 +2090,37 @@ final class AppSettings: ObservableObject {
         remoteDeviceProfiles[index].hidFingerprint = fingerprint
     }
 
-    private func mappingsForNewRemote() -> RemoteDeviceMappings {
-        selectedRemoteProfile?.mappings ?? RemoteDeviceMappings(
-            buttonBindings: buttonBindings,
-            buttonShortcuts: buttonShortcuts,
-            buttonApplicationProfileIDs: buttonApplicationProfileIDs,
-            secondaryButtonBindings: secondaryButtonBindings,
-            buttonRapidPressEnabled: buttonRapidPressEnabled,
-            interactionSettings: interactionSettings
+    private static func defaultRemoteMappings() -> RemoteDeviceMappings {
+        RemoteDeviceMappings(
+            buttonBindings: defaultBindings,
+            buttonShortcuts: [:],
+            secondaryButtonBindings: [:]
         )
+    }
+
+    /// New profiles only inherit mappings from a selected remote of the same model.
+    ///
+    /// The model is often unknown when a Xiaomi profile is first created. Those profiles
+    /// start with defaults and inherit later in `inheritMappingsIfCompatible` once the
+    /// BLE handshake identifies the model. A different model always keeps defaults so a
+    /// new RC001 cannot silently take over an RC003's configuration.
+    private func mappingsForNewRemote(model: XiaomiRemoteModel = .unknown) -> RemoteDeviceMappings {
+        guard let selected = selectedRemoteProfile else {
+            // No selected profile yet: the in-memory bindings are the only configuration
+            // the user has, so the first physical remote keeps them.
+            return RemoteDeviceMappings(
+                buttonBindings: buttonBindings,
+                buttonShortcuts: buttonShortcuts,
+                buttonApplicationProfileIDs: buttonApplicationProfileIDs,
+                secondaryButtonBindings: secondaryButtonBindings,
+                buttonRapidPressEnabled: buttonRapidPressEnabled,
+                interactionSettings: interactionSettings
+            )
+        }
+        guard model != .unknown, selected.model == model else {
+            return Self.defaultRemoteMappings()
+        }
+        return selected.mappings
     }
 
     private struct RemoteProfileDeduplicationResult {
@@ -2158,6 +2189,9 @@ final class AppSettings: ObservableObject {
         if merged.model == .unknown, discarded.model != .unknown {
             merged.model = discarded.model
         }
+        if merged.lastKnownBluetoothName == nil {
+            merged.lastKnownBluetoothName = discarded.lastKnownBluetoothName
+        }
         if merged.hardwareIdentity == nil {
             merged.hardwareIdentity = discarded.hardwareIdentity
         }
@@ -2217,8 +2251,12 @@ final class AppSettings: ObservableObject {
         customName: String
     ) {
         guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }) else { return }
+        let previousModel = remoteDeviceProfiles[index].model
         remoteDeviceProfiles[index].model = model
         remoteDeviceProfiles[index].customName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if previousModel != model {
+            inheritMappingsIfCompatible(for: profileID, model: model)
+        }
     }
 
     /// The system name is a display cache, never a device identity or a stored numbered label.
@@ -2231,11 +2269,19 @@ final class AppSettings: ObservableObject {
         guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }),
               let customName = RemoteDeviceNamePolicy.customName(
                 from: name, model: remoteDeviceProfiles[index].model, serialNumber: serialNumber
-              ),
-              remoteDeviceProfiles[index].customName != customName
-        else { return false }
-        remoteDeviceProfiles[index].customName = customName
-        return true
+              ) else { return false }
+        var changed = false
+        if let observed = RemoteDeviceNamePolicy.observedSystemName(from: name),
+           observed != serialNumber, !RemoteDeviceIdentity.looksLikeSerial(observed),
+           remoteDeviceProfiles[index].lastKnownBluetoothName != observed {
+            remoteDeviceProfiles[index].lastKnownBluetoothName = observed
+            changed = true
+        }
+        if remoteDeviceProfiles[index].customName != customName {
+            remoteDeviceProfiles[index].customName = customName
+            changed = true
+        }
+        return changed
     }
 
     /// 记下序列号的单向摘要，作为这台遥控器的稳定身份。
@@ -2277,6 +2323,82 @@ final class AppSettings: ObservableObject {
         return result.replacements
     }
 
+    /// Merge the two records one physical Xiaomi remote can leave behind.
+    ///
+    /// A BLE registration and an HID registration can create separate profiles for the
+    /// same remote. The HID profile owns the button monitor and active mappings; the BLE
+    /// profile owns the connection, battery and voice link. Without this reconciliation
+    /// the connected card asks the BLE profile for HID readiness, gets no signal and
+    /// stays at "状态确认中", while the HID profile's mappings are edited in a different
+    /// record.
+    ///
+    /// Only an unambiguous pair is merged: exactly two profiles of one Xiaomi model, one
+    /// HID-only and one BLE-only, with both sides currently live. The HID record is kept,
+    /// so its monitor, mappings and selection remain the single source of truth.
+    @discardableResult
+    func reconcileComplementaryRemoteProfiles(
+        connectedProfileIDs: Set<UUID> = [],
+        activeHIDProfileIDs: Set<UUID> = []
+    ) -> [UUID: UUID] {
+        var replacements: [UUID: UUID] = [:]
+        for model in [XiaomiRemoteModel.rc001, .rc003] {
+            let group = remoteDeviceProfiles.filter { $0.model == model }
+            guard group.count == 2,
+                  let hid = group.first(where: {
+                      $0.hidFingerprint != nil && $0.bluetoothIdentifier == nil
+                  }),
+                  let ble = group.first(where: {
+                      $0.bluetoothIdentifier != nil && $0.hidFingerprint == nil
+                  }),
+                  activeHIDProfileIDs.contains(hid.id) || selectedRemoteProfileID == hid.id,
+                  connectedProfileIDs.contains(ble.id),
+                  Self.complementaryProfilesMayDescribeTheSameRemote(hid, ble)
+            else { continue }
+
+            let merged = Self.mergingRemoteProfile(hid, with: ble)
+            guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == hid.id }) else {
+                continue
+            }
+            remoteDeviceProfiles[index] = merged
+            remoteDeviceProfiles.removeAll { $0.id == ble.id }
+            if selectedRemoteProfileID == ble.id {
+                selectedRemoteProfileID = hid.id
+            }
+            replacements[ble.id] = hid.id
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILE_PAIR phase=completed result=merged " +
+                    "model=\(model.rawValue) kept=hid reason=complementary_identity"
+            )
+        }
+        return replacements
+    }
+
+    /// Two named profiles with different identities must not be paired just because
+    /// their model and identifier shapes complement each other.
+    private static func complementaryProfilesMayDescribeTheSameRemote(
+        _ hid: RemoteDeviceProfile,
+        _ ble: RemoteDeviceProfile
+    ) -> Bool {
+        if let hidIdentity = hid.hardwareIdentity,
+           let bleIdentity = ble.hardwareIdentity,
+           hidIdentity != bleIdentity {
+            return false
+        }
+        let hidName = hid.lastKnownBluetoothName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bleName = ble.lastKnownBluetoothName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let hidName, let bleName, !hidName.isEmpty, !bleName.isEmpty, hidName != bleName {
+            return false
+        }
+        let hidCustomName = hid.customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bleCustomName = ble.customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !hidCustomName.isEmpty, !bleCustomName.isEmpty, hidCustomName != bleCustomName {
+            return false
+        }
+        return true
+    }
+
     func updateRemoteProfileModel(_ profileID: UUID, model: XiaomiRemoteModel) {
         guard model != .unknown,
               let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }),
@@ -2284,6 +2406,28 @@ final class AppSettings: ObservableObject {
         else { return }
         remoteDeviceProfiles[index].model = model
         ensureGestureTiming(for: model, profileID: profileID)
+        inheritMappingsIfCompatible(for: profileID, model: model)
+    }
+
+    /// Same-model inheritance happens after identification, never across models.
+    ///
+    /// New Xiaomi profiles are created before the BLE handshake reports the model, so
+    /// they start with defaults. Once the model is known, a profile that is still
+    /// untouched can inherit the selected remote's full mappings only when both models
+    /// match. A different model keeps defaults.
+    private func inheritMappingsIfCompatible(for profileID: UUID, model: XiaomiRemoteModel) {
+        guard model != .unknown,
+              let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }),
+              Self.isDefaultRemoteMappings(remoteDeviceProfiles[index].mappings),
+              let selected = selectedRemoteProfile,
+              selected.id != profileID,
+              selected.model == model,
+              !Self.isDefaultRemoteMappings(selected.mappings)
+        else { return }
+        remoteDeviceProfiles[index].mappings = selected.mappings
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILE_MAPPINGS phase=completed result=inherited reason=same_model"
+        )
     }
 
     func setAction(_ action: ButtonAction, for button: RemoteButton, trigger: ButtonTrigger) {
@@ -3634,7 +3778,8 @@ final class AppSettings: ObservableObject {
     }
 
     private func saveSelectedRemoteProfileMappings() {
-        guard !isLoadingRemoteProfile,
+        guard !isLoadingStoredSettings,
+              !isLoadingRemoteProfile,
               let selectedRemoteProfileID,
               let index = remoteDeviceProfiles.firstIndex(where: { $0.id == selectedRemoteProfileID })
         else { return }
@@ -3654,6 +3799,15 @@ final class AppSettings: ObservableObject {
     }
 
     private func saveRemoteDeviceProfiles() {
+        guard !isLoadingStoredSettings else { return }
+        if let unreadableStoredRemoteProfiles {
+            defaults.set(unreadableStoredRemoteProfiles, forKey: Self.unreadableRemoteProfilesBackupKey)
+            self.unreadableStoredRemoteProfiles = nil
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILES phase=completed result=recovery_snapshot_saved " +
+                    "reason=stored_decode_failed"
+            )
+        }
         guard let data = try? JSONEncoder().encode(remoteDeviceProfiles) else { return }
         defaults.set(data, forKey: Keys.remoteDeviceProfiles)
     }

@@ -349,10 +349,10 @@
 "remote.device.model.rc001" = "小米蓝牙遥控器 2";
 "remote.device.model.rc003" = "小米蓝牙遥控器 2 Pro";
 "remote.device.model.unrecognized" = "未识别的遥控器";
-"remote.device.model.apple_siri_remote_a2854" = "苹果遥控器第 7 代";
-"remote.device.model.apple_siri_remote_a2540" = "苹果遥控器第 6 代";
+"remote.device.model.apple_siri_remote_a2854" = "苹果遥控器 Type-C";
+"remote.device.model.apple_siri_remote_a2540" = "苹果遥控器 Lightning";
 "remote.device.model.chromecast_voice_remote" = "Chromecast 遥控器";
-"remote.device.model.unknown" = "小米遥控器";
+"remote.device.model.unknown" = "未识别的遥控器";
 "remote.device.custom_name" = "自定义名称";
 "remote.device.bind_button" = "绑定普通按键";
 "remote.device.binding_waiting" = "请按这只遥控器的任意普通键";
@@ -480,9 +480,9 @@
 "audio.action.refresh_devices" = "刷新音频设备";
 "audio.action.learn_virtual_microphones" = "获取 BlackHole";
 "audio.action.send_test_tone" = "发送 1 秒测试音";
-"audio.output.privacy_help" = "语音会写入所选设备。最后一只遥控器断开时，如果系统默认输入正是该虚拟设备，会临时回退到物理麦克风；重连时仅在用户没有手动改选的情况下恢复。系统默认输出不会被修改。";
+"audio.output.privacy_help" = "语音会写入所选设备。最后一只设备断开时，如果系统默认输入正是该虚拟设备，会临时回退到物理麦克风；重连时仅在用户没有手动改选的情况下恢复。系统默认输出不会被修改。";
 "audio.compatibility.open_install_guide" = "打开驱动安装说明";
-"audio.compatibility.missing_notice" = "未检测到兼容虚拟麦克风，语音工具可能收不到遥控器声音。";
+"audio.compatibility.missing_notice" = "未检测到兼容虚拟麦克风，语音工具可能收不到设备声音。";
 "button_mapping.page.title" = "按键映射";
 "button_mapping.page.subtitle" = "点击按键进行设置";
 "button_mapping.toggle.enabled" = "自定义按键";
@@ -883,8 +883,8 @@
 "onboarding.control_source.xiaomi_remote.detail" = "实体语音键，按住说话、松开结束。";
 "onboarding.control_source.siri_remote.title" = "苹果遥控器第 6 代 / 第 7 代";
 "onboarding.control_source.siri_remote.detail" = "按住语音键说话，松开结束。设置期间可试用，日常语音需会员。";
-"onboarding.control_source.apple_remote.generation_6.title" = "苹果遥控器第 6 代";
-"onboarding.control_source.apple_remote.generation_7.title" = "苹果遥控器第 7 代";
+"onboarding.control_source.apple_remote.generation_6.title" = "苹果遥控器 Lightning";
+"onboarding.control_source.apple_remote.generation_7.title" = "苹果遥控器 Type-C";
 "onboarding.control_source.chromecast_remote.title" = "Chromecast 语音遥控器";
 "onboarding.control_source.chromecast_remote.detail" = "支持按住说话或按一次说话。";
 "onboarding.control_source.apple_companion.title" = "iOS / watchOS App";
@@ -1352,6 +1352,9 @@
 
 "custom_application.accessibility.needs_verification" = "待学习或验证";
 
+"button_mapping.action_failed.title" = "按键动作未完成";
+"button_mapping.action_failed.detail" = "这次按键没有执行成功；其他按键仍可使用。";
+
 "settings.portable_configuration.title" = "组合动作、App 配置与键位方案";
 "connection.approval.title" = "允许“%1$@”连接无线麦 SayAll？";
 "connection.approval.watch_body" = "这块 Apple Watch 将与无线麦 SayAll 通信，代替实体遥控器发送按键和麦克风声音。请确认 Apple Watch 上显示的 2 位校验码与下方一致。允许后，本次安装会成为受信任设备。";
@@ -1387,9 +1390,9 @@
 "audio.mac_microphone.input" = "麦克风";
 "audio.mac_microphone.none" = "无";
 "audio.mac_microphone.current" = "当前收音：";
-"audio.mac_microphone.current.remote" = "遥控器麦克风";
+"audio.mac_microphone.current.remote" = "设备麦克风";
 "audio.mac_microphone.fallback" = "备用麦克风";
-"audio.mac_microphone.fallback_help" = "不使用遥控器时，可直接对所选麦克风说话；选择后会切换 macOS 输入设备；遥控器收音与此设置无关。";
+"audio.mac_microphone.fallback_help" = "不使用设备时，可直接对所选麦克风说话；选择后会切换 macOS 输入设备；设备收音与此设置无关。";
 "audio.mac_microphone.start" = "用%@说话";
 "audio.mac_microphone.stop" = "停用%@说话";
 "audio.mac_microphone.error.no_audio" = "所选麦克风没有音频。请检查连接，或改用其他麦克风。";
@@ -1537,3 +1540,82 @@
 
 "application_buttons.target.title" = "打开自定义 APP";
 "application_buttons.target.hint" = "选择要打开的 APP。聚焦方式仍由该 APP 的设置决定。";
+/* Bounded remote recovery and per-device controls. */
+"connection.devices.title" = "设备";
+"connection.devices.new.title" = "连接新的设备";
+"connection.devices.new.detail" = "重新运行设置向导，配对新的设备。";
+"connection.devices.history.empty" = "还没有连接过的设备。连接后会显示在这里。";
+"connection.history.title" = "连接过的设备";
+"connection.history.expanded" = "已展开";
+"connection.history.collapsed" = "已收起";
+"connection.history.all_connected" = "这些设备均已连接";
+"connection.history.offline" = "当前未连接的设备";
+"connection.history.empty" = "设备未连接";
+"connection.history.keep_configuration" = "设备配置会保留。";
+"connection.history.find" = "查找设备";
+"connection.history.connect" = "连接";
+"connection.history.cancel" = "取消";
+"connection.history.open_bluetooth" = "打开蓝牙设置";
+"connection.history.not_found_help" = "请确认设备已开机并在附近。";
+"connection.history.paused_help" = "需要使用时，点击“连接”。";
+"connection.history.status.waiting" = "未连接";
+"connection.history.status.recovering" = "正在连接…";
+"connection.history.status.ready" = "已连接";
+"connection.history.status.paused" = "自动连接已暂停";
+"connection.history.status.not_found" = "未找到设备";
+"connection.history.status.cancelled" = "已取消连接";
+"connection.history.retry" = "重试";
+"connection.history.voice_key_ready" = "语音键已映射为 Fn";
+"connection.history.cooldown" = "请稍后重试；两次手动连接至少间隔五秒。";
+"button_mapping.profile.created.detail" = "已切换到新方案";
+
+"remote.card.status.connected" = "已连接";
+"remote.card.detail.connected" = "设备已连接，当前应当可用的按键和语音功能均正常。";
+
+"remote.card.status.disconnected" = "未连接";
+"remote.card.detail.disconnected" = "设备尚未连接。";
+
+"remote.card.status.checking" = "检查中";
+"remote.card.detail.checking" = "设备已连接，正在确认按键及已授权的语音功能；尚未确认一切正常。";
+
+"remote.card.status.confirming" = "状态确认中";
+"remote.card.detail.confirming" = "设备已连接，正在确认功能状态；确认完成前不标记为正常。";
+
+"remote.card.status.buttons_failed" = "按键异常";
+"remote.card.detail.buttons_failed" = "设备已连接，但按键功能出现问题。";
+
+"remote.card.status.voice_failed" = "语音异常";
+"remote.card.detail.voice_failed" = "设备已连接，但已授权的语音功能出现问题。";
+
+"remote.card.status.device_failed" = "设备异常";
+"remote.card.detail.device_failed" = "设备已连接，但按键和已授权的语音功能均出现问题。";
+
+"remote.card.status.connecting" = "正在连接";
+"remote.card.detail.connecting" = "本次连接受有限恢复预算约束，可取消。";
+
+"remote.card.status.not_found" = "未找到";
+"remote.card.detail.not_found" = "本轮未找到设备，请确认设备已开机并在附近，再点击连接。";
+
+"remote.card.status.paused" = "自动连接已暂停";
+"remote.card.detail.paused" = "自动恢复预算已用尽。需要时点击连接。";
+
+"remote.card.status.cancelled" = "已取消";
+"remote.card.detail.cancelled" = "本次连接已取消。需要时可以再次连接。";
+
+"remote.card.open_membership" = "开通会员";
+
+"remote.card.install.title" = "安装苹果遥控器组件";
+
+"remote.card.install.detail" = "苹果遥控器需要独立安装包中的可选组件。请下载安装包并勾选苹果遥控器组件，安装后回到本页启用。启用和普通按键无需会员。";
+
+"connection.siri_remote_component.title" = "安装 Siri Remote 组件";
+
+"connection.siri_remote_component.detail" = "安装需要一次管理员授权。";
+
+"connection.siri_remote_component.install" = "安装组件";
+
+"connection.siri_remote_component.retry" = "重试";
+
+"connection.siri_remote_component.retry_detail" = "上次安装未完成。可以重试；取消后不会自动重复弹窗。";
+
+"connection.siri_remote_component.installing" = "正在等待管理员授权…";

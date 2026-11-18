@@ -692,6 +692,8 @@ struct SettingsView: View {
     @State private var isMappingPermissionAlertPresented = false
     @State private var isWaitingForMappingPermissions = false
     @State private var expandedShareSection: SettingsSection?
+    @State private var showsPreviouslyConnectedDevices = true
+    @State private var isNewDeviceRowHovered = false
     @State private var versionTapRevealCounter = VersionTapRevealCounter()
 
     init(
@@ -1324,22 +1326,90 @@ struct SettingsView: View {
             }
             CompatibilityGlassContainer(spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
-                    connectionDevicePanel
-                        .frame(width: 230)
+                    VStack(spacing: 14) {
+                        connectionDevicePanel
+                        devicesPanel
+#if SAYALL_SIRI_REMOTE_ENABLED
+                        if showsAppleRemoteComponentInstallation {
+                            appleRemoteComponentInstallation
+                        }
+#endif
+                    }
+                        .frame(width: SettingsPageBehavior.mappingRemoteCardWidth + 32, alignment: .top)
                     VStack(spacing: 14) {
                         phoneConnectionsPanel
                         audioSettingsPanel
-                        // Chromecast 连接卡片已按产品要求移除：启用开关默认常开，
-                        // 语音键模式在语音键设置面板内，状态见侧边栏「连接」的设备列表。
+                        #if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
+                        // Chromecast 卡片在系统 HID 或语音链路连接时显示；两者都不在时不渲染，
+                        // 与小米/苹果遥控器卡片一致。启用开关默认常开，语音键模式在语音键设置面板内。
+                        if model.isChromecastHIDPresent || model.chromecastStatus.isConnected {
+                            chromecastConnectionCard
+                        }
+                        #endif
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
             }
         }
         .onAppear {
+            model.refreshRemoteDiscovery()
             model.refreshVoiceKeyCompatibilityWarning()
         }
     }
+
+#if SAYALL_SIRI_REMOTE_ENABLED
+    /// Upgrade users can have the App without the optional PKG component.
+    /// This module only installs the component; it does not touch remote cards.
+    private var showsAppleRemoteComponentInstallation: Bool {
+        !model.isSiriRemoteHelperInstalled
+    }
+
+    private var appleRemoteComponentInstallation: some View {
+        let showsRetry = settings.siriRemoteNeedsUserAction
+            || model.siriRemoteAudioStatus.hasPrefix("unavailable:authorization_helper_upgrade")
+        let isInstalling = settings.siriRemoteEnabled && model.siriRemoteAudioStatus == "preparing_hci"
+        return GlassPanel {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("connection.siri_remote_component.title")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("connection.siri_remote_component.detail")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if showsRetry {
+                    Text("connection.siri_remote_component.retry_detail")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if isInstalling {
+                    HStack(spacing: 7) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("connection.siri_remote_component.installing")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button {
+                        model.installSiriRemoteComponent()
+                    } label: {
+                        Text(
+                            showsRetry
+                                ? "connection.siri_remote_component.retry"
+                                : "connection.siri_remote_component.install"
+                        )
+                    }
+                    .compatibilityButtonStyle(.standard)
+                    .controlSize(.small)
+                    .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
+                    .accessibilityIdentifier("apple-remote-component-install")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+#endif
 
     private func voiceKeyCompatibilityWarningPanel(
         _ warning: VoiceKeyCompatibilityWarning
@@ -1405,6 +1475,38 @@ struct SettingsView: View {
         }
     }
 
+    #endif
+
+    #if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
+    /// 系统 HID 或语音链路连接时渲染；两者都不在时与小米/苹果遥控器卡片一样隐藏。
+    private var chromecastConnectionCard: some View {
+        GlassPanel {
+            HStack(alignment: .top, spacing: 14) {
+                ChromecastConnectionPhoto()
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("chromecast.section_title")
+                        .font(.headline)
+                    Text("chromecast.section_subtitle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    connectionStatusLine(
+                        symbol: "antenna.radiowaves.left.and.right",
+                        text: localization.text(model.chromecastStatus.localizationKey),
+                        tint: model.chromecastStatus.isConnected ? .green : .orange
+                    )
+                    Text("chromecast.help.plain")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("chromecast.action.reconnect") {
+                        model.reconnectChromecast()
+                    }
+                    .compatibilityButtonStyle(.standard)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
     #endif
 
     private var connectionMembershipRequiredView: some View {
@@ -1606,42 +1708,167 @@ struct SettingsView: View {
     private var connectionDevicePanel: some View {
         GlassPanel {
             VStack(spacing: 16) {
+                if settings.remoteDeviceProfiles.contains(where: { model.isRemoteConnected($0.id) }) {
                 remoteDeviceSelector(vertical: true)
 
                 connectionRemotePhoto
 
-                VStack(alignment: .leading, spacing: 9) {
-                    connectionStatusLine(
-                        symbol: "antenna.radiowaves.left.and.right",
-                        text: model.connectionStatusText(using: localization),
-                        tint: connectionTint
-                    )
-                    connectionStatusLine(
-                        symbol: "waveform",
-                        text: localization.text(
-                            model.isStreaming
-                                ? "connection.status.voice_streaming"
-                                : "connection.status.voice_ready"
-                        ),
-                        tint: model.isStreaming ? .orange : .blue
-                    )
-                    connectionStatusLine(
-                        symbol: "mic.fill",
-                        text: model.voiceShortcutStatus.text(using: localization),
-                        tint: .blue
-                    )
+                if let profile = settings.selectedRemoteProfile,
+                   model.isRemoteConnected(profile.id) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        connectionStatusLine(
+                            symbol: "antenna.radiowaves.left.and.right",
+                            text: model.connectionStatusText(using: localization),
+                            tint: connectionTint
+                        )
+                        connectionStatusLine(
+                            symbol: "waveform",
+                            text: localization.text(
+                                model.isStreaming
+                                    ? "connection.status.voice_streaming"
+                                    : "connection.status.voice_ready"
+                            ),
+                            tint: model.isStreaming ? .orange : .blue
+                        )
+                        connectionStatusLine(
+                            symbol: "mic.fill",
+                            text: model.voiceShortcutStatus.text(using: localization),
+                            tint: .blue
+                        )
+                    }
                 }
+
+                } else {
+                    Image(systemName: "appletvremote.gen4.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.secondary)
+                    Text("connection.history.empty")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("connection.history.keep_configuration")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    if previouslyConnectedProfiles.isEmpty {
+                        Text(model.connectionStatusText(using: localization))
+                            .font(.system(size: 12))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(model.remoteDiscoveryIsActive ? "connection.history.cancel" : "connection.history.find") {
+                            if model.remoteDiscoveryIsActive { model.cancelRemoteDiscovery() }
+                            else { model.findRemoteDevices() }
+                        }
+                        .compatibilityButtonStyle(.standard)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var previouslyConnectedProfiles: [RemoteDeviceProfile] {
+        RemoteDeviceNamePolicy.sortedForCards(
+            settings.remoteDeviceProfiles.filter { profile in
+                profile.bluetoothIdentifier != nil || profile.hidFingerprint != nil || profile.model.usesPrivateAdapter
+            }, modelName: remoteModelName, systemName: { model.systemDeviceName(for: $0) }
+        )
+    }
+
+    private var devicesPanel: some View {
+        let profiles = previouslyConnectedProfiles.filter { !model.isRemoteConnected($0.id) }
+        return GlassPanel {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("connection.devices.title")
+                    .font(.system(size: 13, weight: .semibold))
 
                 Button {
-                    model.reconnect()
+                    AppLogger.shared.write(
+                        "CONNECTION NEW DEVICE phase=requested action=restart_onboarding source=connection_page"
+                    )
+                    settings.restartOnboarding()
                 } label: {
-                    Text("connection.action.reconnect")
-                        .foregroundStyle(.white)
+                    HStack(spacing: 10) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 28, height: 28)
+                            .background(
+                                Color.accentColor.opacity(0.12),
+                                in: Circle()
+                            )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("connection.devices.new.title")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("connection.devices.new.detail")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 4)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        isNewDeviceRowHovered ? Color.primary.opacity(0.045) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
                 }
-                    .compatibilityButtonStyle(.prominent)
-                    .compatibilityRoundedButtonBorderShape(radius: 10)
-                    .frame(maxWidth: .infinity)
+                .buttonStyle(.plain)
+                .onHover { isNewDeviceRowHovered = $0 }
+                .accessibilityIdentifier("connection-connect-new-device")
+                .accessibilityLabel(Text("connection.devices.new.title"))
+                .accessibilityHint(Text("connection.devices.new.detail"))
 
+                Divider()
+
+                if profiles.isEmpty {
+                    Text("connection.history.title")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    if previouslyConnectedProfiles.isEmpty {
+                        Text("connection.devices.history.empty")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("connection.history.all_connected")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button { showsPreviouslyConnectedDevices.toggle() } label: {
+                        HStack {
+                            Text("connection.history.title")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 4)
+                            Image(systemName: showsPreviouslyConnectedDevices ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 12))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityValue(
+                        localization.text(
+                            showsPreviouslyConnectedDevices
+                                ? "connection.history.expanded"
+                                : "connection.history.collapsed"
+                        )
+                    )
+                    if showsPreviouslyConnectedDevices {
+                        ForEach(profiles) { profile in
+                            remoteDeviceCard(profile, history: true)
+                        }
+                    }
+                }
+
+                if let block = model.bluetoothConnectionBlock {
+                    Text(block.text(using: localization)).font(.system(size: 12)).foregroundStyle(.orange)
+                    Button("connection.history.open_bluetooth") { model.openBluetoothPrivacySettings() }
+                        .compatibilityButtonStyle(.standard)
+                }
             }
         }
     }
@@ -3413,12 +3640,10 @@ struct SettingsView: View {
         let visibleProfiles = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
             RemoteDeviceNamePolicy.sortedForCards(
                 settings.remoteDeviceProfiles.filter { profile in
-                    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-                    // Keep the activation entry available while the Apple adapter is stopped.
-                    model.isRemoteConnected(profile.id) || profile.model.isAppleSiriRemote
-                    #else
+                    // 私有遥控器离线时仍保留在按键页选择器中：画布不依赖蓝牙连接，
+                    // 用户从连接页选中 Chromecast 后必须能在顶部继续看到并切换回它。
                     model.isRemoteConnected(profile.id)
-                    #endif
+                        || (!vertical && profile.model.usesPrivateAdapter)
                 },
                 modelName: remoteModelName,
                 systemName: { model.systemDeviceName(for: $0) }
@@ -3432,7 +3657,7 @@ struct SettingsView: View {
         } else if vertical {
             VStack(spacing: 8) {
                 ForEach(visibleProfiles) { profile in
-                    remoteDeviceCard(profile, fillsWidth: true)
+                    remoteDeviceCard(profile)
                 }
             }
         } else {
@@ -3561,222 +3786,47 @@ struct SettingsView: View {
 
     private func remoteDeviceCard(
         _ profile: RemoteDeviceProfile,
-        fillsWidth: Bool = false
+        history: Bool = false
     ) -> some View {
-        let selected = settings.selectedRemoteProfileID == profile.id
         let connected = model.isRemoteConnected(profile.id)
-        let batteryLevel = model.batteryLevel(for: profile.id)
-        let powerState = model.powerState(for: profile.id)
-        let modelName = remoteModelName(profile)
-        let systemName = remoteSystemName(profile)
-        let showsBattery = RemoteBatteryPresentationPolicy.shouldShowBattery(
-            model: profile.model,
-            level: batteryLevel,
-            powerState: powerState
-        )
-        let siriRemoteMembershipRequired = requiresSiriRemoteMembership(for: profile)
-        return HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 5) {
-                Button {
-                    model.noteManualRemoteProfileSelection()
-                    model.selectRemoteProfile(profile.id)
-                } label: {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(modelName)
-                            .help(modelName)
-                            .font(.system(size: 13, weight: .semibold))
-                            .lineLimit(1)
-                        Text(systemName)
-                            .help(systemName)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                .buttonStyle(.plain)
-                // 卡片行放得下时不再滚动，窗口的初始键盘焦点会落到这张标题按钮上，
-                // 画出一个只框住标题的焦点环，看起来像选中态渲染坏了。
-                // 卡片本身是点击选择的，这里不画焦点环；卡片里的其它按钮不受影响。
-                .modifier(CompatibilityFocusEffectDisabledModifier())
-                .accessibilityLabel(Text("\(modelName), \(systemName)"))
-                .accessibilityAddTraits(selected ? .isSelected : [])
-                HStack(spacing: 7) {
-                    remoteConnectionLabel(connected: connected)
-                    if showsBattery {
-                        remoteBatteryLabel(level: batteryLevel, powerState: powerState)
-                    }
-                    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-                    if profile.model.isAppleSiriRemote {
-                        // 会员入口与启用/停用都排在这一行里，卡片不额外开一列。
-                        siriRemoteCardActions(
-                            profile,
-                            showsVoiceMembershipHint: siriRemoteMembershipRequired
-                        )
-                        .fixedSize()
-                    }
-                    #endif
-                }
-                .font(.system(size: 12))
-                .lineLimit(1)
+        let status = model.remoteCardStatus(for: profile, history: history)
+        let recovering = status == .connecting
+        let appleNeedsEnable = profile.model.isAppleSiriRemote && model.siriRemoteActivationNeeded
+        let level = connected ? model.batteryLevel(for: profile.id) : nil
+        let power = connected ? model.powerState(for: profile.id) : nil
+        return RemoteDeviceCard(
+            modelName: remoteModelName(profile), systemName: remoteSystemName(profile),
+            status: status,
+            statusDetail: localization.text("remote.card.detail.\(status.rawValue)"),
+            statusDisplayOverride: model.remoteCardStatusDisplayOverride(for: profile.id),
+            settlesTransientStatus: !history && !SettingsVisualRenderingPolicy.isScreenshotHarness,
+            selected: !history && settings.selectedRemoteProfileID == profile.id,
+            batteryLevel: level, powerState: power,
+            showsBattery: connected && (level != nil || power == .charging || power == .externalPower)
+                && RemoteBatteryPresentationPolicy.shouldShowBattery(model: profile.model, level: level, powerState: power),
+            enableTitle: appleNeedsEnable ? localization.text("siri_remote.activation.enable") : nil,
+            membershipTitle: requiresSiriRemoteMembership(for: profile) ? localization.text("remote.card.open_membership") : nil,
+            connectionTitle: history ? localization.text(recovering ? "connection.history.cancel" : "connection.history.connect") : nil,
+            actionsDisabled: model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote,
+            connectionDisabled: !recovering && !model.canConnectRemoteProfile(profile.id),
+            onSelect: {
+                model.noteManualRemoteProfileSelection()
+                model.selectRemoteProfile(profile.id)
+            },
+            onEnable: { model.activateSiriRemoteFromCard() },
+            onMembership: {
+                selectedSection = .membership
+                membershipFeature.refreshIfNeeded()
+            },
+            onConnect: {
+                if recovering { model.cancelRemoteConnection(profile.id) }
+                else { model.connectRemoteProfile(profile.id) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(
-            width: fillsWidth ? nil : SettingsPageBehavior.mappingRemoteCardWidth,
-            alignment: .leading
         )
-        .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
-        .background {
-            // The background handles padding; foreground buttons keep their own actions.
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(selected ? Color.accentColor.opacity(0.13) : Color.primary.opacity(0.045))
-                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .onTapGesture {
-                    model.noteManualRemoteProfileSelection()
-                    model.selectRemoteProfile(profile.id)
-                }
-                .accessibilityHidden(true)
-        }
-        .overlay {
-            // 卡片行在放不下时会横向滚动，卡片贴着滚动容器的左边缘；
-            // `.stroke` 有一半在形状外，会被裁成半条边，改用画在内侧的 `strokeBorder`。
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(selected ? Color.accentColor.opacity(0.65) : Color.secondary.opacity(0.18))
-                .allowsHitTesting(false)
-        }
     }
 
-    /// 苹果遥控器只有**语音**需要会员；这里只决定是否给出「开通会员」提示，
-    /// 不再用来隐藏启用/停用，因为连接、按键与触摸都不看会员。
     private func requiresSiriRemoteMembership(for profile: RemoteDeviceProfile) -> Bool {
-        guard profile.model.isAppleSiriRemote else { return false }
-        switch membershipFeature.buttonProfilesAccessDecision {
-        case .allowed, .temporarilyOffline, .authorized:
-            return false
-        case .requiresPlus, .unavailable:
-            return true
-        }
-    }
-
-    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-    /// 第三行内联的紧凑操作：语音会员入口 + 启用/重试/准备中。
-    ///
-    /// 卡片正文固定三行（型号、系统名称、连接状态与电量），所以这些操作不再单独占一列，
-    /// 而是紧跟在连接状态与电量后面同一行显示。
-    private func siriRemoteCardActions(
-        _ profile: RemoteDeviceProfile,
-        showsVoiceMembershipHint: Bool = false
-    ) -> some View {
-        HStack(spacing: 8) {
-            if showsVoiceMembershipHint {
-                Button(localization.text("siri_remote.activation.open_membership")) {
-                    model.selectRemoteProfile(profile.id)
-                    selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .help(localization.text("siri_remote.mapping.voice.detail"))
-            }
-            if !settings.siriRemoteEnabled {
-                Button(localization.text("siri_remote.activation.enable")) {
-                    model.selectRemoteProfile(profile.id)
-                    model.setSiriRemoteEnabled(true)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
-            } else if model.siriRemoteAudioStatus.hasPrefix("unavailable:") {
-                Button(localization.text("siri_remote.activation.retry")) {
-                    model.selectRemoteProfile(profile.id)
-                    model.prepareSiriRemoteFromUserAction()
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
-            } else if model.siriRemoteAudioStatus != "ready" {
-                Button(localization.text("siri_remote.activation.preparing")) {}
-                    .buttonStyle(.borderless)
-                    .disabled(true)
-            }
-        }
-        .lineLimit(1)
-    }
-    #endif
-
-    private func remoteConnectionLabel(connected: Bool) -> some View {
-        Label(
-            localization.text(connected ? "common.status.connected" : "remote.device.disconnected"),
-            systemImage: "circle.fill"
-        )
-        .foregroundStyle(connected ? Color.green : Color.secondary)
-    }
-
-    private func remoteBatteryLabel(
-        level: Int?,
-        powerState: RemotePowerState?
-    ) -> some View {
-        HStack(spacing: 4) {
-            ZStack(alignment: .bottomTrailing) {
-                Image(systemName: batterySymbol(for: level))
-                    .font(.system(size: 13, weight: .medium))
-                if powerState == .charging || powerState == .externalPower {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 7, weight: .bold))
-                        .foregroundStyle(Color.green)
-                        .padding(2)
-                        .background(Color(nsColor: .windowBackgroundColor), in: Circle())
-                        .offset(x: 3, y: 3)
-                }
-            }
-            .frame(width: 20)
-
-            Text(level.map { "\($0)%" } ?? "—")
-        }
-        .foregroundStyle(batteryColor(for: level))
-        .help(remoteBatteryHelp(level: level, powerState: powerState))
-    }
-
-    private func batterySymbol(for level: Int?) -> String {
-        guard let level else { return "battery.0percent" }
-        switch level {
-        case 76...: return "battery.100percent"
-        case 51...: return "battery.75percent"
-        case 26...: return "battery.50percent"
-        case 11...: return "battery.25percent"
-        default: return "battery.0percent"
-        }
-    }
-
-    private func batteryColor(for level: Int?) -> Color {
-        guard let level else { return .secondary }
-        if level <= 10 { return .red }
-        if level <= 25 { return .orange }
-        return .secondary
-    }
-
-    private func remoteBatteryHelp(
-        level: Int?,
-        powerState: RemotePowerState?
-    ) -> String {
-        switch powerState {
-        case .charging:
-            return localization.text("remote.device.power.charging")
-        case .externalPower:
-            return localization.text("remote.device.power.external")
-        case .onBattery:
-            return level == nil
-                ? localization.text("remote.device.battery_unavailable")
-                : localization.text("remote.device.power.battery")
-        case .unknown:
-            return localization.text("remote.device.power.unknown")
-        case nil:
-            return level == nil
-                ? localization.text("remote.device.battery_unavailable")
-                : localization.text("remote.device.power.battery")
-        }
+        profile.model.isAppleSiriRemote && !membershipFeature.canUseSiriRemoteVoice
     }
 
     private func remoteModelName(_ profile: RemoteDeviceProfile) -> String {
@@ -8463,7 +8513,7 @@ private struct ShortcutCaptureView: NSViewRepresentable {
     }
 }
 
-private enum CompatibilityButtonStyle {
+enum CompatibilityButtonStyle {
     case standard
     case prominent
 }
@@ -8497,7 +8547,7 @@ private struct CompatibilityGlassContainer<Content: View>: View {
     }
 }
 
-private struct CompatibilityButtonStyleModifier: ViewModifier {
+struct CompatibilityButtonStyleModifier: ViewModifier {
     let style: CompatibilityButtonStyle
 
     @ViewBuilder
@@ -8531,7 +8581,7 @@ private struct CompatibilityScrollEdgeEffectModifier: ViewModifier {
     }
 }
 
-private struct CompatibilityFocusEffectDisabledModifier: ViewModifier {
+struct CompatibilityFocusEffectDisabledModifier: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(macOS 14.0, *) {
@@ -8581,11 +8631,13 @@ private struct CompatibilityTintedGlassModifier<GlassShape: Shape>: ViewModifier
     }
 }
 
-private extension View {
+extension View {
     func compatibilityButtonStyle(_ style: CompatibilityButtonStyle) -> some View {
         modifier(CompatibilityButtonStyleModifier(style: style))
     }
+}
 
+private extension View {
     func compatibilityScrollEdgeEffect() -> some View {
         modifier(CompatibilityScrollEdgeEffectModifier())
     }

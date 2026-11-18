@@ -4295,6 +4295,7 @@ struct RemoteButtonsTests {
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let settings = AppSettings(defaults: defaults)
         let firstProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(firstProfileID, model: .rc003)
         settings.selectRemoteProfile(firstProfileID)
         let shortcut = CustomKeyboardShortcut(
             keyCode: 40,
@@ -4306,6 +4307,7 @@ struct RemoteButtonsTests {
         settings.setAction(.showDesktop, for: .tv, trigger: .doubleClick)
 
         let secondProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(secondProfileID, model: .rc003)
 
         #expect(settings.configuredAction(
             for: .menu,
@@ -4327,6 +4329,37 @@ struct RemoteButtonsTests {
         ).action == .customShortcut)
     }
 
+    @Test func anotherModelDoesNotInheritTheSelectedRemotesMappings() throws {
+        let suiteName = "RemoteMicTests.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        let rc003ProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(rc003ProfileID, model: .rc003)
+        settings.selectRemoteProfile(rc003ProfileID)
+        settings.setAction(.openCodex, for: .menu)
+        settings.setAction(.showDesktop, for: .tv, trigger: .doubleClick)
+
+        let rc001ProfileID = settings.registerBluetoothRemote(identifier: UUID())
+        #expect(settings.configuredAction(
+            for: .menu,
+            trigger: .singleClick,
+            profileID: rc001ProfileID
+        ).action == AppSettings.defaultBindings[.menu])
+        settings.updateRemoteProfileModel(rc001ProfileID, model: .rc001)
+
+        #expect(settings.configuredAction(
+            for: .menu,
+            trigger: .singleClick,
+            profileID: rc001ProfileID
+        ).action == AppSettings.defaultBindings[.menu])
+        #expect(settings.configuredAction(
+            for: .tv,
+            trigger: .doubleClick,
+            profileID: rc001ProfileID
+        ).action == .disabled)
+    }
+
     @Test func HIDRemotesAreAutomaticallyAssignedAndKeepIndependentProfiles() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
         let defaults = try #require(TestUserDefaults(suiteName: suiteName))
@@ -4335,7 +4368,9 @@ struct RemoteButtonsTests {
         settings.setAction(.openCodex, for: .menu)
 
         let firstProfileID = settings.registerHIDRemote(fingerprint: "hid-one")
+        settings.updateRemoteProfileModel(firstProfileID, model: .rc003)
         let secondProfileID = settings.registerHIDRemote(fingerprint: "hid-two")
+        settings.updateRemoteProfileModel(secondProfileID, model: .rc003)
 
         #expect(firstProfileID != secondProfileID)
         #expect(settings.profileID(forHIDFingerprint: "hid-one") == firstProfileID)
@@ -5929,6 +5964,131 @@ struct RemoteButtonsTests {
         #expect(RemotePowerState.externalPower.logValue == "external_power")
         #expect(RemotePowerState.charging.logValue == "charging")
         #expect(RemotePowerState.unknown.logValue == "unknown")
+    }
+
+    @Test(arguments: [ButtonAction.returnKey, .combinationAction])
+    func actionFailureKeepsMonitorAliveAndNextPressAccepted(_ action: ButtonAction) throws {
+        let suiteName = "RemoteButtonsTests.actionFailure.\(action.rawValue).\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(action, for: .ok)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var attempts = 0
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in
+                attempts += 1
+                return attempts > 1
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "action-failure-\(action.rawValue)",
+            profileID: profileID
+        ))
+        let press = Data([UInt8(RemoteButton.ok.hidUsage), 0, 0, 0, 0, 0])
+        let release = Data(repeating: 0, count: press.count)
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        monitor.handleSimulatedReport(reportID: 1, data: release)
+
+        #expect(attempts == 1)
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("accessibility_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") && $0.contains("monitor_retained=true")
+        })
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        monitor.handleSimulatedReport(reportID: 1, data: release)
+        #expect(attempts == 2)
+    }
+
+    @Test func backOnlyFailureDoesNotReleasePermissionsOrStopTheMonitor() throws {
+        let suiteName = "RemoteButtonsTests.backOnlyFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in false },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+
+        monitor.handleSimulatedBackOnlyReport(
+            reportID: 1,
+            data: Data([UInt8(RemoteButton.back.hidUsage), 0, 0, 0, 0, 0])
+        )
+
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("system_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") &&
+                $0.contains("path=back_only") &&
+                $0.contains("monitor_retained=true")
+        })
+    }
+
+    @Test func repeatFailureCancelsRepeatWithoutStoppingTheMonitor() throws {
+        let suiteName = "RemoteButtonsTests.repeatFailure.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.scrollUp, for: .up)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        let suppressor = KeyboardEventSuppressor()
+        suppressor.setPrearmActiveForTesting(true)
+        var attempts = 0
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            eventSuppressor: suppressor,
+            ownsEventSuppressor: true,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in
+                attempts += 1
+                return attempts == 1
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) }
+        )
+        #expect(monitor.connectSimulatedDevice(
+            fingerprint: "repeat-failure",
+            profileID: profileID
+        ))
+        monitor.handleSimulatedReport(
+            reportID: 1,
+            data: Data([UInt8(RemoteButton.up.hidUsage), 0, 0, 0, 0, 0])
+        )
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.repeatStartMilliseconds)
+
+        #expect(attempts == 2)
+        #expect(suppressor.acceptsPrearm)
+        #expect(!monitor.status.key.contains("accessibility_expired"))
+        #expect(diagnostics.contains {
+            $0.contains("HID ACTION failed") &&
+                $0.contains("monitor_retained=true")
+        })
     }
 }
 
