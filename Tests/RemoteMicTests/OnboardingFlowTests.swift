@@ -20,6 +20,39 @@ struct OnboardingFlowTests {
         #expect(context.failureReason?.recoveryStep == .voiceTest)
     }
 
+    @Test func missingSiriRemoteComponentOutranksDeferredAuthorization() {
+        let context = FirstUseDiagnosticContext(
+            step: .voiceTest,
+            controlSource: .siriRemote,
+            capabilities: OnboardingCapabilities(),
+            hasSelectedAudioUID: true,
+            voiceAttempt: FirstUseVoiceAttemptDiagnostic(),
+            voiceComponentMissing: true,
+            voiceAuthorizationRequired: true
+        )
+        #expect(context.failureReason == .voiceComponentMissing)
+        #expect(context.failureReason?.recoveryStep == .voiceTest)
+    }
+
+    #if SAYALL_SIRI_REMOTE_ENABLED && !canImport(SayAllSiriRemote)
+    @Test @MainActor func missingSiriRemoteComponentUsesInstallRecovery() throws {
+        let fixture = try OnboardingOffscreenFixture(
+            step: .voiceTest,
+            controlSource: .siriRemote,
+            siriRemoteInitiallyEnabled: true,
+            siriRemoteNeedsUserAction: true,
+            siriRemoteComponentInstalled: false
+        )
+        defer { fixture.close() }
+        #expect(fixture.probe.actions["voice-test.audio-retry"] != nil)
+        fixture.probe.invoke("voice-test.audio-retry")
+        #expect(fixture.settings.firstUseEvents.contains {
+            $0.kind == .retry && $0.failureReason == .voiceComponentMissing
+        })
+        #expect(!fixture.settings.siriRemoteNeedsUserAction)
+    }
+    #endif
+
     #if SAYALL_SIRI_REMOTE_ENABLED && !canImport(SayAllSiriRemote)
     @Test @MainActor func resumedSiriVoiceTestExposesAuthorizationRetryWithoutRecording() throws {
         let fixture = try OnboardingOffscreenFixture(
@@ -183,6 +216,21 @@ struct OnboardingFlowTests {
             #expect(fixture.settings.isOnboardingComplete)
             // 连接与按键不看会员：完成引导不再关闭 Siri Remote 支持，只有语音按权益判定。
             #expect(fixture.settings.siriRemoteEnabled)
+        }
+    }
+
+    @Test @MainActor func switchingAwayFromSiriTrialRestoresInitialDisabledState() throws {
+        for initiallyEnabled in [false, true] {
+            let fixture = try OnboardingOffscreenFixture(
+                step: .remoteAvailability,
+                controlSource: .webRemote,
+                siriRemoteInitiallyEnabled: initiallyEnabled
+            )
+            defer { fixture.close() }
+            fixture.model.enableSiriRemoteForOnboarding()
+            #expect(fixture.settings.siriRemoteEnabled)
+            fixture.model.endSiriRemoteOnboardingTrialIfNeeded()
+            #expect(fixture.settings.siriRemoteEnabled == initiallyEnabled)
         }
     }
 
@@ -446,7 +494,7 @@ struct OnboardingFlowTests {
             contentsOf: root.appendingPathComponent("README.md"),
             encoding: .utf8
         )
-        #expect(readme.contains("首次设置向导允许“蓝牙”“输入监控”和“辅助功能”三项权限"))
+        #expect(readme.contains("首次设置向导允许“蓝牙”“输入监控”和“辅助功能（新名称：设备控制和数据访问）”三项权限"))
         #expect(readme.contains("系统蓝牙显示已连接不等于 SayAll 已经连接"))
         #expect(readme.contains("--agent-configure --auto --json"))
         #expect(readme.contains("not_found / connected_remote"))
@@ -478,9 +526,31 @@ struct OnboardingFlowTests {
     }
 
     @Test func controlSourcePresentationUsesSourceSpecificPairingAndButtons() throws {
-        let xiaomiPairing = OnboardingView.physicalRemotePairingGuide(for: .xiaomiRemote)
-        #expect(xiaomiPairing.steps == [
+        let xiaomiProPairing = OnboardingView.physicalRemotePairingGuide(
+            for: .xiaomiRemote,
+            xiaomiModel: .rc003
+        )
+        #expect(xiaomiProPairing.steps == [
             "onboarding.remote.first_pairing.wake",
+            "onboarding.remote.first_pairing.pair",
+        ])
+
+        // 小米蓝牙遥控器 2 没有底部白灯：保留唤醒步骤，但只说到长按 2 秒。
+        let xiaomi2Pairing = OnboardingView.physicalRemotePairingGuide(
+            for: .xiaomiRemote,
+            xiaomiModel: .rc001
+        )
+        #expect(xiaomi2Pairing.steps == [
+            "onboarding.remote.first_pairing.wake_without_light",
+            "onboarding.remote.first_pairing.pair",
+        ])
+
+        let unknownModelPairing = OnboardingView.physicalRemotePairingGuide(
+            for: .xiaomiRemote,
+            xiaomiModel: nil
+        )
+        #expect(unknownModelPairing.steps == [
+            "onboarding.remote.first_pairing.wake_without_light",
             "onboarding.remote.first_pairing.pair",
         ])
 
@@ -521,6 +591,147 @@ struct OnboardingFlowTests {
             "onboarding.controls.web_remote.detail")
     }
 
+    @Test func xiaomiRemote2KeepsWakeStepWithoutWhiteLightCopy() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let zh = try String(
+            contentsOf: root.appendingPathComponent("Resources/zh-Hans.lproj/Localizable.strings"),
+            encoding: .utf8
+        )
+        let en = try String(
+            contentsOf: root.appendingPathComponent("Resources/en.lproj/Localizable.strings"),
+            encoding: .utf8
+        )
+        #expect(zh.contains(
+            "\"onboarding.remote.first_pairing.wake_without_light\" = \"长按 TV 键约 2 秒\";"
+        ))
+        #expect(en.contains(
+            "\"onboarding.remote.first_pairing.wake_without_light\" = \"Hold the TV button for about 2 seconds\";"
+        ))
+        #expect(!zh.contains(
+            "\"onboarding.remote.first_pairing.wake_without_light\" = \"长按 TV 键约 2 秒，直到遥控器底部白灯开始闪烁\";"
+        ))
+    }
+
+    @Test func physicalRemoteCardsSplitXiaomiAndFollowRequiredOrder() {
+        #expect(OnboardingXiaomiRemoteModel.allCases == [.rc003, .rc001])
+        #expect(OnboardingPhysicalRemoteCard.ordered(availableSources: [.xiaomiRemote]) == [
+            .xiaomi(.rc003),
+            .xiaomi(.rc001),
+        ])
+        #expect(OnboardingPhysicalRemoteCard.ordered(
+            availableSources: [.xiaomiRemote, .siriRemote]
+        ) == [
+            .xiaomi(.rc003),
+            .xiaomi(.rc001),
+            .apple(.generation7),
+            .apple(.generation6),
+        ])
+        #expect(OnboardingPhysicalRemoteCard.ordered(
+            availableSources: [.siriRemote]
+        ) == [
+            .apple(.generation7),
+            .apple(.generation6),
+        ])
+    }
+
+    @Test func onboardingControlSourceSelectionRequiresXiaomiModel() {
+        #expect(!OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .unselected,
+            xiaomiModel: nil
+        ))
+        #expect(!OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .xiaomiRemote,
+            xiaomiModel: nil
+        ))
+        #expect(OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .xiaomiRemote,
+            xiaomiModel: .rc001
+        ))
+        #expect(OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .xiaomiRemote,
+            xiaomiModel: .rc003
+        ))
+        #expect(OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .siriRemote,
+            xiaomiModel: nil
+        ))
+        #expect(OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .appleCompanion,
+            xiaomiModel: nil
+        ))
+        #expect(OnboardingControlSourceSelectionPolicy.isComplete(
+            source: .webRemote,
+            xiaomiModel: nil
+        ))
+    }
+
+    @Test func onboardingXiaomiModelPersistsAndRestartClearsIt() throws {
+        let suiteName = "RemoteMicTests.Onboarding.XiaomiModel.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(defaults: defaults)
+        #expect(settings.onboardingXiaomiRemoteModel == nil)
+        settings.setOnboardingXiaomiRemoteModel(.rc001)
+        #expect(settings.onboardingXiaomiRemoteModel == .rc001)
+
+        let resumed = AppSettings(defaults: defaults)
+        #expect(resumed.onboardingXiaomiRemoteModel == .rc001)
+        resumed.restartOnboarding()
+        #expect(resumed.onboardingXiaomiRemoteModel == nil)
+    }
+
+    @Test func onboardingXiaomiEventPolicyProtectsSelectedModel() {
+        #expect(OnboardingXiaomiEventPolicy.disposition(
+            profileModel: .rc001,
+            selectedModel: .rc001,
+            controlSource: .xiaomiRemote
+        ) == .accept)
+        #expect(OnboardingXiaomiEventPolicy.disposition(
+            profileModel: .rc003,
+            selectedModel: .rc001,
+            controlSource: .xiaomiRemote
+        ) == .rejectOtherModel)
+        #expect(OnboardingXiaomiEventPolicy.disposition(
+            profileModel: .unknown,
+            selectedModel: .rc001,
+            controlSource: .xiaomiRemote
+        ) == .pendingIdentity)
+        #expect(OnboardingXiaomiEventPolicy.disposition(
+            profileModel: .rc003,
+            selectedModel: .rc001,
+            controlSource: .siriRemote
+        ) == .accept)
+
+        #expect(OnboardingXiaomiEventPolicy.shouldAdoptSelection(
+            profileModel: .rc001,
+            selectedModel: .rc001,
+            selectedModelProfileExists: true,
+            controlSource: .xiaomiRemote
+        ))
+        #expect(!OnboardingXiaomiEventPolicy.shouldAdoptSelection(
+            profileModel: .rc003,
+            selectedModel: .rc001,
+            selectedModelProfileExists: true,
+            controlSource: .xiaomiRemote
+        ))
+        #expect(OnboardingXiaomiEventPolicy.shouldAdoptSelection(
+            profileModel: .unknown,
+            selectedModel: .rc001,
+            selectedModelProfileExists: false,
+            controlSource: .xiaomiRemote
+        ))
+        #expect(!OnboardingXiaomiEventPolicy.shouldAdoptSelection(
+            profileModel: .unknown,
+            selectedModel: .rc001,
+            selectedModelProfileExists: true,
+            controlSource: .xiaomiRemote
+        ))
+    }
+
     @Test func siriPairingGuideLandsEveryStepInBothLanguages() throws {
         // 苹果遥控器的配对有两个坑，用户照着一句话版本做基本都会失败：
         // 遥控器会自己连回原来的 Apple TV；这台 Mac 上的旧配对记录会让它连不上。
@@ -552,11 +763,43 @@ struct OnboardingFlowTests {
         )
         // 「必须做」这一步不能被压成可选项：它是用户按下按键却连不上的最常见原因。
         #expect(zh.contains("这一步必须做"))
-        // 遥控器在蓝牙列表里常常显示成序列号，不能再让用户只按名字找。
-        #expect(zh.contains("名称可能是一串序列号"))
+        // 遥控器在蓝牙列表里常常显示成序列号或通用蓝牙设备名，不能再让用户只按名字找。
+        #expect(zh.contains("名称可能是一串序列号或“蓝牙设备”"))
         // 页面说明不能再写死步数：小米两步、苹果遥控器五步，同一句话会自相矛盾。
         #expect(!zh.contains("下面两步"))
         #expect(zh.contains("首次连接请先按下面的步骤配对"))
+    }
+
+    @Test func connectionPageCopyHasNoTrailingPeriods() throws {
+        // 连接页统一不在文案末尾加句号；内部句子标点保留，避免整段失去停顿。
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let prefixes = [
+            "onboarding.remote.",
+            "onboarding.iphone_remote.",
+            "onboarding.apple_companion.",
+            "onboarding.web_remote.",
+            "onboarding.secure_input.",
+            "onboarding.recovery.remote.",
+        ]
+        for resource in ["zh-Hans", "en"] {
+            let text = try String(
+                contentsOf: root.appendingPathComponent(
+                    "Resources/\(resource).lproj/Localizable.strings"
+                ),
+                encoding: .utf8
+            )
+            for line in text.split(separator: "\n") {
+                guard line.hasPrefix("\""),
+                      let separator = line.range(of: "\" = \"") else { continue }
+                let key = String(line[line.index(after: line.startIndex)..<separator.lowerBound])
+                guard prefixes.contains(where: key.hasPrefix),
+                      line.hasSuffix("。\";") || line.hasSuffix(".\";") else { continue }
+                Issue.record("\(resource) 连接页文案以句号结尾：\(key)")
+            }
+        }
     }
 
     @Test func navigationOrderIsStableAndGroupedIntoThreePhases() {
@@ -839,6 +1082,32 @@ struct OnboardingFlowTests {
             "guide.screenshot.zoom=system-fn",
             "guide.screenshot.zoom=-",
         ])
+    }
+
+    @Test @MainActor func guideScreenshotGroupOpensEachImageZoom() throws {
+        let fixture = try OnboardingOffscreenFixture(
+            step: .voiceTool,
+            voiceTool: .doubao,
+            initialInputMethodGuideStep: 3
+        )
+        defer { fixture.close() }
+        let probe = fixture.probe
+
+        #expect(probe.actions["guide.screenshot.zoom.wechat"] != nil)
+        #expect(probe.actions["guide.screenshot.zoom.feishu"] != nil)
+
+        probe.invoke("guide.screenshot.zoom.wechat")
+        fixture.settleLayout()
+        #expect(probe.stateEvents == [
+            "guide.screenshot.zoom=weixin-app-shortcuts",
+        ])
+        probe.invoke("guide.screenshot.zoom.close")
+        fixture.settleLayout()
+
+        probe.invoke("guide.screenshot.zoom.feishu")
+        fixture.settleLayout()
+        #expect(probe.stateEvents.last ==
+            "guide.screenshot.zoom=feishu-settings-remove-shortcuts")
     }
 
     @MainActor
@@ -1511,7 +1780,7 @@ struct OnboardingFlowTests {
         for resourceName in [
             "doubao-menu", "doubao-settings", "weixin-input-menu",
             "weixin-input-settings", "system-fn", "weixin-app-shortcuts",
-            "vokie-step-1", "vokie-step-2",
+            "feishu-settings-remove-shortcuts", "vokie-step-1", "vokie-step-2",
         ] {
             #expect(viewSource.contains(resourceName))
             for appearance in ["light", "dark"] {
@@ -1538,7 +1807,11 @@ struct OnboardingFlowTests {
         #expect(viewSource.contains("columns: physicalColumns"))
         #expect(viewSource.contains("inputMethodGuide(for: settings.onboardingVoiceTool)"))
         #expect(viewSource.contains("content: .systemFunctionKey"))
+        #expect(viewSource.contains("content: .screenshotGroup"))
         #expect(viewSource.contains("onboarding.voice_tool.guide.release_system_fn"))
+        #expect(viewSource.contains("onboarding.voice_tool.guide.release_wechat_feishu_fn"))
+        #expect(viewSource.contains("feishu-settings-remove-shortcuts"))
+        #expect(viewSource.contains("onboarding.voice_tool.guide.screenshot.feishu_app"))
         #expect(viewSource.contains("allRecognizedVoiceToolsUnavailable"))
         #expect(viewSource.contains("onboarding.voice_tool.none_detected"))
         #expect(viewSource.contains("onboarding.voice_tool.other.setup_detail"))
@@ -1700,6 +1973,56 @@ struct OnboardingFlowTests {
         #expect(!OnboardingVoiceTestConfigurationPolicy.requiresGlobalVoiceConfirmation(for: .typeless))
         #expect(!OnboardingVoiceTestConfigurationPolicy.requiresGlobalVoiceConfirmation(for: .vokie))
         #expect(!OnboardingVoiceTestConfigurationPolicy.requiresGlobalVoiceConfirmation(for: .other))
+    }
+
+    @Test func voiceStreamEndEndsAttemptAfterSourceIsCleared() {
+        // `BridgeAppModel` sets isStreaming = false and then clears activeVoiceSource.
+        // The release must still end the attempt even though the source is gone.
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: false,
+            step: .voiceTest,
+            voiceSessionStarted: true,
+            sourceAccepted: false
+        ) == .endVoiceAttempt)
+    }
+
+    @Test func voiceStreamEndWithoutStartedAttemptStaysIdle() {
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: false,
+            step: .voiceTest,
+            voiceSessionStarted: false,
+            sourceAccepted: false
+        ) == .ignore)
+    }
+
+    @Test func voiceStreamStartStillRequiresTheSelectedSource() {
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: true,
+            step: .voiceTest,
+            voiceSessionStarted: false,
+            sourceAccepted: false
+        ) == .ignore)
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: true,
+            step: .voiceTest,
+            voiceSessionStarted: false,
+            sourceAccepted: true
+        ) == .beginVoiceAttempt)
+    }
+
+    @Test func remoteVoiceObservationStillRequiresTheSelectedSource() {
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: true,
+            step: .remote,
+            voiceSessionStarted: false,
+            sourceAccepted: false
+        ) == .ignore)
+        #expect(OnboardingVoiceStreamPolicy.action(
+            isStreaming: true,
+            step: .remote,
+            voiceSessionStarted: false,
+            sourceAccepted: true
+        ) == .recordRemoteVoiceButtonPress)
     }
 
     @Test func globalVoiceSupportIsUnknownForToolsWeNeverObserved() {
@@ -2160,7 +2483,7 @@ struct OnboardingFlowTests {
 
         let detailStart = try #require(source.range(of: "private var webRemoteConnectionIsBlocked"))
         let detailEnd = try #require(source.range(
-            of: "private var selectedControlConnectedKey",
+            of: "private var primaryActionKey",
             range: detailStart.upperBound..<source.endIndex
         ))
         let detail = String(source[detailStart.lowerBound..<detailEnd.lowerBound])
@@ -2170,6 +2493,28 @@ struct OnboardingFlowTests {
         // 服务端判定（`.plusRequired`）要一直被算作被挡：本地权益对了也不该放过。
         #expect(detail.contains("case .plusRequired:"))
         #expect(detail.contains("return !membershipFeature.canStartCompanionConnection"))
+    }
+
+    @Test func remoteConnectionPageDoesNotRepeatChecksInTheSidePanel() throws {
+        // 连接页左栏已经用状态卡展示连接和按键结果，右栏再放一份「连接检查」
+        // 既重复又挤掉遥控器。这里锁住右栏面板的移除，避免以后又长回来。
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/OnboardingView.swift"),
+            encoding: .utf8
+        )
+        let panelStart = try #require(source.range(of: "private var sideStatusPanel"))
+        let panelEnd = try #require(source.range(
+            of: "private func sidePanel",
+            range: panelStart.upperBound..<source.endIndex
+        ))
+        let panel = String(source[panelStart.lowerBound..<panelEnd.lowerBound])
+        #expect(!panel.contains("case .remote:"))
+        #expect(!panel.contains("onboarding.side.remote"))
+        #expect(!panel.contains("onboarding.side.button_received"))
     }
 
     @Test func webRemoteMembershipCopyExistsInBothLanguages() throws {
@@ -2186,10 +2531,10 @@ struct OnboardingFlowTests {
             encoding: .utf8
         )
         #expect(chinese.contains(
-            "\"onboarding.web_remote.membership_detail\" = \"开通会员后即可连接；右侧按钮可直接开通。\";"
+            "\"onboarding.web_remote.membership_detail\" = \"开通会员后即可连接；右侧按钮可直接开通\";"
         ))
         #expect(english.contains(
-            "\"onboarding.web_remote.membership_detail\" = \"Open the membership to connect. Use the button on the right.\";"
+            "\"onboarding.web_remote.membership_detail\" = \"Open the membership to connect. Use the button on the right\";"
         ))
         // 权益放开后要用的那句「下一步生成二维码」也得在两边。
         #expect(chinese.contains("\"onboarding.web_remote.preparing\" = \"下一步生成二维码\";"))
@@ -2304,13 +2649,13 @@ struct OnboardingFlowTests {
             "\"onboarding.apple_companion.membership_title\" = \"此连接是会员功能\";"
         ))
         #expect(chinese.contains(
-            "\"onboarding.apple_companion.membership_detail\" = \"开通会员后即可连接；右侧按钮可直接开通。\";"
+            "\"onboarding.apple_companion.membership_detail\" = \"开通会员后即可连接；右侧按钮可直接开通\";"
         ))
         #expect(english.contains(
             "\"onboarding.apple_companion.membership_title\" = \"This connection is a member feature\";"
         ))
         #expect(english.contains(
-            "\"onboarding.apple_companion.membership_detail\" = \"Open the membership to connect. Use the button on the right.\";"
+            "\"onboarding.apple_companion.membership_detail\" = \"Open the membership to connect. Use the button on the right\";"
         ))
         // 门禁态下的重试按钮文案也要两边都有。
         #expect(chinese.contains(
@@ -2680,7 +3025,7 @@ struct OnboardingFlowTests {
             range: prepareStart.upperBound..<viewSource.endIndex
         ))
         let prepareSource = viewSource[prepareStart.lowerBound..<prepareEnd.lowerBound]
-        #expect(prepareSource.contains("model.refreshRemoteDiscovery()"))
+        #expect(prepareSource.contains("model.findRemoteDevices()"))
         #expect(prepareSource.contains("model.applyHIDSettings()"))
 
         let modelSource = try String(
@@ -2694,6 +3039,8 @@ struct OnboardingFlowTests {
         ))
         let refreshSource = modelSource[refreshStart.lowerBound..<refreshEnd.lowerBound]
         #expect(refreshSource.contains("discoveryBluetoothBridge?.refreshDiscovery()"))
+        #expect(refreshSource.contains("hasBusyBluetoothTarget"))
+        #expect(refreshSource.contains("cancelAutomaticDiscovery()"))
         #expect(!refreshSource.contains("discoveryBluetoothBridge?.reconnectNow()"))
     }
 
@@ -2862,10 +3209,32 @@ struct OnboardingFlowTests {
         #expect(!audioSource.contains("ForEach(model.audioDevices"))
         #expect(!audioSource.contains("Picker("))
         #expect(audioSource.contains("settings.selectedAudioDeviceUID = device.uid"))
-        #expect(audioSource.contains("model.applyAudioSettings(reason: \"onboarding_audio_device_selected\")"))
+        #expect(audioSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_audio_device_selected\")"))
         #expect(viewSource.contains("OnboardingAudioSelectionPolicy.isSupportedDevice"))
         #expect(viewSource.contains("onboarding.audio.on_demand_detail"))
         #expect(viewSource.contains("onboarding.side.audio_on_demand"))
+    }
+
+    /// 音频页不能要求用户先点重试才配置输出。进入页面、设备枚举完成和重新回到前台
+    /// 都要主动准备；离开页面必须解除临时租约，避免把没有语音来源的引擎长期保留。
+    @Test func onboardingAudioStepPreparesAndReleasesTheTemporaryOutputLease() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let viewSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/OnboardingView.swift"),
+            encoding: .utf8
+        )
+
+        #expect(viewSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_audio_entered\")"))
+        #expect(viewSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_audio_devices_refreshed\")"))
+        #expect(viewSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_audio_became_active\")"))
+        #expect(viewSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_audio_device_selected\")"))
+        #expect(viewSource.contains("model.prepareOnboardingAudioOutput(reason: \"onboarding_recovery\")"))
+        #expect(viewSource.contains("model.endOnboardingAudioPreparation(reason: \"onboarding_step_\\(step.rawValue)\")"))
+        #expect(viewSource.contains("model.endOnboardingAudioPreparation(reason: \"onboarding_view_disappeared\")"))
+        #expect(!viewSource.contains("model.applyAudioSettings(reason: \"onboarding_recovery\")"))
     }
 
     @Test func onlySayAllLegacyMiRemoteAndBlackHoleCanSatisfyTheAudioSelectionGate() {
@@ -3629,6 +3998,11 @@ struct OnboardingFlowTests {
         #expect(text.contains("voice_fn_tap_mode_enabled=true"))
         #expect(text.contains("voice_key_policy_compliant=true"))
         #expect(text.contains("control_source=xiaomi_remote"))
+        #expect(text.contains("siri_remote_build_supported=false"))
+        #expect(text.contains("siri_remote_installer_receipt_present=false"))
+        #expect(text.contains("siri_remote_helper_present=false"))
+        #expect(text.contains("siri_remote_launch_daemon_present=false"))
+        #expect(text.contains("siri_remote_component_installed=false"))
         #expect(text.contains("voice_gesture=toggle"))
         #expect(text.contains("voice_binding_source=documented_default"))
         #expect(text.contains("voice_binding_validation=staged"))
@@ -3733,21 +4107,28 @@ struct OnboardingFlowTests {
         let visibleSources = OnboardingControlSourceVisibilityPolicy.visibleSources(
             OnboardingBuildCapabilities.availableControlSources
         )
+        for card in OnboardingPhysicalRemoteCard.ordered(availableSources: visibleSources) {
+            let id = "control-source.\(card.id)"
+            invoke(id, on: remoteSource)
+            switch card {
+            case let .xiaomi(model):
+                #expect(remoteSource.settings.onboardingControlSource == .xiaomiRemote)
+                #expect(remoteSource.settings.onboardingXiaomiRemoteModel == model)
+                #expect(!remoteSource.settings.siriRemoteEnabled)
+            case let .apple(generation):
+                #expect(remoteSource.settings.onboardingControlSource == .siriRemote)
+                #expect(remoteSource.settings.onboardingAppleRemoteGeneration == generation)
+                #expect(remoteSource.settings.siriRemoteEnabled)
+            }
+        }
         for source in visibleSources where source != .siriRemote {
+            guard source != .xiaomiRemote else { continue }
             let id = "control-source.\(source.rawValue)"
             invoke(id, on: remoteSource)
             #expect(remoteSource.settings.onboardingControlSource == source)
             #expect(!remoteSource.settings.siriRemoteEnabled)
         }
-        #if SAYALL_SIRI_REMOTE_ENABLED
-        for generation in OnboardingAppleRemoteGeneration.allCases {
-            let id = "control-source.siri_remote.\(generation.rawValue)"
-            invoke(id, on: remoteSource)
-            #expect(remoteSource.settings.onboardingAppleRemoteGeneration == generation)
-            #expect(remoteSource.settings.siriRemoteEnabled)
-        }
-        #endif
-        invoke("control-source.xiaomi_remote", on: remoteSource)
+        invoke("control-source.xiaomi_remote.rc001", on: remoteSource)
         invoke("continue", on: remoteSource)
         invoke("back", on: remoteSource)
 
@@ -3949,10 +4330,12 @@ private final class OnboardingOffscreenFixture {
         systemFunctionKeyAvailable: Bool = true,
         initialInputMethodGuideStep: Int? = nil,
         controlSource: OnboardingControlSource? = nil,
+        xiaomiModel: OnboardingXiaomiRemoteModel? = nil,
         voiceToolAvailability: [OnboardingVoiceTool: OnboardingVoiceToolAvailability]? = nil,
         siriRemotePackageInstalled: Bool = true,
         siriRemoteInitiallyEnabled: Bool = false,
-        siriRemoteNeedsUserAction: Bool = false
+        siriRemoteNeedsUserAction: Bool = false,
+        siriRemoteComponentInstalled: Bool = true
     ) throws {
         let suiteName = "RemoteMicTests.Onboarding.Fixture.\(UUID().uuidString)"
         guard let defaults = TestUserDefaults(suiteName: suiteName) else {
@@ -3968,7 +4351,14 @@ private final class OnboardingOffscreenFixture {
         settings.setOnboardingVoiceBindingPreference(bindingPreference)
         settings.setOnboardingRemoteAvailability(remoteAvailability)
         settings.setOnboardingControlMethod(controlMethod)
-        settings.setOnboardingControlSource(controlSource ?? .migrated(from: controlMethod))
+        let resolvedControlSource = controlSource ?? .migrated(from: controlMethod)
+        settings.setOnboardingControlSource(resolvedControlSource)
+        if let xiaomiModel {
+            settings.setOnboardingXiaomiRemoteModel(xiaomiModel)
+        } else if resolvedControlSource == .xiaomiRemote,
+                  step != .remoteAvailability {
+            settings.setOnboardingXiaomiRemoteModel(.rc003)
+        }
         settings.setOnboardingStep(step)
         probe = OnboardingInteractionProbe(openURL: { _ in })
         model = BridgeAppModel(
@@ -3996,7 +4386,8 @@ private final class OnboardingOffscreenFixture {
             ],
             initialInputMethodGuideStep: initialInputMethodGuideStep,
             interactionProbe: probe,
-            siriRemotePackageInstalledOverride: siriRemotePackageInstalled
+            siriRemotePackageInstalledOverride: siriRemotePackageInstalled,
+            siriRemoteComponentInstalledOverride: siriRemoteComponentInstalled
         )
         .environmentObject(localization)
         .frame(width: 1020, height: 772)

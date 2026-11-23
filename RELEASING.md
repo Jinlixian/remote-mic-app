@@ -10,8 +10,8 @@
 - Build 号不变量：任何打包前都必须先递增 `CFBundleVersion`，再执行构建、签名、公证或上传。Preview、Hotfix、本地测试包和私有内部 Draft 一律适用，不存在「先打包、需要时再补号」或「只有 Preview 才升号」的例外。递增必须写进源码并被记录：本地测试包和私有 Draft 在独立的打包 worktree 与打包分支里递增并提交，不把递增留在公开 `main` 工作区。**不得为了让工作区变干净而回滚、复用或跳回旧 Build 号**；一个 Build 号只能对应一个已产出的包，已经用掉的号即使没有对应源码提交也不能再次使用，需要继续往前递增。**Build 号的唯一记录是远端已发布的标签**：私有 Draft 的标签形如 `v<版本>-local.<build>`，下一次的起点取远端该形态标签的最大值加一。`Resources/Info.plist` 只保存源码里的起点值，不跟随打包递增，因此**不得**把 `plutil` 读到的数字当作基线——2026-11-02 就因为按 plist 的 270 递增，撞上了已被 `v2.0.0-local.271`–`280` 占用的号段。打包前用 private-draft-release skill 的 `increment_macos_build.sh --plist <Info.plist> --repo <分发仓库>`，它会取远端最大标签与 plist 的较大值再递增；远端不可查时必须先人工确认最大值，不得直接对 plist 加一。**Build 号跨版本连续递增**：升级 `CFBundleShortVersionString` 不重置它——Draft 取远端所有 `v*-local.<build>` 标签的最大值（不限版本）加 1；Preview 取同一组远端标签最大值与 main 上当前 `CFBundleVersion` 的较大值加 10，为其间新增的私有 Draft 留出号段。私有 Draft 标签不可查时，Preview 元数据准备必须停止，不能退回只按 plist 递增。Draft 的版本号同样取自打包 worktree 的 `Resources/Info.plist`，**不固定**为某个值：`v2.0.0-local.N` 只是主线当前恰好在 2.0.0，切到 2.1.0 后 Draft 就是 `v2.1.0-local.N`。
 - 发布 Workflow 只能从精确 `origin/main` 运行。普通新候选源码只能来自 `main`；`hotfix/vX.Y.Z` 是唯一允许的新候选源码例外。`release-main` 冻结为只读历史，但已公开的旧 Pre-release 可按兼容晋升门禁完成正式化。
 - 发布基线：Draft 与 Pre-release 只能从最新 `origin/main`（外加只含 Build 号递增与 `packaging/**` 政策锁的打包提交）构建，入口门禁见 `scripts/verify-release-baseline.sh`。构建来源写进 App 的 `Info.plist`，发布说明的 `Commit：` 必须来自实际构建树，不得手写。
-- 私有内部 Draft：使用 private-draft-release skill 的独立路径，目标仓库固定为 GetSayAll/SayAll，不在公开源码仓库创建内部 Draft。
-- 私有内部 Draft 的资产必须先暂存再上传：`scripts/prepare-private-draft-assets.sh <暂存目录> <架构=产物目录> [<架构=产物目录> ...]` 把每个架构的 DMG 与安装包复制成规范名 `SayAll-<版本>-<Build>-<AppleSilicon|Intel>[-Installer].<ext>`，并写出 `staged-assets.json`（名称、SHA-256、字节数）。**不得**把构建目录里的原始文件名直接上传：`gh release upload` 保留本地文件名并会把空白改名（`Install SayAll.pkg` 会变成 `Install.SayAll.pkg`），丢掉 Build 号与架构标识，上传后也无法按文件名回读校验。**每个架构必须覆盖同一组资产种类**，少一个架构的安装包即停止，不得只发布其中一个架构。上传后按 `staged-assets.json` 里的 SHA-256 逐个回读比对，不能按文件名找资产。
+- 私有内部 Draft：使用 private-draft-release skill 的独立路径，目标仓库固定为 GetSayAll/SayAll，不在公开源码仓库创建内部 Draft。快速包使用 `scripts/notarize-release.sh --private-draft`：默认只构建 Apple Silicon，并跳过不上传的卸载包公证；卸载包仍签名并做结构校验，但不得作为分发资产。只有明确需要 Intel 时使用 `--private-draft --include-intel`。公开 Preview/Stable 和任何双架构候选仍使用 `--all`，必须同时构建两个架构。
+- 私有内部 Draft 的资产必须先暂存再上传：`scripts/prepare-private-draft-assets.sh <暂存目录> <架构=产物目录> [<架构=产物目录> ...]` 把每个架构的 DMG 与安装包复制成规范名 `SayAll-<版本>-<Build>-<AppleSilicon|Intel>[-Installer].<ext>`，并写出 `staged-assets.json`（名称、SHA-256、字节数）。**不得**把构建目录里的原始文件名直接上传：`gh release upload` 保留本地文件名并会把空白改名（`Install SayAll.pkg` 会变成 `Install.SayAll.pkg`），丢掉 Build 号与架构标识，上传后也无法按文件名回读校验。同一 Draft 内每个已包含的架构必须覆盖同一组资产种类；默认 Apple Silicon 快速包只发布 Apple Silicon 的 DMG 与安装包，明确要求 Intel 时两个架构都必须覆盖完整资产组，缺少 Intel 安装包即停止。仅含 Apple Silicon 的 Draft 必须在标题或说明中标注“Apple Silicon 快速包”，不得表述为双架构候选、Preview 或正式发布。上传后按 `staged-assets.json` 里的 SHA-256 逐个回读比对，不能按文件名找资产。
 - “发布正式版”不是独立构建命令。没有指定现有 Pre-release 时，只能准备 Preview 或报告缺少授权。
 - stable latest 不写死版本号。Preview 开始前、公开后和失败恢复前后都必须动态读取 `releases/latest`，确认其为正式稳定版且前后一致；流程不得修改 stable feed。
 
@@ -137,6 +137,7 @@ AI 整理在本次分发协议中保持关闭。`include_ai=true` 在接触发�
 - 在 mac-release Environment 内使用只读 Match、隔离临时 Keychain 和最小权限；
 - 按 `config/release-dependencies.json` 读取固定 Tag 的持久二进制附件并验证来源与摘要，缺少权限、Tag、附件或组件即停止。
 - 独立构建 Apple Silicon/macOS 14 与 Intel Ventura/macOS 13 两条 lane；
+- 通过 `mac-release` 环境提供 `SAYALL_CLIENT_PROOF_KEY`，使用与目标会员服务匹配的 macOS 客户端证明值。签名前注入 App，上传前从双架构的安装 PKG 和更新 ZIP 读回校验。失败时停止打包，日志只记录结果。
 - 对 App、Framework、XPC、Helper、Installer、PKG 和 ZIP 完成 Developer ID 签名、Apple 公证、staple、Gatekeeper 和权限/符号链接校验；DMG 可以作为内部构建中间产物，但不进入公开下载资产。
 - 使用独立 SwiftPM scratch/output，独立提交可并行的 PKG 公证；
 - 生成 canonical public bundle、staged-assets.json 和 stage record；
@@ -153,6 +154,7 @@ AI 整理在本次分发协议中保持关闭。`include_ai=true` 在接触发�
 1. scripts/prepare-staged-preview-ui-test.sh 下载指定 Run、attempt 和 artifact ID，不使用 latest artifact；存在 UI 专用 payload 时优先使用，旧 Run 没有该 artifact 时回退到完整 payload。它同时动态下载并验证发布开始时记录的 stable latest 公开归档。
 2. 用本地固定 feed，只把生产 appcast 的不可变 URL 前缀替换为本地地址，确保 enclosure 是 staging 的同一 ZIP。
 3. 使用稳定版 App 的真实 Sparkle UI 完成 check、download、install、首次启动、退出和二次启动；验证版本/Build、Team ID L3QHLDRPAY、公证、Gatekeeper、Sparkle helper 的 0755 权限和 Versions/Current 链接。
+   会员客户端证明接入或变更时，还须从当前公开会员 Preview 原位升级，验证安装身份、会话和权益延续，并使用隔离测试环境验收首次注册和登录。服务端强制校验独立评估和变更。
 4. 检查没有新增崩溃报告、应用可以再次启动，并用 scripts/record-preview-ui-attestation.sh 生成结构化证明。仅运行 Sparkle CLI probe、单元测试或静态解压不能替代真实 UI 安装；该步骤未完成时不得公开 Preview。
 5. scripts/record-preview-ui-attestation.sh verify 必须重新核对 stage record、manifest、production/test appcast 摘要和安装结果。
 

@@ -1,7 +1,7 @@
 # 遥控器有限恢复与手动连接测试
 
 - 适用：连接页当前候选 Head；本轮新增「连接新的设备」入口；macOS；产品行为以 `feature/remote-connection-lifecycle/PRODUCT_SPEC.md` 为准。
-- 状态：自动化与生产 UI 证据见 PR；以下真实设备用例尚未验收，不代表兼容或发布通过。
+- 状态：自动化与生产 UI 证据见 PR；以下真实设备用例尚未验收，不代表兼容或发布通过。2026-11-23 补充选中设备睡眠唤醒与语音键恢复候选，真实 RC003 + 第三方语音工具仍待验收。
 
 ## 测试前准备
 
@@ -38,8 +38,8 @@
 3. 重复前台切换、广播观察、蓝牙关闭再打开和睡眠唤醒。
 4. 点击该设备“连接”，在连接过程中取消；五秒后再次重试。
 
-预期：耗尽后显示自动连接已暂停，重复事件不重置预算。手动操作最长 30 秒且至多一次握手，取消后无迟到 Ready。重复点击不启动并行连接。
-失败：自动无限重试、主计时被每次扫描重置、取消后仍报成功、重试按钮永远无法恢复。
+预期：真实握手失败耗尽后显示自动连接已暂停；重复广播、前台和后台事件不重置失败预算。系统睡眠/唤醒本身不消耗失败预算：选中设备睡眠前 Ready 时，唤醒后允许一次免预算恢复；语音键在链路未就绪时允许一次免预算恢复。手动操作最长 30 秒且至多一次握手，取消后无迟到 Ready。重复点击不启动并行连接。
+失败：自动无限重试、主计时被每次扫描重置、取消后仍报成功、重试按钮永远无法恢复、选中设备唤醒后仍永久暂停，或按语音键静默无恢复。
 
 ## 用例 4：坏设备与多设备隔离
 
@@ -53,11 +53,11 @@
 ## 用例 5：改名、蓝牙和权限
 
 1. 在系统设置中给已登记设备改名，然后重新连接。
-2. 分别测试蓝牙关闭、权限不足、系统睡眠和会话恢复。
-3. 检查页面原因和系统设置入口，恢复条件后使用未耗尽预算或手动恢复。
+2. 分别测试蓝牙关闭、权限不足、系统睡眠和会话恢复；对选中设备连续睡眠/唤醒至少 7 次。
+3. 检查页面原因和系统设置入口，恢复条件后使用未耗尽预算、语音键或手动恢复。
 
-预期：改名不改变身份和映射；外来硬件仍不误识别；蓝牙或权限阻断时不做无效连接；系统睡眠没有新扫描。
-失败：改名后拒绝原设备、错误匹配其他型号、关闭蓝牙仍尝试连接、耗尽设备被系统通知自动复活。
+预期：改名不改变身份和映射；外来硬件仍不误识别；蓝牙或权限阻断时不做无效连接；系统睡眠没有新扫描；选中设备每次真实唤醒最多一次免预算恢复，语音键可在暂停后触发一轮恢复，不要求重启 App；历史未选中设备仍保持暂停。
+失败：改名后拒绝原设备、错误匹配其他型号、关闭蓝牙仍尝试连接、耗尽设备被系统通知自动复活、选中设备唤醒后仍暂停，或语音键无恢复。
 
 ## 用例 6：页面和稳定回归
 
@@ -86,11 +86,74 @@ Apple、Chromecast 和手机/网页/Watch 入口分别回归，不以小米通�
 
 失败：入口依赖 Apple Remote 卡片出现、点击后没有进入向导、进入后清除已有配置、列表折叠时入口消失、页面在其他位置使用“遥控器”泛称，或 1067 × 760 下入口被裁切。
 
+## 用例 8：重新配对后旧 identifier 与新 HID 身份分裂
+
+1. 使用 RC001 或 RC003，保留一个已有档案和独立按键映射；在 macOS 蓝牙设置中移除并重新配对同一只遥控器，或制造系统 CoreBluetooth identifier 变化。
+2. 重启 App，确认当前 HID 普通按键仍能被识别，连接页进入恢复。若当前 identifier 没有广播名称或语音服务，确认扫描路径仍能通过 HID 指纹命中，不被 `ignored_unrelated` 过滤。
+3. 检查日志：出现 `BLE IDENTITY phase=completed result=replaced reason=hid_fingerprint_match`，并记录 `previous_recovery`；随后 `BLE CONNECTING` 使用当前 identifier，而不是旧 identifier。
+4. 等待 `BLE READY`，确认档案数量不变、原映射、自定义名称、选中状态和音量仍保留；第一次普通按键和语音直接可用。
+5. 先让旧 identifier 的自动重连预算耗尽（日志出现暂停），再完成重新配对。确认新 identifier 仍会发起 `BLE CONNECTING`，不会因旧预算已暂停而永久不连接；`previous_recovery` 只记录旧状态。
+6. 准备一台没有历史档案的新设备并连接，确认没有 HID 指纹命中时仍创建新档案，不覆盖旧档案。
+7. 准备两台同型号、同名遥控器，确认各自 HID 指纹唯一；任一台重新配对不会把另一台的 identifier 写进错误档案。
+8. 让当前 identifier 已被另一条档案占用，确认不替换并记录 `result=skipped reason=identifier_owned`，不串台。
+9. 在语音进行中或首个语音启动等待中触发同一发现，确认不替换、不结束当前语音。
+10. 构造一条只有 BLE identifier、没有 HID 指纹的历史重复档案。确认本次不会猜测合并它；记录为已知边界，后续需独立修复或在现有界面允许时手动清理。
+
+预期：HID 指纹唯一命中且当前 identifier 未被占用时，只更新原档案的 BLE 字段并复用原档案；旧 identifier 的重连停止，旧恢复预算不迁移，当前 identifier 建立新桥。新设备、重复指纹、identifier 冲突、语音进行中和只有 BLE 的历史重复档案都保持原行为。
+
+失败：生成重复档案、覆盖其他档案、丢失映射或选中状态、继续重连旧 identifier、迁移已暂停的旧预算导致新 identifier 不连接、替换后不尝试当前 identifier、语音被中断，或当前 identifier 仍连接失败时把失败伪装成成功。
+
+## 用例 9：周边蓝牙设备多时的连接页滚动
+
+1. 在周围有至少 20 台其他 BLE 设备（耳机、手表、音箱、键盘等）的环境中打开连接页。
+2. 在 20 秒发现窗口内和结束后分别纵向滚动连接页，再切到按键页滚动。
+3. 观察界面是否持续掉帧、卡顿或输入延迟；记录开始和结束时间。
+4. 检查日志：发现窗口结束时应有 `BLE DISCOVERY_WINDOW phase=completed ... ignored_unrelated=<n>`；`BLE ADOPT IGNORED` 只应出现在通过第一层候选过滤的设备上，不得为每台无关设备逐条输出。
+5. 保持已保存遥控器稳定在线，退出并重新打开连接页，确认原遥控器仍直接可用；再点击“查找遥控器”或进入添加新遥控器向导，确认手动扫描仍能发现已知型号的新遥控器。
+
+预期：滚动过程中不出现持续主线程卡顿；无关 BLE 广播只在扫描结束时汇总计数；已保存身份、已知名称和 ATVV 服务候选仍进入统一准入判定；稳定连接时不再自动开发现窗口，手动查找和添加新遥控器仍能扫描。
+
+失败：每台无关设备仍产生 `BLE ADOPT IGNORED`；`ignored_unrelated` 无界增长或跨扫描累加；已保存遥控器或已知型号新遥控器不再被发现；稳定连接时仍自动开 `BLE DISCOVERY_WINDOW phase=started`；滚动仍明显掉帧。
+
+自动化只证明过滤策略与接线；真实 CoreBluetooth 回调频率、滚动帧率和设备发现仍需现场验证。
+
+## 用例 10：稳定连接时的自动发现抑制
+
+1. 连接并保存一台小米遥控器，等待日志出现 `BLE READY`，确认目标桥稳定在线。
+2. 切到其他 App 再回到 SayAll，或退出并重新进入连接页；等待至少 30 秒。
+3. 检查日志：稳定连接期间不应出现新的自动 `BLE DISCOVERY_WINDOW phase=started window_ms=20000`；如需验证，记录页面出现时间和日志时间。
+4. 点击“查找遥控器”或进入添加新遥控器向导，确认手动扫描仍出现 `BLE DISCOVERY_WINDOW phase=started`，并能发现已知型号的新遥控器。
+5. 断开或移走已保存遥控器，确认目标桥按自己的重连路径扫描，不依赖发现桥。
+
+预期：目标桥处于连接、重连或 ready 时，自动发现窗口被抑制；手动查找和 onboarding 添加新遥控器仍能启动 20 秒窗口；已保存遥控器的连接不受影响。
+
+失败：稳定连接时切回 App 或打开连接页仍自动出现 `BLE DISCOVERY_WINDOW phase=started`；手动查找或 onboarding 无法启动扫描；抑制自动发现后已保存遥控器断开无法重连。
+
+自动化只证明守卫接线和源码路径；真实页面切换、日志和手动扫描仍需现场验证。
+
+## 用例 11：选中设备睡眠唤醒与语音键恢复
+
+1. 选中 RC003，等待 `BLE READY`，确认目标语音工具可用。
+2. 让 Mac 睡眠/唤醒 7 次（合盖或系统睡眠），每次间隔约 40 秒。
+3. 每次唤醒后按遥控器语音键说一句短句；记录按下到首个 PCM、可观察首字和松键尾字。
+4. 制造一次语音链路未就绪（暂停或断开），不打开设置页，直接按遥控器语音键。
+5. 检查日志：`BLE SYSTEM_SUSPENSION ... wake_eligible=true`；`BLE RECOVERY phase=requested ... recovery_trigger=system_wake`；`BLE RECOVERY_WINDOW ... result=ready`。链路未就绪时应有 `VOICE KEY reconnect_requested reason=voice_link_down` 和 `BLE RECOVERY ... recovery_trigger=voice_key`。
+6. 让遥控器不可达，连续制造 6 次真实握手失败；确认后台自动重连仍暂停，不出现无限重试。
+7. 在暂停状态打开菜单栏，确认显示“自动连接已暂停”，点击“重新连接”可以恢复。
+
+预期：选中设备不会因正常睡眠/唤醒进入永久暂停；按语音键不需要手动连接或重启 App；系统唤醒和语音键各只启动一轮，唤醒恢复失败后后续睡眠/唤醒不再重复握手；历史设备仍受限；首字和尾字完整。
+失败：必须重启或打开设置页；语音键无日志、无恢复；每次唤醒启动多轮；后台无限重试；历史设备被唤醒；首字丢失或尾字被截断。
+
+真实设备、第三方工具和睡眠矩阵未完成时只能标记候选；自动化不能替代首字/尾字和文字上屏。
+
 ## 自动化与证据边界
 
-- `RemoteConnectionRecoveryTests` 使用虚拟时间验证预算、冷却、短暂 Ready、周期掉线、取消、迟到结果和多设备独立性。
+- `RemoteConnectionRecoveryTests` 使用虚拟时间验证预算、冷却、短暂 Ready、周期掉线、取消、迟到结果、多设备独立性，以及系统唤醒/语音键在暂停后的一次性恢复和冷却。
+- `VoiceKeyDiagnosticTests` 验证语音键下沿触发一次恢复意图、重复报告和设备上沿不重复触发；`BluetoothLifecycleTests` 验证 `system_wake` 触发、`RemoteWakeRecoveryPolicy` 资格和语音键接线。
 - `SiriRemoteActivationTests.explicitEnableWithoutMembershipSurvivesRelaunch` 使用无会员配置验证显式启用与持久化，不授予语音权益；真实 Free 账号、组件、按键与触摸仍待现场验收。
-- `BluetoothLifecycleTests` 验证既有发现、扫描、代次和会话门禁；`AppLoggerTests` 验证密集拒绝事件的聚合上限。
+- `BluetoothLifecycleTests` 验证既有发现、扫描、代次和会话门禁；`BluetoothDiscoveryScanPolicy` 用例覆盖无关广播过滤、身份快照和稳定连接时的自动发现抑制；新增 `RemoteIdentityReconciliationPolicy` 用例覆盖唯一 HID 命中、identifier 冲突、重复指纹、私有/未知型号和发现桥接线，并静态确认替换路径不迁移旧恢复预算、会清理旧桥状态。`AppLoggerTests` 验证密集拒绝事件的聚合上限。
+- `RemoteDeviceNameIntegrationTests` 验证替换 BLE identifier 后档案 ID、HID、型号、自定义名称、系统名称、硬件身份、映射、选中状态和持久化不变，且已被其他档案占用的 identifier 不写入。
+- 已暂停的旧恢复预算迁移、`identifier_owned` 跳过和只有 BLE 的历史重复档案属于策略/静态验证边界；真实 CoreBluetooth 事件顺序与真实遥控器仍待现场验收。
 - 生产 `SettingsView` 的隔离夹具截图只证明页面渲染；夹具不会发起真实蓝牙或录音。
 - `SettingsScreenshotRenderer` 的 connection 场景分别覆盖空档案和离线档案，检查“设备”卡片、连接新的设备入口、空状态和列表；真实窗口截图覆盖中英文与浅深色。点击后进入真实设置向导仍需交互验收。
 - 模拟、策略测试与构建不能证明真实 CoreBluetooth 的发现时机、功耗、首字、尾音和第三方工具文字结果。
@@ -99,5 +162,6 @@ Apple、Chromecast 和手机/网页/Watch 入口分别回归，不以小米通�
 ## 日志判定
 
 核对 `BLE DISCOVERY_WINDOW`、`BLE RECOVERY_WINDOW`、`BLE RECOVERY_ATTEMPT`、`BLE CONNECTING`、`BLE READY` 和 `BLE DISCONNECTED`。
+系统唤醒和语音键恢复额外核对 `recovery_trigger=system_wake|voice_key|automatic|manual`、`BLE RECOVERY phase=skipped ... reason=wake_not_eligible|budget_paused|cooldown`、`VOICE KEY reconnect_requested|reconnect_skipped`。免预算恢复不得增加十分钟失败计数；真实握手失败仍按 `BLE RECOVERY_ATTEMPT` 计数。
 使用窗口 operation_id 与 attempt_id 关联请求、尝试和唯一终态。Ready 只证明本地握手，不能代替最终文字上屏。
-等待或暂停时不应出现周期超时；`BLE REJECTED` 与 `BLE ADOPT IGNORED` 应聚合，不逐设备刷屏。
+等待或暂停时不应出现周期超时；`BLE REJECTED` 与 `BLE ADOPT IGNORED` 只应来自通过第一层候选过滤的设备。普通无关设备在扫描结束时只汇总为 `ignored_unrelated=<n>`，不得逐设备刷屏。

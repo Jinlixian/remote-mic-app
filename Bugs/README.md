@@ -1,5 +1,27 @@
 # Bug 记录
 
+- [Mac 麦克风选择 iPhone 连续互通麦克风后无音频](./2026-11-23-mac-microphone-continuity-capture-slow-start.md)
+- [睡眠唤醒后自动重连暂停，Fn 语音键必须手动连接或重启才恢复](./2026-11-23-fn-voice-recovery-paused.md)
+- [小米 2 Pro 原生映射校验失败后整场不再接管按键](./2026-11-23-native-mapping-verify-failure-no-retry.md)
+- [键位方案里的 disable 显示成「本方案禁用」，实际含义是「未设置」](./2026-11-22-profile-disabled-label-means-not-set.md)
+- [键位方案引用失效时显示「配置不可用」且按键变成死键](./2026-11-22-profile-unavailable-shortcut-references.md)
+- [键位方案的旧快捷键引用在换机或迁移后失效](./2026-11-22-profile-shortcut-selfcontained-migration.md)
+- [升级后同一遥控器档案 UUID 变化导致自定义配置丢失](./2026-11-22-remote-profile-continuity-custom-config-loss.md)
+- [关于页显示“此版本暂未提供可展示的更新内容”](./2026-11-22-about-update-release-notes-unavailable.md)
+- [按下音量键触发档案切换后松键不停止重复](./2026-11-21-volume-repeat-after-profile-switch.md)
+- [双传输档案旁多出默认 BLE 档案导致卡片常驻“状态确认中”](./2026-11-21-card-confirming-both-ble-duplicate.md)
+- [切换遥控器后残留上一台设备的按键编辑区](./2026-11-20-mapping-remote-switch-stale-editor.md)
+- [重新配对后 HID 指纹与 BLE identifier 分裂，遥控器语音链路永久超时](./2026-11-21-stale-bluetooth-identity-after-repair.md)
+- [连接页扫描逐设备写忽略日志导致主线程 BLE 风暴](./2026-11-21-ble-discovery-main-thread-storm.md)
+- [控制来源未连接时 Onboarding 卡在音频页](./2026-11-20-onboarding-audio-gate-disconnected-remote.md)
+- [Typeless 的 Fn 组合快捷键在 2.0.8 预览版后无法定义](./2026-11-20-typeless-fn-shortcut-unavailable.md)
+- [卸载后残留 Siri Remote 安装收据和 Dock 固定项](./2026-11-20-uninstaller-stale-siri-receipt-and-dock-tile.md)
+- [Build 409 遥控器可用但卡片持续“状态确认中”](./2026-11-19-remote-card-confirming-on-build-409.md)
+- [虚拟音频启动阻塞导致遥控器卡片长期“状态确认中”](./2026-11-19-audio-configure-timeout-card-stuck.md)
+- [Onboarding 语音测试松键后不结束，无法进入下一步](./2026-11-19-onboarding-voice-test-end-blocked-by-cleared-source.md)
+- [Onboarding 切到非 Siri 来源后仍保持 Siri Remote 临时启用](./2026-11-19-onboarding-source-switch-keeps-siri-enabled.md)
+- [Onboarding 无法在 RC003 已连接时选择并连接 RC001](./2026-11-18-onboarding-xiaomi-remote-model-selection.md)
+- [Onboarding 苹果遥控器组件缺失时误显示重新授权](./2026-11-18-onboarding-siri-component-missing.md)
 - [安装器因重复的兼容麦克风驱动阻止升级](./2026-11-17-installer-duplicate-driver-block.md)
 - [快速连接时遥控器卡片闪现黄色状态](./2026-11-17-remote-card-transient-yellow-flicker.md)
 - [历史设备持续盲连且缺少手动恢复入口](./2026-11-15-bounded-remote-recovery.md)
@@ -222,6 +244,9 @@
 
 | 时间 | Bug | 状态 |
 | --- | --- | --- |
+| 2026-11-23 | [睡眠唤醒后自动重连暂停，Fn 语音键必须手动连接或重启才恢复](./2026-11-23-fn-voice-recovery-paused.md) | 候选修复：自动失败预算与系统唤醒/语音键意图分离；暂停后选中设备可各执行一次免预算恢复；71 项定向测试通过；真实 RC003、睡眠矩阵和第三方文字上屏待验收 |
+| 2026-11-20 | [Typeless 的 Fn 组合快捷键在 2.0.8 预览版后无法定义](./2026-11-20-typeless-fn-shortcut-unavailable.md) | 调查中；已补启动/退出 Fn 快照、HID/session Fn 边沿、Fn 组合观察、软件 Fn 提交和快捷键录入日志；90 项定向测试通过；根因待现场日志确认 |
+| 2026-11-20 | [卸载后残留 Siri Remote 安装收据和 Dock 固定项](./2026-11-20-uninstaller-stale-siri-receipt-and-dock-tile.md) | 候选修复：卸载成功后按条件清除 Siri Remote 收据；只移除当前控制台用户中指向被卸载 App 的 Dock 固定项；新增伪卷/偏好回放与静态门禁。真实签名 PKG、Installer 授权、双架构和真实 Dock 待验收 |
 | 2026-11-17 | [安装器因重复的兼容麦克风驱动阻止升级](./2026-11-17-installer-duplicate-driver-block.md) | 候选修复：HAL 扫描拆分为 `hal_scan` + 精确 `detail`/`scope`/`level`/`issue` 枚举；可写 HAL 中的本产品多余副本移入 root 废纸篓并强制重启 Core Audio；符号链接、只读 System HAL 副本和权限异常仍停止。隔离夹具全部通过；真实 Installer、CoreAudio 与现场日志待回收 |
 | 2026-11-15 | [PreferredInputSourceMonitor 取消测试依赖真实 timer，CI 偶发超时失败](./2026-11-15-preferred-input-source-activation-timeout-flake.md) | 候选修复：移除 0.04 秒真实 timer，改在 production waiter 的循环内确定触发取消；定向 20/20、1456 项完整测试、48 项项目自检通过；无产品源码改动，等待 CI |
 | 2026-11-15 | [macOS 27 HID device 回调注册后不投递，显示已连接但遥控器无响应](./2026-11-15-hid-device-callback-silent-after-monitor-restart.md) | 候选修复：不再按“回调已注册”丢弃 manager 报告，改为按实际报告去重；新增 `path=` 与 10 秒汇总日志，device 静默时重挂回调并有界退避；180 项定向测试、1456 项完整测试、Release 构建和 48 项项目自检通过，真实 RC001/RC003 断连重连验收待完成 |

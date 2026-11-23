@@ -1,0 +1,86 @@
+{
+  // F5 (default) rebuilds and debugs the full, locally runnable SayAll.app
+  // bundle. The other configurations cover the lightweight SwiftPM debug
+  // executable and attaching to an already running Mac app.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Default: build the packaged Mac app (public ad-hoc path), then launch
+      // its real executable under LLDB. Bundle resources, Info.plist and the
+      // Sparkle framework are all present, so this is the app users run.
+      "name": "Debug SayAll.app (Mac)",
+      "type": "lldb-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/dist/SayAll.app/Contents/MacOS/RemoteMic",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "SayAll: Prepare Mac App Debug",
+      "console": "internalConsole",
+      // build-app.sh strips the release binary; the staged dSYM (UUID-matched
+      // by the build task) restores source-level breakpoints.
+      "preRunCommands": [
+        "target symbols add \"${workspaceFolder}/.build/SayAll.app.dSYM\""
+      ]
+    },
+    {
+      "name": "Run SayAll.app (Mac, no debugger)",
+      "type": "lldb-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/dist/SayAll.app/Contents/MacOS/RemoteMic",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "SayAll: Prepare Mac App Debug",
+      "console": "internalConsole",
+      "noDebug": true
+    },
+    {
+      "name": "Attach to SayAll.app (Mac)",
+      "type": "lldb-dap",
+      "request": "attach",
+      "program": "${workspaceFolder}/dist/SayAll.app/Contents/MacOS/RemoteMic",
+      "waitFor": true,
+      "preRunCommands": [
+        "target symbols add \"${workspaceFolder}/.build/SayAll.app.dSYM\""
+      ]
+    },
+    {
+      // Lightweight alternative: debug the bare SwiftPM debug executable.
+      // Not a signed .app bundle; use the Mac app configs above for bundle,
+      // Helper, signing or installer behavior.
+      "name": "Debug SayAll (SwiftPM)",
+      "type": "lldb-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/.build/out/Products/Debug/RemoteMic",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "SayAll: Prepare Debug",
+      "console": "internalConsole",
+      "env": {
+        "REMOTE_MIC_RESOURCE_ROOT": "${workspaceFolder}/Resources"
+      }
+    },
+    {
+      "name": "Run SayAll (SwiftPM, no debugger)",
+      "type": "lldb-dap",
+      "request": "launch",
+      "program": "${workspaceFolder}/.build/out/Products/Debug/RemoteMic",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "SayAll: Prepare Debug",
+      "console": "internalConsole",
+      "noDebug": true,
+      "env": {
+        "REMOTE_MIC_RESOURCE_ROOT": "${workspaceFolder}/Resources"
+      }
+    },
+    {
+      "name": "Attach to SayAll (wait for launch)",
+      "type": "lldb-dap",
+      "request": "attach",
+      "program": "${workspaceFolder}/.build/out/Products/Debug/RemoteMic",
+      "waitFor": true
+    },
+    {
+      "name": "Attach to running SayAll",
+      "type": "lldb-dap",
+      "request": "attach",
+      "program": "${workspaceFolder}/.build/out/Products/Debug/RemoteMic"
+    }
+  ]
+}

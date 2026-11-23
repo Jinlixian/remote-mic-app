@@ -165,8 +165,10 @@ extension AppSettings {
             }
             if let id = options.applicationReplacements[a.id] {
                 guard let index = profiles.firstIndex(where: { $0.id == id }) else { throw PortableTransferError.concurrentChange }
+                let existingBindings = profiles[index].buttonBindings
                 profile = CustomApplicationProfile(id: id,displayName: profile.displayName,bundleIdentifier: profile.bundleIdentifier,
-                    applicationPath: "",focusStrategy: profile.focusStrategy,focusShortcut: profile.focusShortcut,accessibilityTarget: profile.accessibilityTarget)
+                    applicationPath: "",focusStrategy: profile.focusStrategy,focusShortcut: profile.focusShortcut,accessibilityTarget: profile.accessibilityTarget,
+                    buttonBindings: existingBindings)
                 affected.append("App: \(profiles[index].displayName) → \(profile.displayName)")
                 for binding in unifiedBaseBindings where binding.configured.applicationProfileID == id {
                     let device = remoteDeviceProfiles.first { $0.id == binding.remoteProfileID }
@@ -201,6 +203,32 @@ extension AppSettings {
             map[a.id] = profile.id.uuidString
             if a.focusStrategy == .recordedAccessibility { pending.insert(profile.id.uuidString) }
             profiles.append(profile); if options.applicationReplacements[a.id] == nil { count += 1 }
+        }
+        for index in profiles.indices {
+            profiles[index].buttonBindings = ApplicationButtonBindingScope.sanitize(
+                profiles[index].buttonBindings,
+                validateAction: { configured in
+                    var result = configured
+                    if let id = result.applicationProfileID,
+                       let replacement = map[id.uuidString],
+                       let uuid = UUID(uuidString: replacement) {
+                        result.applicationProfileID = uuid
+                    }
+                    return result.normalizedForExecution
+                }
+            )
+        }
+        // 方案 ID 属于本机私有按键方案组件，跨机导入会悬空；一律回退默认方案。
+        var clearedMappingProfiles = 0
+        for index in profiles.indices where profiles[index].mappingProfileID != nil {
+            profiles[index].mappingProfileID = nil
+            clearedMappingProfiles += 1
+        }
+        if clearedMappingProfiles > 0 {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=clear_import scope=app count=\(clearedMappingProfiles) " +
+                    "result=cleared reason=portable_transfer"
+            )
         }
         p = PortableTransferGraph.remapping(p, macros: [:],shortcuts: [:],focuses: [:],applications: map)
         p.applications = Dictionary(grouping: p.applications,by: \.id).values.compactMap(\.first).sorted { $0.id < $1.id }

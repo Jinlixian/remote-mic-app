@@ -338,6 +338,7 @@ final class AppSettings: ObservableObject {
         static let chromecastSystemReservedExceptions = "chromecast.systemReservedExceptions"
         static let voiceKeyMode = "voiceKeyMode"
         static let siriRemoteScrollArrowReversed = "siriRemote.scrollArrowReversed"
+        static let siriRemoteCursorFeedbackVisible = "siriRemote.cursorFeedbackVisible"
         static let siriRemoteEnabled = "siriRemote.enabled"
         static let siriRemoteNeedsUserAction = "siriRemote.needsUserAction"
         static let chromecastEnabled = "chromecast.enabled"
@@ -356,6 +357,7 @@ final class AppSettings: ObservableObject {
         static let onboardingRemoteAvailability = "onboarding.remoteAvailability"
         static let onboardingControlMethod = "onboarding.controlMethod"
         static let onboardingControlSource = "onboarding.controlSource"
+        static let onboardingXiaomiRemoteModel = "onboarding.xiaomiRemoteModel"
         static let onboardingAppleRemoteGeneration = "onboarding.appleRemoteGeneration"
         static let onboardingVoiceTool = "onboarding.voiceTool"
         static let onboardingVoiceBindingPreference = "onboarding.voiceBindingPreference"
@@ -382,6 +384,25 @@ final class AppSettings: ObservableObject {
     /// first later save replaces the live value.
     private var unreadableStoredRemoteProfiles: Data?
     static let unreadableRemoteProfilesBackupKey = "remoteDeviceProfilesUnreadableBackup"
+    static let mergedRemoteProfilesBackupKey = "remoteDeviceProfilesMergeBackup"
+    static let mergedRemoteProfileSelectionBackupKey = "remoteDeviceProfilesMergeSelectionBackup"
+    static let mergedRemoteProfilesLatestBackupKey = "remoteDeviceProfilesLatestMergeBackup"
+    static let mergedRemoteProfileLatestSelectionBackupKey = "remoteDeviceProfilesLatestMergeSelectionBackup"
+    static let remappedScopedBindingConflictsKey = "unifiedBaseBindingsRecoveryConflicts"
+    /// 记录已经检查过快捷键恢复的档案 ID。恢复只针对升级窗口，不能每次启动
+    /// 都把用户后来主动重置的快捷键重新补回。
+    static let shortcutRecoveryEvaluatedKey = "remoteProfileShortcutRecoveryEvaluated"
+    /// 旧版本在解码失败或合并前留下的档案快照。只用于恢复仍然被
+    /// `unifiedBaseBindings` 引用的档案，不能作为活动档案的来源。
+    /// 顺序从较新到较旧；同一按键出现不同值时，先读到的较新值优先。
+    private static let remoteProfileRecoverySnapshotKeys = [
+        "remoteDeviceProfilesLatestMergeBackup",
+        "remoteDeviceProfilesMergeBackup",
+        "remoteDeviceProfiles.corrupt",
+        "buttonInteractionMigrationBackup",
+        "remoteDeviceProfilesUnreadableBackup",
+        "unifiedRemoteProfilesMigrationBackup",
+    ]
     private lazy var localUsageLedger = LocalUsageLedger(defaults: defaults,
         buttonCount: totalButtonPressCount, voiceDuration: totalVoiceDuration,
         longestVoice: voiceSessionRanking.map(\.duration).max() ?? 0)
@@ -440,8 +461,19 @@ final class AppSettings: ObservableObject {
     }
 
     var configuredActionOverride: ((UUID?, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
+    var frontmostApplicationBundleIdentifier: (() -> String?)?
+    /// APP 指定方案的可用性判定，由宿主注入（方案列表属于私有按键方案组件）。
+    var assignedMappingProfileApplicable: ((UUID) -> Bool)?
+    /// 读取 APP 指定方案里某个手势的动作；未覆盖时返回 nil，由调用方继承基础映射。
+    var assignedMappingProfileAction: ((UUID, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
+    private let applicationButtonResolutionLock = NSLock()
+    private var lastApplicationButtonResolution: (
+        key: String,
+        timestamp: TimeInterval
+    )?
     @Published var unifiedBaseBindings: [UnifiedButtonBinding] = [] {
         didSet {
+            guard !isLoadingStoredSettings else { return }
             onInteractionModeChanged?(selectedRemoteProfileID)
             if let data = try? JSONEncoder().encode(unifiedBaseBindings) {
                 defaults.set(data, forKey: "unifiedBaseBindings")
@@ -513,6 +545,7 @@ final class AppSettings: ObservableObject {
               let stored = try? JSONDecoder().decode([UnifiedButtonBinding].self, from: data)
         else { return false }
         unifiedBaseBindings = stored
+        recoverRemoteProfileDataIfNeeded()
         return true
     }
 
@@ -669,6 +702,7 @@ final class AppSettings: ObservableObject {
     @Published private(set) var selectedRemoteProfileID: UUID? {
         didSet {
             onInteractionModeChanged?(oldValue)
+            guard persistsSelectedRemoteProfile, !selectedRemoteProfileIsTransient else { return }
             defaults.set(selectedRemoteProfileID?.uuidString, forKey: Keys.selectedRemoteProfileID)
         }
     }
@@ -754,6 +788,16 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// 只控制触摸反馈是否显示在屏幕上；指针移动、滚动和点击本身不受影响。
+    @Published var siriRemoteCursorFeedbackVisible: Bool {
+        didSet {
+            defaults.set(
+                siriRemoteCursorFeedbackVisible,
+                forKey: Keys.siriRemoteCursorFeedbackVisible
+            )
+        }
+    }
+
     /// Only an explicit user action enables Apple Remote runtime services.
     @Published var siriRemoteEnabled: Bool {
         didSet { defaults.set(siriRemoteEnabled, forKey: Keys.siriRemoteEnabled) }
@@ -803,6 +847,11 @@ final class AppSettings: ObservableObject {
     }
 
     private var isLoadingRemoteProfile = false
+    private var persistsSelectedRemoteProfile = true
+    /// 同一进程内只保存一次恢复前快照，避免新增恢复路径覆盖原始证据。
+    private var didPreserveRecoverySnapshot = false
+    /// 自动回退只改变当前画布。后续去重/合并迁移这条临时选中项时，不得写回偏好。
+    private var selectedRemoteProfileIsTransient = false
 
     @Published private(set) var totalButtonPressCount: UInt64 {
         didSet {
@@ -867,6 +916,15 @@ final class AppSettings: ObservableObject {
     @Published private(set) var onboardingControlSource: OnboardingControlSource {
         didSet {
             defaults.set(onboardingControlSource.rawValue, forKey: Keys.onboardingControlSource)
+        }
+    }
+
+    @Published private(set) var onboardingXiaomiRemoteModel: OnboardingXiaomiRemoteModel? {
+        didSet {
+            defaults.set(
+                onboardingXiaomiRemoteModel?.rawValue,
+                forKey: Keys.onboardingXiaomiRemoteModel
+            )
         }
     }
 
@@ -1128,6 +1186,9 @@ final class AppSettings: ObservableObject {
         siriRemoteScrollArrowReversed = defaults.bool(
             forKey: Keys.siriRemoteScrollArrowReversed
         )
+        siriRemoteCursorFeedbackVisible = defaults.object(
+            forKey: Keys.siriRemoteCursorFeedbackVisible
+        ) == nil ? true : defaults.bool(forKey: Keys.siriRemoteCursorFeedbackVisible)
         siriRemoteEnabled = defaults.bool(forKey: Keys.siriRemoteEnabled)
         siriRemoteNeedsUserAction = defaults.bool(forKey: Keys.siriRemoteNeedsUserAction)
         // 首次运行默认开启：私有包只会被编入有该硬件的构建，让用户先找开关再测试没有意义。
@@ -1192,6 +1253,17 @@ final class AppSettings: ObservableObject {
         onboardingControlSource = defaults.string(forKey: Keys.onboardingControlSource)
             .flatMap(OnboardingControlSource.init(rawValue:))
             ?? OnboardingControlSource.migrated(from: persistedControlMethod)
+        let persistedXiaomiRemoteModel = defaults.string(
+            forKey: Keys.onboardingXiaomiRemoteModel
+        )
+        let decodedXiaomiRemoteModel = persistedXiaomiRemoteModel
+            .flatMap(OnboardingXiaomiRemoteModel.init(rawValue:))
+        onboardingXiaomiRemoteModel = decodedXiaomiRemoteModel
+        if persistedXiaomiRemoteModel != nil, decodedXiaomiRemoteModel == nil {
+            AppLogger.shared.write(
+                "SETTINGS onboarding_xiaomi_model phase=discarded reason=invalid_value"
+            )
+        }
         onboardingAppleRemoteGeneration = defaults.string(
             forKey: Keys.onboardingAppleRemoteGeneration
         ).flatMap(OnboardingAppleRemoteGeneration.init(rawValue:))
@@ -1254,6 +1326,11 @@ final class AppSettings: ObservableObject {
             buttonRapidPressEnabled: buttonRapidPressEnabled,
             interactionSettings: interactionSettings
         )
+        unifiedBaseBindings = Self.decodeSetting(
+            [UnifiedButtonBinding].self, forKey: "unifiedBaseBindings",
+            from: defaults, corrupted: &corruptedKeys
+        ) ?? []
+        let scopedBindingsReadable = !corruptedKeys.contains("unifiedBaseBindings")
         let storedRemoteProfilesData = defaults.data(forKey: Keys.remoteDeviceProfiles)
         if
             let decoded = Self.decodeSetting(
@@ -1265,10 +1342,23 @@ final class AppSettings: ObservableObject {
             !decoded.isEmpty
         {
             let savedID = defaults.string(forKey: Keys.selectedRemoteProfileID).flatMap(UUID.init(uuidString:))
-            let deduplicated = Self.deduplicateRemoteProfiles(decoded, selectedProfileID: savedID)
+            let deduplicated = Self.deduplicateRemoteProfiles(
+                decoded,
+                selectedProfileID: savedID,
+                protectedProfileIDs: protectedRemoteProfileIDs(
+                    in: decoded, scopedBindingsReadable: scopedBindingsReadable
+                )
+            )
             if defaults.data(forKey: "buttonInteractionMigrationBackup") == nil,
                let original = defaults.data(forKey: Keys.remoteDeviceProfiles) {
                 defaults.set(original, forKey: "buttonInteractionMigrationBackup")
+            }
+            if deduplicated.removedCount > 0 {
+                Self.persistRemoteProfilesRecoverySnapshot(
+                    decoded,
+                    selectedProfileID: savedID,
+                    defaults: defaults
+                )
             }
             remoteDeviceProfiles = deduplicated.profiles.map(Self.migratingButtonInteraction)
             if deduplicated.removedCount > 0 {
@@ -1349,10 +1439,6 @@ final class AppSettings: ObservableObject {
             enabled: experimentalContinuousRecordingEnabled,
             backup: continuousRecordingPowerBindingBackup
         )
-        if let data = defaults.data(forKey: "unifiedBaseBindings") {
-            do { unifiedBaseBindings = try JSONDecoder().decode([UnifiedButtonBinding].self, from: data) }
-            catch { corruptedKeys.append("unifiedBaseBindings") }
-        }
         corruptedSettingKeys = corruptedKeys
         if unreadableStoredRemoteProfiles == nil,
            let data = try? JSONEncoder().encode(remoteDeviceProfiles) {
@@ -1362,6 +1448,7 @@ final class AppSettings: ObservableObject {
             defaults.set(data, forKey: "buttonInteractionSettings")
         }
         isLoadingStoredSettings = false
+        recoverRemoteProfileDataIfNeeded()
         _ = localUsageLedger
     }
 
@@ -1447,6 +1534,19 @@ final class AppSettings: ObservableObject {
         discardOnboardingVoiceTrial()
         onboardingPreferredGesture = gesture
         stagedVoiceToolBinding = nil
+    }
+
+    func setOnboardingXiaomiRemoteModel(
+        _ model: OnboardingXiaomiRemoteModel?,
+        source: String = "user"
+    ) {
+        guard onboardingXiaomiRemoteModel != model else { return }
+        onboardingXiaomiRemoteModel = model
+        if let model {
+            AppLogger.shared.write(
+                "ONBOARDING XIAOMI_MODEL selected=\(model.rawValue) source=\(source)"
+            )
+        }
     }
 
     func setOnboardingControlSource(_ source: OnboardingControlSource) {
@@ -1603,6 +1703,7 @@ final class AppSettings: ObservableObject {
         onboardingRemoteAvailability = .unselected
         onboardingControlMethod = .unselected
         onboardingControlSource = .unselected
+        onboardingXiaomiRemoteModel = nil
         onboardingAppleRemoteGeneration = nil
         onboardingVoiceBindingPreference = .documentedDefault
         onboardingPreferredGesture = nil
@@ -1727,6 +1828,80 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    enum ApplicationButtonOverrideWriteResult: Equatable {
+        case wrote
+        case cleared
+        case invalidTarget
+        case invalidAction
+    }
+
+    @discardableResult
+    func setApplicationButtonOverride(
+        _ configured: ConfiguredButtonAction?,
+        applicationProfileID: UUID,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ApplicationButtonOverrideWriteResult {
+        let operationID = UUID().uuidString
+        let action = configured == nil ? "clear_override" : "write"
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=\(action) button=\(button.rawValue) trigger=\(trigger.rawValue) phase=requested result=requested")
+        guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+              let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID })
+        else {
+            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_target")
+            return .invalidTarget
+        }
+        var profile = customApplicationProfiles[index]
+        var bindings = profile.buttonBindings ?? []
+        bindings.removeAll { $0.button == button && $0.trigger == trigger }
+        if let configured {
+            guard let validated = Self.validatedConfiguredAction(configured),
+                  validated.applicationProfileID.map({ customApplicationProfile(id: $0) != nil }) ?? true
+            else {
+                AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_action")
+                return .invalidAction
+            }
+            bindings.append(ApplicationButtonBinding(
+                button: button,
+                trigger: trigger,
+                configured: validated.normalizedForExecution
+            ))
+        }
+        profile.buttonBindings = bindings.isEmpty ? nil : bindings
+        customApplicationProfiles[index] = profile
+        let outcome: ApplicationButtonOverrideWriteResult = configured == nil ? .cleared : .wrote
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=\(outcome == .cleared ? "cleared" : "saved") reason=storage_confirmed")
+        return outcome
+    }
+
+    @discardableResult
+    func clearApplicationButtonOverrides(applicationProfileID: UUID) -> ApplicationButtonOverrideWriteResult {
+        clearApplicationButtonOverrides(
+            applicationProfileID: applicationProfileID,
+            buttons: Set(RemoteButton.allCases)
+        )
+    }
+
+    /// 只清除指定按键的覆盖；用于「另存为新方案」时保留无法进入方案的菜单键/TV 键覆盖。
+    func clearApplicationButtonOverrides(
+        applicationProfileID: UUID,
+        buttons: Set<RemoteButton>
+    ) -> ApplicationButtonOverrideWriteResult {
+        let operationID = UUID().uuidString
+        let action = buttons == Set(RemoteButton.allCases) ? "clear_all" : "clear_scope"
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=\(action) phase=requested result=requested")
+        guard let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID }) else {
+            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_target")
+            return .invalidTarget
+        }
+        var profile = customApplicationProfiles[index]
+        let remaining = (profile.buttonBindings ?? []).filter { !buttons.contains($0.button) }
+        profile.buttonBindings = remaining.isEmpty ? nil : remaining
+        customApplicationProfiles[index] = profile
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=cleared reason=storage_confirmed")
+        return .cleared
+    }
+
     /// 移除一个 APP 档案。调用方必须先确认没有任何绑定指向它，
     /// 否则那些按键会静默变成「尚未选择 APP」。
     func removeCustomApplicationProfile(id: UUID) {
@@ -1790,11 +1965,271 @@ final class AppSettings: ObservableObject {
         configuredAction(for: button, trigger: trigger, profileID: selectedRemoteProfileID)
     }
 
-    func configuredAction(for button: RemoteButton, trigger: ButtonTrigger,
-                          profileID: UUID?) -> ConfiguredButtonAction {
+    func configuredGlobalAction(for button: RemoteButton, trigger: ButtonTrigger,
+                                profileID: UUID?) -> ConfiguredButtonAction {
         (configuredActionOverride?(profileID, button, trigger)
             ?? configuredBaseAction(for: button, trigger: trigger, profileID: profileID))
             .normalizedForExecution
+    }
+
+    func configuredAction(for button: RemoteButton, trigger: ButtonTrigger,
+                          profileID: UUID?) -> ConfiguredButtonAction {
+        configuredAction(
+            for: button,
+            trigger: trigger,
+            profileID: profileID,
+            applicationBundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    /// 按指定 APP 的档案解析动作，不依赖当前前台是谁。APP 详情与「另存为新方案」
+    /// 必须使用这个入口，否则设置窗口在前台时会把其它 APP 的配置存成方案。
+    func configuredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?,
+        applicationBundleIdentifier: String?
+    ) -> ConfiguredButtonAction {
+        if let applicationOverride = applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
+            return applicationOverride
+        }
+        if let assigned = applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
+            return assigned
+        }
+        return configuredGlobalAction(for: button, trigger: trigger, profileID: profileID)
+    }
+
+    /// 当前前台 APP 是否指定了一套可用的键位方案。命中时全局「当前生效方案」
+    /// 必须让位给 APP 指定方案，即使该手势在方案里是「继承」。
+    func activeAssignedMappingProfileID() -> UUID? {
+        activeAssignedMappingProfileID(
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    func activeAssignedMappingProfileID(bundleIdentifier: String?) -> UUID? {
+        guard customMappingEnabled,
+              let bundleIdentifier,
+              let profile = customApplicationProfiles.first(where: {
+                  $0.bundleIdentifier == bundleIdentifier
+              }),
+              let mappingProfileID = profile.mappingProfileID,
+              assignedMappingProfileApplicable?(mappingProfileID) == true
+        else { return nil }
+        return mappingProfileID
+    }
+
+    private func applicationAssignedProfileAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationAssignedProfileAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
+        // 键位方案自身仍只覆盖 10 个普通按键；菜单键与 TV 键只能通过 APP 逐项覆盖，
+        // 不能被 APP 指定的方案隐式接管。
+        guard RemoteButton.profileScopeDisplayOrder.contains(button),
+              ApplicationButtonBindingScope.triggers.contains(trigger),
+              let mappingProfileID = activeAssignedMappingProfileID(
+                  bundleIdentifier: bundleIdentifier
+              )
+        else { return nil }
+        return assignedMappingProfileAction?(mappingProfileID, button, trigger)
+    }
+
+    /// 所选方案在该手势上有显式动作（包括显式「不执行」）。
+    func applicationAssignedProfileHasBinding(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        applicationAssignedProfileAction(for: button, trigger: trigger) != nil
+    }
+
+    func applicationAssignedProfileHasBinding(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> Bool {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: bundleIdentifier
+        ) != nil
+    }
+
+    private func applicationButtonOverride(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationButtonOverride(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
+        let state = ApplicationButtonBindingScope.overrideState(
+            customMappingEnabled: customMappingEnabled,
+            supportedButton: ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+            frontmostBundleIdentifier: bundleIdentifier,
+            applicationBindings: applicationBindings(for: bundleIdentifier),
+            button: button,
+            trigger: trigger
+        )
+        logApplicationButtonResolution(
+            button: button,
+            trigger: trigger,
+            bundleIdentifier: bundleIdentifier,
+            state: state
+        )
+        guard let bundleIdentifier,
+              let profile = customApplicationProfiles.first(where: {
+                  $0.bundleIdentifier == bundleIdentifier
+              })
+        else { return nil }
+        return ApplicationButtonBindingResolver.override(
+            in: profile.buttonBindings,
+            button: button,
+            trigger: trigger
+        )
+    }
+
+    private func logApplicationButtonResolution(
+        button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?,
+        state: ApplicationButtonBindingScope.OverrideState
+    ) {
+        let key = [
+            bundleIdentifier ?? "-",
+            button.rawValue,
+            trigger.rawValue,
+            state.result,
+            state.reason,
+        ].joined(separator: "|")
+        let now = Date().timeIntervalSince1970
+        applicationButtonResolutionLock.lock()
+        defer { applicationButtonResolutionLock.unlock() }
+        if let last = lastApplicationButtonResolution,
+           last.key == key,
+           now - last.timestamp < 2 {
+            return
+        }
+        lastApplicationButtonResolution = (key, now)
+        AppLogger.shared.write(
+            "APP BUTTON RESOLUTION " +
+                "button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "phase=completed result=\(state.result) reason=\(state.reason)"
+        )
+    }
+
+    private func applicationBindings(for bundleIdentifier: String?) -> [ApplicationButtonBinding]? {
+        guard let bundleIdentifier else { return nil }
+        return customApplicationProfiles.first {
+            $0.bundleIdentifier == bundleIdentifier
+        }?.buttonBindings
+    }
+
+    func applicationButtonOverrideExists(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        guard customMappingEnabled,
+              ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+              let bundleIdentifier = frontmostApplicationBundleIdentifier?(),
+              let profile = customApplicationProfiles.first(where: {
+                  $0.bundleIdentifier == bundleIdentifier
+              })
+        else { return false }
+        return ApplicationButtonBindingResolver.hasOverride(
+            in: profile.buttonBindings,
+            button: button,
+            trigger: trigger
+        )
+    }
+
+    func applicationMappingProfileID(for bundleIdentifier: String?) -> UUID? {
+        guard let bundleIdentifier else { return nil }
+        return customApplicationProfiles.first {
+            $0.bundleIdentifier == bundleIdentifier
+        }?.mappingProfileID
+    }
+
+    func applicationProfilesSharingMappingProfile(_ mappingProfileID: UUID) -> Int {
+        customApplicationProfiles.filter { $0.mappingProfileID == mappingProfileID }.count
+    }
+
+    @discardableResult
+    func setApplicationMappingProfileID(
+        _ mappingProfileID: UUID?,
+        applicationProfileID: UUID
+    ) -> Bool {
+        let operationID = UUID().uuidString
+        let action = mappingProfileID == nil ? "clear" : "assign"
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT operation_id=\(operationID) scope=app " +
+                "action=\(action) phase=requested result=requested"
+        )
+        guard let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID })
+        else {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT operation_id=\(operationID) action=\(action) " +
+                    "phase=completed result=failed reason=invalid_target"
+            )
+            return false
+        }
+        var profile = customApplicationProfiles[index]
+        profile.mappingProfileID = mappingProfileID
+        customApplicationProfiles[index] = profile
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT operation_id=\(operationID) action=\(action) " +
+                "phase=completed result=saved reason=storage_confirmed"
+        )
+        return true
+    }
+
+    /// 方案被删除或不再可用时，清掉指向它的 APP 引用。返回清理数量。
+    @discardableResult
+    func clearUnavailableApplicationMappingProfileReferences(
+        valid: Set<UUID>
+    ) -> Int {
+        var cleared = 0
+        for index in customApplicationProfiles.indices {
+            guard let mappingProfileID = customApplicationProfiles[index].mappingProfileID,
+                  !valid.contains(mappingProfileID)
+            else { continue }
+            customApplicationProfiles[index].mappingProfileID = nil
+            cleared += 1
+        }
+        if cleared > 0 {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=clear_invalid scope=app count=\(cleared) " +
+                    "result=cleared reason=profile_unavailable"
+            )
+        }
+        return cleared
     }
 
     var selectedRemoteProfile: RemoteDeviceProfile? {
@@ -1802,12 +2237,29 @@ final class AppSettings: ObservableObject {
         return remoteDeviceProfiles.first(where: { $0.id == selectedRemoteProfileID })
     }
 
-    func selectRemoteProfile(_ profileID: UUID) {
-        guard profileID != selectedRemoteProfileID,
-              let profile = remoteDeviceProfiles.first(where: { $0.id == profileID })
-        else { return }
-        isLoadingRemoteProfile = true
+    func selectRemoteProfile(_ profileID: UUID, persistSelection: Bool = true) {
+        guard let profile = remoteDeviceProfiles.first(where: { $0.id == profileID }) else { return }
+        if persistSelection, profileID == selectedRemoteProfileID {
+            guard selectedRemoteProfileIsTransient else { return }
+            // 自动回退可能只改变当前显示；用户手动点选同一条档案时，必须把
+            // 偏好重新落到磁盘，否则下次启动仍会回到旧档案。
+            selectedRemoteProfileIsTransient = false
+            defaults.set(profileID.uuidString, forKey: Keys.selectedRemoteProfileID)
+            return
+        }
+        guard profileID != selectedRemoteProfileID else { return }
+        persistsSelectedRemoteProfile = persistSelection
+        selectedRemoteProfileIsTransient = !persistSelection
         selectedRemoteProfileID = profileID
+        loadRemoteProfileMappings(profile)
+        persistsSelectedRemoteProfile = true
+        recoverMissingShortcutsFromHistoricalSnapshotsIfNeeded()
+    }
+
+    /// 把档案映射加载到当前编辑/执行内存态。合并后即使选中 ID 不变，档案内容也可能已补齐，
+    /// 必须重新加载，否则下一次编辑会用旧内存覆盖刚合并的用户配置。
+    private func loadRemoteProfileMappings(_ profile: RemoteDeviceProfile) {
+        isLoadingRemoteProfile = true
         buttonBindings = Self.defaultBindings.merging(profile.mappings.parsedButtonBindings) {
             _, saved in saved
         }
@@ -1819,13 +2271,37 @@ final class AppSettings: ObservableObject {
         isLoadingRemoteProfile = false
     }
 
+    /// 临时显示时，磁盘偏好可能指向另一条档案。合并替换表也要更新它，
+    /// 否则重启后原 ID 已不存在，选中项会退回第一条。
+    private func remapPersistedSelectedProfile(_ replacements: [UUID: UUID]) {
+        guard let persisted = defaults.string(forKey: Keys.selectedRemoteProfileID)
+            .flatMap(UUID.init(uuidString:)),
+              let kept = replacements[persisted]
+        else { return }
+        defaults.set(kept.uuidString, forKey: Keys.selectedRemoteProfileID)
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILES phase=completed result=selection_remapped"
+        )
+    }
+
     @discardableResult
     func registerBluetoothRemote(identifier: UUID) -> UUID {
         if let existing = remoteDeviceProfiles.first(where: { $0.bluetoothIdentifier == identifier }) {
             return existing.id
         }
+        if let index = hidOnlyProfileIndex(matching: identifier) {
+            preserveRemoteProfilesBeforeMerge()
+            remoteDeviceProfiles[index].bluetoothIdentifier = identifier
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILE_PAIR phase=completed result=linked " +
+                    "reason=hid_fingerprint_match"
+            )
+            return remoteDeviceProfiles[index].id
+        }
+        // 只收养完全没有 HID 指纹的临时档案。已有 HID 指纹的档案可能属于另一只
+        // 同型号遥控器，不能仅凭「型号未知」就把蓝牙标识写进去。
         if let index = remoteDeviceProfiles.firstIndex(where: {
-            $0.bluetoothIdentifier == nil && $0.model == .unknown
+            $0.bluetoothIdentifier == nil && $0.hidFingerprint == nil && $0.model == .unknown
         }) {
             remoteDeviceProfiles[index].bluetoothIdentifier = identifier
             return remoteDeviceProfiles[index].id
@@ -1838,15 +2314,65 @@ final class AppSettings: ObservableObject {
         return profile.id
     }
 
+    private func hidOnlyProfileIndex(matching identifier: UUID) -> Int? {
+        let fingerprints = RemoteIdentityFingerprint.candidates(for: identifier)
+        let matches = remoteDeviceProfiles.indices.filter { index in
+            remoteDeviceProfiles[index].hidFingerprint.map(fingerprints.contains) == true
+        }
+        guard matches.count == 1, let index = matches.first else { return nil }
+        let profile = remoteDeviceProfiles[index]
+        guard profile.bluetoothIdentifier == nil, !profile.model.usesPrivateAdapter else {
+            return nil
+        }
+        return index
+    }
+
+    /// 将同一物理设备的新 CoreBluetooth identifier 写回已有档案。
+    ///
+    /// 调用方必须已经用 HID 指纹证明当前 BLE 设备与档案是同一物理设备。这里再次拒绝
+    /// 已被其他档案占用的 identifier，避免新设备或重复数据造成串台；映射和其他字段不动。
+    @discardableResult
+    func replaceBluetoothIdentifier(for profileID: UUID, with identifier: UUID) -> UUID? {
+        guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }) else {
+            return nil
+        }
+        let previousIdentifier = remoteDeviceProfiles[index].bluetoothIdentifier
+        guard previousIdentifier != identifier else { return nil }
+        guard !remoteDeviceProfiles.contains(where: {
+            $0.id != profileID && $0.bluetoothIdentifier == identifier
+        }) else { return nil }
+        remoteDeviceProfiles[index].bluetoothIdentifier = identifier
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_IDENTITY phase=completed result=replaced reason=hid_fingerprint_match"
+        )
+        return previousIdentifier
+    }
+
     @discardableResult
     func registerHIDRemote(fingerprint: String) -> UUID {
         if let existing = remoteDeviceProfiles.first(where: { $0.hidFingerprint == fingerprint }) {
             return existing.id
         }
-        let selectedUnboundIndex = remoteDeviceProfiles.firstIndex(where: {
-            $0.id == selectedRemoteProfileID && $0.hidFingerprint == nil
-        })
-        if let index = selectedUnboundIndex ?? remoteDeviceProfiles.firstIndex(where: { $0.hidFingerprint == nil }) {
+        let matches = remoteDeviceProfiles.indices.filter { index in
+            let profile = remoteDeviceProfiles[index]
+            guard !profile.model.usesPrivateAdapter, let identifier = profile.bluetoothIdentifier else {
+                return false
+            }
+            return RemoteIdentityFingerprint.candidates(for: identifier).contains(fingerprint)
+        }
+        if matches.count == 1, let index = matches.first,
+           remoteDeviceProfiles[index].hidFingerprint == nil {
+            preserveRemoteProfilesBeforeMerge()
+            remoteDeviceProfiles[index].hidFingerprint = fingerprint
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILE_PAIR phase=completed result=linked " +
+                    "reason=bluetooth_identifier_match"
+            )
+            return remoteDeviceProfiles[index].id
+        }
+        if let index = remoteDeviceProfiles.firstIndex(where: {
+            !$0.model.usesPrivateAdapter && $0.hidFingerprint == nil && $0.bluetoothIdentifier == nil
+        }) {
             remoteDeviceProfiles[index].hidFingerprint = fingerprint
             return remoteDeviceProfiles[index].id
         }
@@ -1882,7 +2408,7 @@ final class AppSettings: ObservableObject {
         let profile = RemoteDeviceProfile(
             model: model,
             hidFingerprint: fingerprint,
-            mappings: mappingsForNewRemote(model: model)
+            mappings: mappingsForNewRemote()
         )
         remoteDeviceProfiles.append(profile)
         ensureGestureTiming(for: model, profileID: profile.id)
@@ -1909,7 +2435,7 @@ final class AppSettings: ObservableObject {
         }
         let profile = RemoteDeviceProfile(
             model: .chromecastVoiceRemote,
-            mappings: mappingsForNewRemote(model: .chromecastVoiceRemote)
+            mappings: mappingsForNewRemote()
         )
         remoteDeviceProfiles.append(profile)
         ensureGestureTiming(for: .chromecastVoiceRemote, profileID: profile.id)
@@ -1917,11 +2443,17 @@ final class AppSettings: ObservableObject {
     }
 
     func profileID(forBluetoothIdentifier identifier: UUID) -> UUID? {
-        remoteDeviceProfiles.first(where: { $0.bluetoothIdentifier == identifier })?.id
+        // 冲突档案可能保留两条相同标识。优先当前选中项，避免用户选中第二张卡片后
+        // 按键仍路由到第一条。
+        let matches = remoteDeviceProfiles.filter { $0.bluetoothIdentifier == identifier }
+        return matches.first(where: { $0.id == selectedRemoteProfileID })?.id
+            ?? matches.first?.id
     }
 
     func profileID(forHIDFingerprint fingerprint: String) -> UUID? {
-        remoteDeviceProfiles.first(where: { $0.hidFingerprint == fingerprint })?.id
+        let matches = remoteDeviceProfiles.filter { $0.hidFingerprint == fingerprint }
+        return matches.first(where: { $0.id == selectedRemoteProfileID })?.id
+            ?? matches.first?.id
     }
 
     func bindHIDFingerprint(_ fingerprint: String, to profileID: UUID) {
@@ -1940,29 +2472,26 @@ final class AppSettings: ObservableObject {
         )
     }
 
-    /// New profiles only inherit mappings from a selected remote of the same model.
+    /// A new physical remote never inherits another remote's custom mappings.
     ///
-    /// The model is often unknown when a Xiaomi profile is first created. Those profiles
-    /// start with defaults and inherit later in `inheritMappingsIfCompatible` once the
-    /// BLE handshake identifies the model. A different model always keeps defaults so a
-    /// new RC001 cannot silently take over an RC003's configuration.
-    private func mappingsForNewRemote(model: XiaomiRemoteModel = .unknown) -> RemoteDeviceMappings {
-        guard let selected = selectedRemoteProfile else {
-            // No selected profile yet: the in-memory bindings are the only configuration
-            // the user has, so the first physical remote keeps them.
-            return RemoteDeviceMappings(
-                buttonBindings: buttonBindings,
-                buttonShortcuts: buttonShortcuts,
-                buttonApplicationProfileIDs: buttonApplicationProfileIDs,
-                secondaryButtonBindings: secondaryButtonBindings,
-                buttonRapidPressEnabled: buttonRapidPressEnabled,
-                interactionSettings: interactionSettings
-            )
-        }
-        guard model != .unknown, selected.model == model else {
+    /// Only the first profile created before any profile exists may adopt the legacy
+    /// in-memory bindings, because that is the user's existing single-device configuration.
+    /// Once any profile exists, a new remote starts from defaults even when it has the same
+    /// model. This keeps two same-model remotes independent.
+    private func mappingsForNewRemote() -> RemoteDeviceMappings {
+        guard selectedRemoteProfile == nil, remoteDeviceProfiles.isEmpty else {
             return Self.defaultRemoteMappings()
         }
-        return selected.mappings
+        // No selected profile yet: the in-memory bindings are the only configuration
+        // the user has, so the first physical remote keeps them.
+        return RemoteDeviceMappings(
+            buttonBindings: buttonBindings,
+            buttonShortcuts: buttonShortcuts,
+            buttonApplicationProfileIDs: buttonApplicationProfileIDs,
+            secondaryButtonBindings: secondaryButtonBindings,
+            buttonRapidPressEnabled: buttonRapidPressEnabled,
+            interactionSettings: interactionSettings
+        )
     }
 
     private struct RemoteProfileDeduplicationResult {
@@ -1972,6 +2501,26 @@ final class AppSettings: ObservableObject {
         let replacements: [UUID: UUID]
 
         var removedCount: Int { replacements.count }
+    }
+
+    var privateRemoteProfileReferences: (() -> Set<UUID>?)?
+
+    private func protectedRemoteProfileIDs(
+        in profiles: [RemoteDeviceProfile], scopedBindingsReadable: Bool
+    ) -> Set<UUID> {
+        guard scopedBindingsReadable else { return Set(profiles.map(\.id)) }
+        let local = Set(unifiedBaseBindings.compactMap(\.remoteProfileID))
+        #if canImport(SayAllButtonProfiles) || canImport(SayAllMacroRemoteMic)
+        // The production stores load after AppSettings. Preserve every possible
+        // owner until the components can supply an authoritative reference list.
+        if defaults === UserDefaults.standard {
+            guard let references = privateRemoteProfileReferences?() else {
+                return Set(profiles.map(\.id))
+            }
+            return local.union(references)
+        }
+        #endif
+        return local
     }
 
     /// 把同一台遥控器的重复档案并成一条。
@@ -1985,15 +2534,21 @@ final class AppSettings: ObservableObject {
     private static func deduplicateRemoteProfiles(
         _ profiles: [RemoteDeviceProfile],
         selectedProfileID: UUID?,
-        preferredProfileIDs: Set<UUID> = []
+        preferredProfileIDs: Set<UUID> = [],
+        protectedProfileIDs: Set<UUID> = []
     ) -> RemoteProfileDeduplicationResult {
         var result: [RemoteDeviceProfile] = []
         var indicesByIdentity: [String: Int] = [:]
+        var conflictedIdentities: Set<String> = []
         var replacements: [UUID: UUID] = [:]
         var selected = selectedProfileID
 
         for profile in profiles {
             let identity = RemoteDeviceIdentity.key(for: profile)
+            guard !conflictedIdentities.contains(identity) else {
+                result.append(profile)
+                continue
+            }
             guard let existingIndex = indicesByIdentity[identity] else {
                 indicesByIdentity[identity] = result.count
                 result.append(profile)
@@ -2001,14 +2556,37 @@ final class AppSettings: ObservableObject {
             }
 
             let existing = result[existingIndex]
-            let keepExisting = Self.shouldKeepRemoteProfile(
-                existing,
-                over: profile,
-                selectedProfileID: selectedProfileID,
-                preferredProfileIDs: preferredProfileIDs
-            )
+            if Self.remoteMappingsConflict(existing.mappings, profile.mappings) {
+                conflictedIdentities.insert(identity)
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILES phase=completed result=merge_skipped " +
+                        "reason=conflicting_mappings"
+                )
+                result.append(profile)
+                continue
+            }
+            let existingProtected = protectedProfileIDs.contains(existing.id)
+            let candidateProtected = protectedProfileIDs.contains(profile.id)
+            let keepExisting = existingProtected != candidateProtected
+                ? existingProtected
+                : Self.shouldKeepRemoteProfile(
+                    existing,
+                    over: profile,
+                    selectedProfileID: selectedProfileID,
+                    preferredProfileIDs: preferredProfileIDs
+                )
             let kept = keepExisting ? existing : profile
             let discarded = keepExisting ? profile : existing
+            if protectedProfileIDs.contains(discarded.id) ||
+                (preferredProfileIDs.contains(discarded.id) && protectedProfileIDs.contains(kept.id)) {
+                conflictedIdentities.insert(identity)
+                result.append(profile)
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILES phase=completed result=merge_skipped " +
+                        "reason=scoped_bindings_preserved"
+                )
+                continue
+            }
             result[existingIndex] = Self.mergingRemoteProfile(kept, with: discarded)
             replacements[discarded.id] = kept.id
             // 选中项可能落在被并掉的那条上，跟着搬到留下的那条。
@@ -2050,9 +2628,44 @@ final class AppSettings: ObservableObject {
            RemoteDeviceIdentity.legacyToken(storedName: discarded.customName) == nil {
             merged.customName = discarded.customName
         }
-        if Self.isDefaultRemoteMappings(merged.mappings),
-           !Self.isDefaultRemoteMappings(discarded.mappings) {
-            merged.mappings = discarded.mappings
+        // 动作载荷和交互设置分别补齐。不能因为主档已有自定义交互设置，就跳过
+        // 被并档案的自定义动作；两类配置都属于用户数据。
+        if !Self.hasCustomActionMappings(merged.mappings),
+           Self.hasCustomActionMappings(discarded.mappings) {
+            merged.mappings.buttonBindings = discarded.mappings.buttonBindings
+            merged.mappings.buttonShortcuts = discarded.mappings.buttonShortcuts
+            merged.mappings.buttonApplicationProfileIDs = discarded.mappings.buttonApplicationProfileIDs
+            merged.mappings.secondaryButtonBindings = discarded.mappings.secondaryButtonBindings
+            merged.mappings.buttonRapidPressEnabled = discarded.mappings.buttonRapidPressEnabled
+        }
+        // 交互设置按字段补齐。不能整体替换主档，否则会丢掉迁移生成的按住/连发模式。
+        merged.mappings.interactionSettings = Self.mergingInteractionSettings(
+            kept: merged.mappings.interactionSettings,
+            discarded: discarded.mappings.interactionSettings
+        )
+        return merged
+    }
+
+    private static func mergingInteractionSettings(
+        kept: RemoteButtonInteractionSettings?,
+        discarded: RemoteButtonInteractionSettings?
+    ) -> RemoteButtonInteractionSettings? {
+        guard let discarded, hasCustomInteractionSettings(discarded) else { return kept }
+        var merged = kept ?? RemoteButtonInteractionSettings()
+        guard !hasCustomInteractionSettings(merged) else { return merged }
+        let defaultTiming = RemoteButtonGestureTiming()
+        if discarded.doubleClickMilliseconds != defaultTiming.doubleClickMilliseconds {
+            merged.doubleClickMilliseconds = discarded.doubleClickMilliseconds
+        }
+        if discarded.longPressMilliseconds != defaultTiming.longPressMilliseconds {
+            merged.longPressMilliseconds = discarded.longPressMilliseconds
+        }
+        let migrated = discarded.migratedRepeatButtons
+        for (button, mode) in discarded.modes
+        where mode != RemoteButtonHoldMode.repeatSingle.rawValue
+            || migrated?.contains(button) != true {
+            merged.modes[button] = mode
+            merged.migratedRepeatButtons?.removeAll { $0 == button }
         }
         return merged
     }
@@ -2078,13 +2691,81 @@ final class AppSettings: ObservableObject {
             (isDefaultRemoteMappings(profile.mappings) ? 0 : 2)
     }
 
+    /// 旧档案可能只保存部分按键字典；缺失键在运行时继承默认值，比较时也必须先补齐。
+    private static func effectiveButtonBindings(
+        _ mappings: RemoteDeviceMappings
+    ) -> [RemoteButton: ButtonAction] {
+        defaultBindings.merging(mappings.parsedButtonBindings) { _, saved in saved }
+    }
+
     private static func isDefaultRemoteMappings(_ mappings: RemoteDeviceMappings) -> Bool {
-        mappings.parsedButtonBindings == defaultBindings &&
+        effectiveButtonBindings(mappings) == defaultBindings &&
             mappings.parsedButtonShortcuts.isEmpty &&
             mappings.parsedButtonApplicationProfileIDs.isEmpty &&
             mappings.parsedSecondaryButtonBindings.isEmpty &&
             mappings.parsedButtonRapidPressEnabled.isEmpty &&
             (mappings.interactionSettings == nil || mappings.interactionSettings == RemoteButtonInteractionSettings())
+    }
+
+    /// Action payloads are the user-authored mapping. Interaction settings include fields
+    /// synthesized by the one-time migration, so they are compared separately.
+    private static func hasCustomActionMappings(_ mappings: RemoteDeviceMappings) -> Bool {
+        effectiveButtonBindings(mappings) != defaultBindings ||
+            !mappings.parsedButtonShortcuts.isEmpty ||
+            !mappings.parsedButtonApplicationProfileIDs.isEmpty ||
+            !mappings.parsedSecondaryButtonBindings.isEmpty ||
+            !mappings.parsedButtonRapidPressEnabled.isEmpty
+    }
+
+    private static func actionMappingsEqual(
+        _ lhs: RemoteDeviceMappings,
+        _ rhs: RemoteDeviceMappings
+    ) -> Bool {
+        effectiveButtonBindings(lhs) == effectiveButtonBindings(rhs) &&
+            lhs.parsedButtonShortcuts == rhs.parsedButtonShortcuts &&
+            lhs.parsedButtonApplicationProfileIDs == rhs.parsedButtonApplicationProfileIDs &&
+            lhs.parsedSecondaryButtonBindings == rhs.parsedSecondaryButtonBindings &&
+            lhs.parsedButtonRapidPressEnabled == rhs.parsedButtonRapidPressEnabled
+    }
+
+    /// A migrated profile may contain repeat modes synthesized from old bindings. Those
+    /// settings are not a second user-authored configuration and must not block a safe merge.
+    private static func hasCustomInteractionSettings(
+        _ settings: RemoteButtonInteractionSettings?
+    ) -> Bool {
+        guard let settings else { return false }
+        if settings == RemoteButtonInteractionSettings() { return false }
+        guard let migrated = settings.migratedRepeatButtons else { return true }
+        guard settings.doubleClickMilliseconds == RemoteButtonGestureTiming().doubleClickMilliseconds,
+              settings.longPressMilliseconds == RemoteButtonGestureTiming().longPressMilliseconds
+        else { return true }
+        return settings.modes.contains { button, value in
+            value != RemoteButtonHoldMode.repeatSingle.rawValue || !migrated.contains(button)
+        }
+    }
+
+    /// Two different custom configurations cannot be merged without choosing one and losing
+    /// the other. A single customized side is safe to carry over. Defaults may be filled from
+    /// the other side, but two different custom sets must stay independent until resolved.
+    private static func remoteMappingsConflict(
+        _ lhs: RemoteDeviceMappings,
+        _ rhs: RemoteDeviceMappings
+    ) -> Bool {
+        let lhsHasActions = hasCustomActionMappings(lhs)
+        let rhsHasActions = hasCustomActionMappings(rhs)
+        if lhsHasActions && rhsHasActions && !actionMappingsEqual(lhs, rhs) {
+            return true
+        }
+        let lhsHasInteraction = hasCustomInteractionSettings(lhs.interactionSettings)
+        let rhsHasInteraction = hasCustomInteractionSettings(rhs.interactionSettings)
+        if lhsHasInteraction && rhsHasInteraction {
+            var lhsSettings = lhs.interactionSettings
+            var rhsSettings = rhs.interactionSettings
+            lhsSettings?.migratedRepeatButtons = nil
+            rhsSettings?.migratedRepeatButtons = nil
+            return lhsSettings != rhsSettings
+        }
+        return false
     }
 
     func updateRemoteProfile(
@@ -2093,12 +2774,8 @@ final class AppSettings: ObservableObject {
         customName: String
     ) {
         guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }) else { return }
-        let previousModel = remoteDeviceProfiles[index].model
         remoteDeviceProfiles[index].model = model
         remoteDeviceProfiles[index].customName = customName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if previousModel != model {
-            inheritMappingsIfCompatible(for: profileID, model: model)
-        }
     }
 
     /// The system name is a display cache, never a device identity or a stored numbered label.
@@ -2151,13 +2828,28 @@ final class AppSettings: ObservableObject {
         let result = Self.deduplicateRemoteProfiles(
             remoteDeviceProfiles,
             selectedProfileID: selectedRemoteProfileID,
-            preferredProfileIDs: preferredProfileIDs
+            preferredProfileIDs: preferredProfileIDs,
+            protectedProfileIDs: protectedRemoteProfileIDs(
+                in: remoteDeviceProfiles,
+                scopedBindingsReadable: !corruptedSettingKeys.contains("unifiedBaseBindings")
+            )
         )
         guard !result.replacements.isEmpty else { return [:] }
+        preserveRemoteProfilesBeforeMerge()
+        let previousSelectedID = selectedRemoteProfileID
         remoteDeviceProfiles = result.profiles
-        if selectedRemoteProfileID != result.selectedProfileID {
-            selectedRemoteProfileID = result.selectedProfileID
+        if previousSelectedID != result.selectedProfileID {
+            if let selectedID = result.selectedProfileID {
+                selectRemoteProfile(
+                    selectedID,
+                    persistSelection: !selectedRemoteProfileIsTransient
+                )
+            }
+        } else if let selected = selectedRemoteProfile {
+            loadRemoteProfileMappings(selected)
         }
+        remapScopedBindings(result.replacements)
+        remapPersistedSelectedProfile(result.replacements)
         AppLogger.shared.write(
             "SETTINGS REMOTE_PROFILES phase=completed result=deduplicated " +
                 "removed=\(result.removedCount) remaining=\(result.profiles.count)"
@@ -2182,29 +2874,163 @@ final class AppSettings: ObservableObject {
         connectedProfileIDs: Set<UUID> = [],
         activeHIDProfileIDs: Set<UUID> = []
     ) -> [UUID: UUID] {
+        let protectedProfileIDs = protectedRemoteProfileIDs(
+            in: remoteDeviceProfiles,
+            scopedBindingsReadable: !corruptedSettingKeys.contains("unifiedBaseBindings")
+        )
         var replacements: [UUID: UUID] = [:]
         for model in [XiaomiRemoteModel.rc001, .rc003] {
-            let group = remoteDeviceProfiles.filter { $0.model == model }
-            guard group.count == 2,
-                  let hid = group.first(where: {
-                      $0.hidFingerprint != nil && $0.bluetoothIdentifier == nil
-                  }),
-                  let ble = group.first(where: {
-                      $0.bluetoothIdentifier != nil && $0.hidFingerprint == nil
-                  }),
-                  activeHIDProfileIDs.contains(hid.id) || selectedRemoteProfileID == hid.id,
-                  connectedProfileIDs.contains(ble.id),
-                  Self.complementaryProfilesMayDescribeTheSameRemote(hid, ble)
-            else { continue }
+            var group = remoteDeviceProfiles.filter { $0.model == model }
+            // HID reports do not identify a Xiaomi model. A connected BLE-only record can
+            // supply it when the system identity uniquely matches the existing HID record.
+            if group.count == 1, let ble = group.first,
+               ble.hidFingerprint == nil, connectedProfileIDs.contains(ble.id),
+               let identifier = ble.bluetoothIdentifier,
+               let index = hidOnlyProfileIndex(matching: identifier),
+               remoteDeviceProfiles[index].model == .unknown,
+               activeHIDProfileIDs.contains(remoteDeviceProfiles[index].id) {
+                group.append(remoteDeviceProfiles[index])
+            }
+            let hidOnly = group.filter {
+                $0.hidFingerprint != nil && $0.bluetoothIdentifier == nil
+            }
+            let bleOnly = group.filter {
+                $0.bluetoothIdentifier != nil && $0.hidFingerprint == nil
+            }
+            let both = group.filter {
+                $0.hidFingerprint != nil && $0.bluetoothIdentifier != nil
+            }
+            let hidIDs = Set(hidOnly.map(\.id))
+            let bleIDs = Set(bleOnly.map(\.id))
+            let hidLive = hidIDs.contains { activeHIDProfileIDs.contains($0) }
+                || selectedRemoteProfileID.map(hidIDs.contains) == true
+            let bleConnected = bleIDs.contains { connectedProfileIDs.contains($0) }
+
+            func logSkip(_ reason: String) {
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILE_PAIR phase=skipped result=not_merged " +
+                        "model=\(model.rawValue) reason=\(reason) " +
+                        "group_count=\(group.count) hid_only=\(hidOnly.count) " +
+                        "ble_only=\(bleOnly.count) both=\(both.count) " +
+                        "active_hid=\(hidLive) " +
+                        "selected_hid=\(selectedRemoteProfileID.map(hidIDs.contains) == true) " +
+                        "connected_ble=\(bleConnected)"
+                )
+            }
+
+            guard group.count == 2 else {
+                logSkip("group_count")
+                continue
+            }
+            if hidOnly.isEmpty, both.count == 1, bleOnly.count == 1,
+               let bothProfile = both.first, let bleProfile = bleOnly.first {
+                // An older BLE registration can leave a default BLE-only record next to the
+                // profile that already owns both transports. The connected BLE identifier must
+                // hash to the both-profile HID fingerprint; only then is the split identity
+                // proven. The default-field check only proves removal cannot lose user data.
+                let bothLive = selectedRemoteProfileID == bothProfile.id
+                    || activeHIDProfileIDs.contains(bothProfile.id)
+                guard bothLive else {
+                    logSkip("both_not_live_or_selected")
+                    continue
+                }
+                guard !connectedProfileIDs.contains(bothProfile.id) else {
+                    logSkip("both_ble_connected")
+                    continue
+                }
+                guard connectedProfileIDs.contains(bleProfile.id) else {
+                    logSkip("ble_not_connected")
+                    continue
+                }
+                guard Self.bluetoothIdentifierMatchesHIDFingerprint(
+                    bleProfile,
+                    bothProfile
+                ) else {
+                    logSkip("identity_mismatch")
+                    continue
+                }
+                guard !protectedProfileIDs.contains(bleProfile.id),
+                      Self.defaultBLEOnlyDuplicateIsSafeToRemove(bleProfile)
+                else {
+                    logSkip("ble_duplicate_has_user_data")
+                    continue
+                }
+                let merged = Self.mergingDefaultBLEDuplicate(into: bothProfile, from: bleProfile)
+                guard let index = remoteDeviceProfiles.firstIndex(where: {
+                    $0.id == bothProfile.id
+                }) else {
+                    continue
+                }
+                preserveRemoteProfilesBeforeMerge()
+                let previousSelectedID = selectedRemoteProfileID
+                remoteDeviceProfiles[index] = merged
+                remoteDeviceProfiles.removeAll { $0.id == bleProfile.id }
+                if previousSelectedID == bleProfile.id {
+                    selectRemoteProfile(
+                        bothProfile.id,
+                        persistSelection: !selectedRemoteProfileIsTransient
+                    )
+                } else if previousSelectedID == bothProfile.id {
+                    loadRemoteProfileMappings(merged)
+                }
+                replacements[bleProfile.id] = bothProfile.id
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILE_PAIR phase=completed result=merged " +
+                        "model=\(model.rawValue) kept=both " +
+                        "reason=default_ble_duplicate_identity_match"
+                )
+                continue
+            }
+            guard hidOnly.count == 1 else {
+                logSkip("hid_only_count")
+                continue
+            }
+            guard bleOnly.count == 1 else {
+                logSkip("ble_only_count")
+                continue
+            }
+            guard hidLive else {
+                logSkip("hid_not_live_or_selected")
+                continue
+            }
+            guard bleConnected else {
+                logSkip("ble_not_connected")
+                continue
+            }
+            guard let hid = hidOnly.first, let ble = bleOnly.first,
+                  Self.complementaryProfilesMayDescribeTheSameRemote(
+                      hid,
+                      ble,
+                      fingerprintMatches: ble.bluetoothIdentifier
+                          .flatMap(hidOnlyProfileIndex(matching:))
+                          .map { remoteDeviceProfiles[$0].id == hid.id } == true
+                  )
+            else {
+                logSkip("identity_or_name_conflict")
+                continue
+            }
+            guard !protectedProfileIDs.contains(ble.id),
+                  !Self.remoteMappingsConflict(hid.mappings, ble.mappings)
+            else {
+                logSkip("conflicting_mappings")
+                continue
+            }
 
             let merged = Self.mergingRemoteProfile(hid, with: ble)
             guard let index = remoteDeviceProfiles.firstIndex(where: { $0.id == hid.id }) else {
                 continue
             }
+            preserveRemoteProfilesBeforeMerge()
+            let previousSelectedID = selectedRemoteProfileID
             remoteDeviceProfiles[index] = merged
             remoteDeviceProfiles.removeAll { $0.id == ble.id }
-            if selectedRemoteProfileID == ble.id {
-                selectedRemoteProfileID = hid.id
+            if previousSelectedID == ble.id {
+                selectRemoteProfile(
+                    hid.id,
+                    persistSelection: !selectedRemoteProfileIsTransient
+                )
+            } else if previousSelectedID == hid.id {
+                loadRemoteProfileMappings(merged)
             }
             replacements[ble.id] = hid.id
             AppLogger.shared.write(
@@ -2212,6 +3038,8 @@ final class AppSettings: ObservableObject {
                     "model=\(model.rawValue) kept=hid reason=complementary_identity"
             )
         }
+        remapScopedBindings(replacements)
+        remapPersistedSelectedProfile(replacements)
         return replacements
     }
 
@@ -2219,11 +3047,17 @@ final class AppSettings: ObservableObject {
     /// their model and identifier shapes complement each other.
     private static func complementaryProfilesMayDescribeTheSameRemote(
         _ hid: RemoteDeviceProfile,
-        _ ble: RemoteDeviceProfile
+        _ ble: RemoteDeviceProfile,
+        fingerprintMatches: Bool
     ) -> Bool {
-        if let hidIdentity = hid.hardwareIdentity,
-           let bleIdentity = ble.hardwareIdentity,
-           hidIdentity != bleIdentity {
+        // 互补形状只能说明「可能是一台设备的两种传输」，不能证明是同一台物理设备。
+        // 没有双方一致的稳定身份时保持两条档案，避免两只同型号遥控器共用映射。
+        let hidIdentity = hid.hardwareIdentity
+            ?? RemoteDeviceIdentity.legacyToken(storedName: hid.customName)
+        let bleIdentity = ble.hardwareIdentity
+            ?? RemoteDeviceIdentity.legacyToken(storedName: ble.customName)
+        if let hidIdentity, let bleIdentity, hidIdentity != bleIdentity { return false }
+        guard fingerprintMatches || (hidIdentity?.isEmpty == false && hidIdentity == bleIdentity) else {
             return false
         }
         let hidName = hid.lastKnownBluetoothName?
@@ -2241,6 +3075,72 @@ final class AppSettings: ObservableObject {
         return true
     }
 
+    /// The system BLE identifier and the HID `PhysicalDeviceUniqueID` can be the same UUID.
+    /// HID profiles store its SHA-256; hashing the BLE identifier with the same rule proves the
+    /// two records describe one physical remote before anything is removed.
+    ///
+    /// 用 `candidates` 而不是单个 `fingerprint`：HID 侧哈希的是系统属性的原始字面量，
+    /// 大小写不保证；身份同步路径（`BridgeAppModel.reconcileStaleRemoteIdentity`）已经
+    /// 同时接受两个变体，这里必须用同一套判定，否则同一个分裂档案会在一条路径上能修、
+    /// 在另一条路径上静默不修。
+    private static func bluetoothIdentifierMatchesHIDFingerprint(
+        _ ble: RemoteDeviceProfile,
+        _ both: RemoteDeviceProfile
+    ) -> Bool {
+        guard let identifier = ble.bluetoothIdentifier,
+              let hidFingerprint = both.hidFingerprint
+        else { return false }
+        return RemoteIdentityFingerprint.candidates(for: identifier).contains(hidFingerprint)
+    }
+
+    /// Identity match proves which two records belong together; this guard proves removing the
+    /// BLE-only record cannot discard user edits. The one allowed non-nil field is the migration
+    /// marker that older builds wrote to every profile.
+    private static func defaultBLEOnlyDuplicateIsSafeToRemove(
+        _ ble: RemoteDeviceProfile
+    ) -> Bool {
+        guard ble.customName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        let mappings = ble.mappings
+        guard mappings.buttonBindings.count == defaultBindings.count,
+              mappings.parsedButtonBindings == defaultBindings,
+              mappings.buttonShortcuts.isEmpty,
+              (mappings.buttonApplicationProfileIDs ?? [:]).isEmpty,
+              mappings.secondaryButtonBindings.isEmpty,
+              (mappings.buttonRapidPressEnabled ?? [:]).isEmpty,
+              interactionSettingsAreMigrationOnly(mappings.interactionSettings)
+        else { return false }
+        return true
+    }
+
+    private static func interactionSettingsAreMigrationOnly(
+        _ settings: RemoteButtonInteractionSettings?
+    ) -> Bool {
+        guard let settings else { return true }
+        guard settings.isWellFormed,
+              settings.doubleClickMilliseconds == 300,
+              settings.longPressMilliseconds == 550
+        else { return false }
+        let migrated = Set(settings.migratedRepeatButtons ?? [])
+        guard Set(settings.modes.keys) == migrated else { return false }
+        return settings.modes.values.allSatisfy {
+            $0 == RemoteButtonHoldMode.repeatSingle.rawValue
+        }
+    }
+
+    private static func mergingDefaultBLEDuplicate(
+        into both: RemoteDeviceProfile,
+        from ble: RemoteDeviceProfile
+    ) -> RemoteDeviceProfile {
+        var merged = both
+        merged.bluetoothIdentifier = ble.bluetoothIdentifier
+        if merged.lastKnownBluetoothName?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            merged.lastKnownBluetoothName = ble.lastKnownBluetoothName
+        }
+        return merged
+    }
+
     func updateRemoteProfileModel(_ profileID: UUID, model: XiaomiRemoteModel) {
         guard model != .unknown,
               let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }),
@@ -2248,28 +3148,6 @@ final class AppSettings: ObservableObject {
         else { return }
         remoteDeviceProfiles[index].model = model
         ensureGestureTiming(for: model, profileID: profileID)
-        inheritMappingsIfCompatible(for: profileID, model: model)
-    }
-
-    /// Same-model inheritance happens after identification, never across models.
-    ///
-    /// New Xiaomi profiles are created before the BLE handshake reports the model, so
-    /// they start with defaults. Once the model is known, a profile that is still
-    /// untouched can inherit the selected remote's full mappings only when both models
-    /// match. A different model keeps defaults.
-    private func inheritMappingsIfCompatible(for profileID: UUID, model: XiaomiRemoteModel) {
-        guard model != .unknown,
-              let index = remoteDeviceProfiles.firstIndex(where: { $0.id == profileID }),
-              Self.isDefaultRemoteMappings(remoteDeviceProfiles[index].mappings),
-              let selected = selectedRemoteProfile,
-              selected.id != profileID,
-              selected.model == model,
-              !Self.isDefaultRemoteMappings(selected.mappings)
-        else { return }
-        remoteDeviceProfiles[index].mappings = selected.mappings
-        AppLogger.shared.write(
-            "SETTINGS REMOTE_PROFILE_MAPPINGS phase=completed result=inherited reason=same_model"
-        )
     }
 
     func setAction(_ action: ButtonAction, for button: RemoteButton, trigger: ButtonTrigger) {
@@ -2343,6 +3221,9 @@ final class AppSettings: ObservableObject {
     }
 
     func resetBindings() {
+        if let selectedRemoteProfileID {
+            markShortcutRecoveryEvaluated(selectedRemoteProfileID)
+        }
         buttonBindings = Self.defaultBindings
         buttonShortcuts = [:]
         unifiedBaseBindings.removeAll { $0.remoteProfileID == selectedRemoteProfileID }
@@ -2824,9 +3705,13 @@ final class AppSettings: ObservableObject {
             else { throw AppConfigurationError.invalidValues }
         }
         for application in configuration.customApplicationProfiles ?? [] {
-            switch Self.validatedApplicationProfile(application) {
+            switch Self.validatedApplicationProfile(application, applicationIDs: Set(appIDs)) {
+            case let .usable(validated), let .notInstalledOnThisMac(validated):
+                guard (validated.buttonBindings?.count ?? 0) ==
+                    (application.buttonBindings?.count ?? 0) else {
+                    throw AppConfigurationError.invalidValues
+                }
             case .rejected: throw AppConfigurationError.invalidValues
-            case .usable, .notInstalledOnThisMac: break
             }
             guard application.accessibilityTarget == nil, application.applicationPath.isEmpty,
                   application.focusShortcut.map({ Self.validatedShortcut($0) == $0 }) ?? true
@@ -2871,6 +3756,7 @@ final class AppSettings: ObservableObject {
             chromecastSystemReservedExceptions: chromecastSystemReservedExceptions.sorted(),
             chromecastEnabled: chromecastEnabled, chromecastVoiceMode: chromecastVoiceMode,
             siriRemoteScrollArrowReversed: siriRemoteScrollArrowReversed,
+            siriRemoteCursorFeedbackVisible: siriRemoteCursorFeedbackVisible,
             siriRemoteEnabled: siriRemoteEnabled, siriRemoteNeedsUserAction: siriRemoteNeedsUserAction,
             localTranscriptHistoryEnabled: localTranscriptHistoryEnabled,
             localOriginalAudioRecordingEnabled: localOriginalAudioRecordingEnabled,
@@ -2937,6 +3823,7 @@ final class AppSettings: ObservableObject {
         if let preferences {
             isLoadingRemoteProfile = true
             remoteDeviceProfiles = preferences.remoteDeviceProfiles
+            selectedRemoteProfileIsTransient = false
             selectedRemoteProfileID = preferences.selectedRemoteProfileID
             isLoadingRemoteProfile = false
         }
@@ -2982,6 +3869,9 @@ final class AppSettings: ObservableObject {
             chromecastEnabled = preferences.chromecastEnabled
             chromecastVoiceMode = preferences.chromecastVoiceMode
             siriRemoteScrollArrowReversed = preferences.siriRemoteScrollArrowReversed
+            if let visible = preferences.siriRemoteCursorFeedbackVisible {
+                siriRemoteCursorFeedbackVisible = visible
+            }
             siriRemoteEnabled = preferences.siriRemoteEnabled
             siriRemoteNeedsUserAction = preferences.siriRemoteNeedsUserAction
             localTranscriptHistoryEnabled = preferences.localTranscriptHistoryEnabled
@@ -2990,6 +3880,9 @@ final class AppSettings: ObservableObject {
         }
         if let supplement, try configurationSupplementSnapshot?() != supplement {
             try configurationSupplementApply?(supplement)
+        }
+        if let selectedRemoteProfileID {
+            markShortcutRecoveryEvaluated(selectedRemoteProfileID)
         }
         defaults.set(pending, forKey: "portableTransferPendingApplications")
         configurationImportNotice = nil
@@ -3022,6 +3915,24 @@ final class AppSettings: ObservableObject {
     /// trusted), but a single bad entry only loses that entry: throwing the file away would
     /// punish a user whose configuration is 99% fine. Everything dropped is published in
     /// `configurationImportNotice` so the user is told rather than silently downgraded.
+    private func validatedApplicationProfileButtonBindings(
+        _ bindings: [ApplicationButtonBinding]?,
+        applicationIDs: Set<UUID>,
+        rejected: inout Set<String>
+    ) -> [ApplicationButtonBinding]? {
+        guard let bindings else { return nil }
+        let sanitized = ApplicationButtonBindingScope.sanitize(bindings) { configured in
+            guard let validated = Self.validatedConfiguredAction(configured),
+                  validated.applicationProfileID.map(applicationIDs.contains) ?? true
+            else { return nil }
+            return validated
+        }
+        if (sanitized?.count ?? 0) != bindings.count {
+            rejected.insert(Keys.customApplicationProfiles)
+        }
+        return sanitized
+    }
+
     func importConfiguration(from data: Data) throws {
         let configuration = try Self.validatedConfiguration(from: data)
         var rejected: Set<String> = []
@@ -3100,14 +4011,26 @@ final class AppSettings: ObservableObject {
                 }
             )
 
+        let appIDs = (configuration.customApplicationProfiles ?? []).map(\.id)
+        let applicationIDs = Set(appIDs)
         let importedApplicationProfiles = (configuration.customApplicationProfiles ?? [])
             .compactMap { profile -> CustomApplicationProfile? in
-                switch Self.validatedApplicationProfile(profile) {
-                case let .usable(profile):
-                    return profile
-                case let .notInstalledOnThisMac(profile):
-                    missingApplications.append(profile.displayName)
-                    return profile
+                let validation = Self.validatedApplicationProfile(
+                    profile,
+                    applicationIDs: applicationIDs
+                )
+                switch validation {
+                case let .usable(validated), let .notInstalledOnThisMac(validated):
+                    var result = validated
+                    result.buttonBindings = validatedApplicationProfileButtonBindings(
+                        profile.buttonBindings,
+                        applicationIDs: applicationIDs,
+                        rejected: &rejected
+                    )
+                    if case .notInstalledOnThisMac = validation {
+                        missingApplications.append(validated.displayName)
+                    }
+                    return result
                 case .rejected:
                     rejected.insert(Keys.customApplicationProfiles)
                     return nil
@@ -3204,6 +4127,9 @@ final class AppSettings: ObservableObject {
                     "missing_apps=\(report.applicationsMissingOnThisMac.count)"
             )
         }
+        if let selectedRemoteProfileID {
+            markShortcutRecoveryEvaluated(selectedRemoteProfileID)
+        }
         configurationImportNotice = report.isClean ? nil : report
     }
 
@@ -3262,7 +4188,8 @@ final class AppSettings: ObservableObject {
     /// and refusing it outright would break the entire point of moving a configuration to a Mac
     /// that has not installed everything yet.
     private static func validatedApplicationProfile(
-        _ profile: CustomApplicationProfile
+        _ profile: CustomApplicationProfile,
+        applicationIDs: Set<UUID>
     ) -> ImportedApplicationProfile {
         guard profile.displayName.count <= maximumImportedIdentifierLength,
               isWellFormedBundleIdentifier(profile.bundleIdentifier),
@@ -3277,6 +4204,15 @@ final class AppSettings: ObservableObject {
             .flatMap(validatedAccessibilityTarget)
         sanitized.scrollRegionTarget = profile.scrollRegionTarget
             .flatMap(validatedScrollRegionTarget)
+        sanitized.buttonBindings = ApplicationButtonBindingScope.sanitize(
+            profile.buttonBindings,
+            validateAction: { configured in
+                guard let validated = validatedConfiguredAction(configured),
+                      validated.applicationProfileID.map(applicationIDs.contains) ?? true
+                else { return nil }
+                return validated
+            }
+        )
 
         guard !sanitized.applicationPath.isEmpty else { return .notInstalledOnThisMac(sanitized) }
         let url = URL(fileURLWithPath: sanitized.applicationPath)
@@ -3594,6 +4530,678 @@ final class AppSettings: ObservableObject {
     private func saveCustomApplicationProfiles() {
         guard let data = try? JSONEncoder().encode(customApplicationProfiles) else { return }
         defaults.set(data, forKey: Keys.customApplicationProfiles)
+    }
+
+    /// 第一次合并前快照用于追溯原始状态；每次合并前的最新快照用于恢复最近一次操作。
+    /// 两者都只保存原始数据，不包含任何设备名称或用户内容日志。
+    private func preserveRemoteProfilesBeforeMerge() {
+        Self.persistRemoteProfilesRecoverySnapshot(
+            remoteDeviceProfiles,
+            selectedProfileID: selectedRemoteProfileID,
+            defaults: defaults
+        )
+    }
+
+    private func preserveRemoteProfilesBeforeRecovery() {
+        guard !didPreserveRecoverySnapshot else { return }
+        didPreserveRecoverySnapshot = true
+        preserveRemoteProfilesBeforeMerge()
+    }
+
+    private static func persistRemoteProfilesRecoverySnapshot(
+        _ profiles: [RemoteDeviceProfile],
+        selectedProfileID: UUID?,
+        defaults: UserDefaults
+    ) {
+        guard let data = try? JSONEncoder().encode(profiles) else { return }
+        let selection = selectedProfileID?.uuidString ?? ""
+        defaults.set(data, forKey: Self.mergedRemoteProfilesLatestBackupKey)
+        defaults.set(selection, forKey: Self.mergedRemoteProfileLatestSelectionBackupKey)
+        if defaults.data(forKey: Self.mergedRemoteProfilesBackupKey) == nil {
+            defaults.set(data, forKey: Self.mergedRemoteProfilesBackupKey)
+            defaults.set(selection, forKey: Self.mergedRemoteProfileSelectionBackupKey)
+        }
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILES phase=completed result=recovery_snapshot_saved reason=merge"
+        )
+    }
+
+    /// 从最近一次（默认）或第一次合并前快照恢复档案。没有设置页入口，供隔离诊断或后续 UI 使用。
+    @discardableResult
+    func restoreMergedRemoteProfilesBackup(latest: Bool = true) -> Bool {
+        let dataKey = latest
+            ? Self.mergedRemoteProfilesLatestBackupKey
+            : Self.mergedRemoteProfilesBackupKey
+        let selectionKey = latest
+            ? Self.mergedRemoteProfileLatestSelectionBackupKey
+            : Self.mergedRemoteProfileSelectionBackupKey
+        guard let data = defaults.data(forKey: dataKey),
+              let profiles = try? JSONDecoder().decode([RemoteDeviceProfile].self, from: data),
+              !profiles.isEmpty
+        else { return false }
+        remoteDeviceProfiles = profiles
+        let restoredID = defaults.string(forKey: selectionKey)
+            .flatMap(UUID.init(uuidString:))
+            .flatMap { id in profiles.contains(where: { $0.id == id }) ? id : nil }
+            ?? profiles.first?.id
+        guard let restoredID else { return false }
+        selectRemoteProfile(restoredID)
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILES phase=completed result=restored reason=merge_backup"
+        )
+        return true
+    }
+
+    /// Never rewrite unreadable profiles or a corrupt scoped-binding store. Profile
+    /// selection also checks this gate before invoking recovery.
+    private var canRecoverRemoteProfileData: Bool {
+        unreadableStoredRemoteProfiles == nil &&
+            !corruptedSettingKeys.contains(Keys.remoteDeviceProfiles) &&
+            !corruptedSettingKeys.contains("unifiedBaseBindings")
+    }
+
+    /// Reattach custom data that older builds left under profile IDs that are no longer active.
+    ///
+    /// Three cases are handled:
+    /// - `unifiedBaseBindings` still references an old profile ID.
+    /// - A 1.9.21-style fallback is the only profile and matches a richer history record.
+    /// - The selected known profile lost only its keyboard shortcuts when 2.0.8 removed the
+    ///   older record; the old shortcut remains in a migration snapshot.
+    ///
+    /// A reset profile with a known identity is not replayed wholesale. Shortcut recovery is
+    /// narrower, runs once per profile, and only fills a missing shortcut plus its
+    /// `customShortcut` action when the current value is still default.
+    @discardableResult
+    func recoverRemoteProfileDataIfNeeded() -> Bool {
+        guard canRecoverRemoteProfileData else { return false }
+        let restoredShortcuts = recoverMissingShortcutsFromHistoricalSnapshotsIfNeeded()
+        let restoredProfiles = recoverRemoteProfileDataFromSnapshotsIfNeeded()
+        return restoredShortcuts || restoredProfiles
+    }
+
+    private func recoverRemoteProfileDataFromSnapshotsIfNeeded() -> Bool {
+        let activeIDs = Set(remoteDeviceProfiles.map(\.id))
+        let orphanIDs = Set(unifiedBaseBindings.compactMap(\.remoteProfileID))
+            .subtracting(activeIDs)
+        let fallbackProfile = Self.legacyFallbackProfileForRecovery(remoteDeviceProfiles)
+        guard !orphanIDs.isEmpty || fallbackProfile != nil else { return false }
+
+        var snapshots: [UUID: RemoteDeviceProfile] = [:]
+        var snapshotOrder: [UUID] = []
+        for key in Self.remoteProfileRecoverySnapshotKeys {
+            guard let data = defaults.data(forKey: key),
+                  let profiles = try? JSONDecoder().decode(
+                      [RemoteDeviceProfile].self,
+                      from: data
+                  )
+            else { continue }
+            for profile in profiles {
+                let isOrphan = orphanIDs.contains(profile.id)
+                let isFallbackCandidate = fallbackProfile.map {
+                    Self.fallbackRecoveryCandidate(profile, matches: $0)
+                } ?? false
+                guard isOrphan || isFallbackCandidate else { continue }
+                if let existing = snapshots[profile.id] {
+                    snapshots[profile.id] = Self.mergingRecoveredProfile(
+                        existing,
+                        with: profile
+                    )
+                } else {
+                    snapshots[profile.id] = profile
+                    snapshotOrder.append(profile.id)
+                }
+            }
+        }
+        guard !snapshots.isEmpty else { return false }
+
+        var replacements: [UUID: UUID] = [:]
+        var selectedMappingsChanged = false
+        var preservedBeforeRecovery = false
+        var usedFallback = false
+        for recoveredID in snapshotOrder {
+            guard let recovered = snapshots[recoveredID] else { continue }
+            let targetID: UUID
+            if let fallbackProfile,
+               Self.fallbackRecoveryCandidate(recovered, matches: fallbackProfile) {
+                targetID = fallbackProfile.id
+                usedFallback = true
+            } else {
+                guard let matchedID = Self.uniqueRecoveryTargetID(
+                    for: recovered,
+                    in: remoteDeviceProfiles
+                ) else {
+                    continue
+                }
+                targetID = matchedID
+            }
+
+            guard let index = remoteDeviceProfiles.firstIndex(where: {
+                $0.id == targetID
+            }) else { continue }
+            var candidate = remoteDeviceProfiles[index]
+            Self.fillMissingRemoteProfileDisplayFields(
+                in: &candidate,
+                from: recovered
+            )
+            Self.fillUniqueRecoveredIdentifiers(
+                in: &candidate,
+                from: recovered,
+                activeProfileID: targetID,
+                active: remoteDeviceProfiles
+            )
+            candidate.mappings = Self.mergingMissingRecoveredMappings(
+                candidate.mappings,
+                with: recovered.mappings
+            )
+            if let model = candidate.model != .unknown ? candidate.model : nil,
+               let timing = candidate.mappings.interactionSettings?.timing,
+               timing.isValid,
+               timing != RemoteButtonGestureTiming(),
+               buttonGestureTimingsByModel[model.rawValue] == nil ||
+                   buttonGestureTimingsByModel[model.rawValue]
+                       == RemoteButtonGestureTiming() {
+                buttonGestureTimingsByModel[model.rawValue] = timing
+            }
+            if candidate != remoteDeviceProfiles[index] {
+                if !preservedBeforeRecovery {
+                    preserveRemoteProfilesBeforeRecovery()
+                    preservedBeforeRecovery = true
+                }
+                remoteDeviceProfiles[index] = candidate
+                if targetID == selectedRemoteProfileID {
+                    selectedMappingsChanged = true
+                }
+            }
+            replacements[recovered.id] = targetID
+        }
+
+        let remappedBindings = remapScopedBindings(replacements)
+        if selectedMappingsChanged, let selected = selectedRemoteProfile {
+            loadRemoteProfileMappings(selected)
+        }
+        guard !replacements.isEmpty || remappedBindings > 0 else {
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed result=skipped " +
+                    "reason=no_unique_target profiles=\(snapshots.count) " +
+                    "bindings=\(orphanIDs.count)"
+            )
+            return false
+        }
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed result=restored " +
+                "reason=\(usedFallback ? "legacy_fallback" : "orphaned_bindings") " +
+                "profiles=\(replacements.count) bindings=\(remappedBindings)"
+        )
+        return true
+    }
+
+    /// 2.0.8 could remove the old custom profile while the replacement already had another
+    /// custom action. Its deduplication then skipped copying the old shortcuts, and 2.0.9 had
+    /// no orphan binding or legacy fallback to trigger the broader recovery. Restore only the
+    /// missing keyboard shortcuts from historical snapshots, once per selected profile.
+    private func recoverMissingShortcutsFromHistoricalSnapshotsIfNeeded() -> Bool {
+        guard canRecoverRemoteProfileData,
+              let selected = selectedRemoteProfile else { return false }
+        let evaluatedIDs = Set(
+            defaults.stringArray(forKey: Self.shortcutRecoveryEvaluatedKey) ?? []
+        )
+        guard !evaluatedIDs.contains(selected.id.uuidString) else { return false }
+
+        let defaultBindings = Self.defaultBindings
+        let selectedBindings = selected.mappings.parsedButtonBindings
+        let missingButtons = RemoteButton.allCases.filter { button in
+            guard selected.mappings.parsedButtonShortcuts[button] == nil,
+                  !hasExplicitBaseBinding(
+                      for: button,
+                      trigger: .singleClick,
+                      profileID: selected.id
+                  )
+            else { return false }
+            let action = selectedBindings[button] ?? defaultBindings[button] ?? .disabled
+            let defaultAction = defaultBindings[button] ?? .disabled
+            return action == .customShortcut || action == defaultAction
+        }
+        guard !missingButtons.isEmpty else {
+            markShortcutRecoveryEvaluated(selected.id)
+            return false
+        }
+
+        let activeIDs = Set(remoteDeviceProfiles.map(\.id))
+        var shortcutsByButton: [RemoteButton: [CustomKeyboardShortcut]] = [:]
+        var matchedProfileCount = 0
+        var shortcutConflict = false
+        var readSnapshot = false
+        for key in Self.remoteProfileRecoverySnapshotKeys {
+            guard let data = defaults.data(forKey: key),
+                  let profiles = try? JSONDecoder().decode(
+                      [RemoteDeviceProfile].self,
+                      from: data
+                  )
+            else { continue }
+            readSnapshot = true
+            for profile in profiles {
+                guard !activeIDs.contains(profile.id),
+                      profile.id != selected.id,
+                      Self.uniqueRecoveryTargetID(
+                          for: profile,
+                          in: remoteDeviceProfiles
+                      ) == selected.id
+                else { continue }
+                matchedProfileCount += 1
+                let recoveredBindings = profile.mappings.parsedButtonBindings
+                for button in missingButtons {
+                    let recoveredAction = recoveredBindings[button]
+                        ?? defaultBindings[button] ?? .disabled
+                    guard recoveredAction == .customShortcut,
+                          let shortcut = profile.mappings.parsedButtonShortcuts[button]
+                    else { continue }
+                    if !shortcutsByButton[button, default: []].contains(shortcut) {
+                        shortcutsByButton[button, default: []].append(shortcut)
+                        if shortcutsByButton[button]?.count ?? 0 > 1 {
+                            shortcutConflict = true
+                        }
+                    }
+                }
+            }
+        }
+        guard readSnapshot else { return false }
+
+        var updated = selected
+        var recoveredCount = 0
+        for button in missingButtons {
+            guard let shortcuts = shortcutsByButton[button],
+                  shortcuts.count == 1,
+                  let shortcut = shortcuts.first
+            else { continue }
+            let currentAction = selectedBindings[button]
+                ?? defaultBindings[button] ?? .disabled
+            if currentAction == .customShortcut {
+                // The action is already correct; only the shortcut was removed.
+            } else {
+                let defaultAction = defaultBindings[button] ?? .disabled
+                guard currentAction == defaultAction else { continue }
+                updated.mappings.buttonBindings[button.rawValue] = .customShortcut
+            }
+            updated.mappings.buttonShortcuts[button.rawValue] = shortcut
+            recoveredCount += 1
+        }
+
+        guard recoveredCount > 0,
+              let index = remoteDeviceProfiles.firstIndex(where: {
+                  $0.id == selected.id
+              })
+        else {
+            guard matchedProfileCount > 0 else { return false }
+            AppLogger.shared.write(
+                "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed " +
+                    "result=skipped reason=" +
+                    "\(shortcutConflict ? "shortcut_conflict" : "no_usable_shortcut") " +
+                    "profiles=\(matchedProfileCount) bindings=\(missingButtons.count)"
+            )
+            return false
+        }
+        preserveRemoteProfilesBeforeRecovery()
+        remoteDeviceProfiles[index] = updated
+        loadRemoteProfileMappings(updated)
+        markShortcutRecoveryEvaluated(selected.id)
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed " +
+                "result=restored_shortcuts reason=historical_migration " +
+                "profiles=1 bindings=\(recoveredCount)"
+        )
+        return true
+    }
+
+    private func markShortcutRecoveryEvaluated(_ profileID: UUID) {
+        var evaluated = Set(
+            defaults.stringArray(forKey: Self.shortcutRecoveryEvaluatedKey) ?? []
+        )
+        guard evaluated.insert(profileID.uuidString).inserted else { return }
+        defaults.set(evaluated.sorted(), forKey: Self.shortcutRecoveryEvaluatedKey)
+    }
+
+    private static func legacyFallbackProfileForRecovery(
+        _ profiles: [RemoteDeviceProfile]
+    ) -> RemoteDeviceProfile? {
+        guard profiles.count == 1, let profile = profiles.first,
+              profile.model == .unknown,
+              profile.hidFingerprint == nil else { return nil }
+        return profile
+    }
+
+    private static func fallbackRecoveryCandidate(
+        _ candidate: RemoteDeviceProfile,
+        matches fallback: RemoteDeviceProfile
+    ) -> Bool {
+        guard candidate.id != fallback.id,
+              candidate.model != .unknown else { return false }
+        func identity(_ profile: RemoteDeviceProfile) -> String? {
+            profile.hardwareIdentity
+                ?? RemoteDeviceIdentity.legacyToken(storedName: profile.customName)
+        }
+        let fallbackIdentity = identity(fallback)
+        let candidateIdentity = identity(candidate)
+        if let fallbackIdentity, !fallbackIdentity.isEmpty,
+           let candidateIdentity, !candidateIdentity.isEmpty,
+           fallbackIdentity != candidateIdentity {
+            return false
+        }
+        if let fallbackIdentifier = fallback.bluetoothIdentifier,
+           candidate.bluetoothIdentifier == fallbackIdentifier {
+            return true
+        }
+        guard let fallbackIdentity, !fallbackIdentity.isEmpty else { return false }
+        return candidateIdentity == fallbackIdentity
+    }
+
+    /// Merge two snapshots of the same profile without letting a later snapshot erase a
+    /// custom category that only the earlier one retained.
+    private static func mergingRecoveredProfile(
+        _ existing: RemoteDeviceProfile,
+        with candidate: RemoteDeviceProfile
+    ) -> RemoteDeviceProfile {
+        var merged = existing
+        Self.fillMissingRemoteProfileDisplayFields(in: &merged, from: candidate)
+        if merged.hardwareIdentity == nil {
+            merged.hardwareIdentity = candidate.hardwareIdentity
+        }
+        if merged.hidFingerprint == nil {
+            merged.hidFingerprint = candidate.hidFingerprint
+        }
+        if merged.bluetoothIdentifier == nil {
+            merged.bluetoothIdentifier = candidate.bluetoothIdentifier
+        }
+        merged.mappings = Self.mergingMissingRecoveredMappings(
+            merged.mappings,
+            with: candidate.mappings
+        )
+        return merged
+    }
+
+    /// Fill only categories that are still default on the fallback profile. Used after an
+    /// older build replaced the profile array with one fallback while custom data survived in
+    /// a migration snapshot.
+    private static func mergingMissingRecoveredMappings(
+        _ target: RemoteDeviceMappings,
+        with recovered: RemoteDeviceMappings
+    ) -> RemoteDeviceMappings {
+        var merged = target
+        let targetBindings = target.parsedButtonBindings
+        let recoveredBindings = recovered.parsedButtonBindings
+        for button in RemoteButton.allCases {
+            let defaultAction = Self.defaultBindings[button] ?? .disabled
+            let targetAction = targetBindings[button] ?? defaultAction
+            if targetAction == defaultAction,
+               let recoveredAction = recoveredBindings[button],
+               recoveredAction != defaultAction {
+                merged.buttonBindings[button.rawValue] = recoveredAction
+            }
+            if merged.buttonShortcuts[button.rawValue] == nil,
+               let shortcut = recovered.buttonShortcuts[button.rawValue] {
+                merged.buttonShortcuts[button.rawValue] = shortcut
+            }
+            if merged.buttonApplicationProfileIDs?[button.rawValue] == nil,
+               let applicationProfileID = recovered.buttonApplicationProfileIDs?[button.rawValue] {
+                var applicationProfileIDs = merged.buttonApplicationProfileIDs ?? [:]
+                applicationProfileIDs[button.rawValue] = applicationProfileID
+                merged.buttonApplicationProfileIDs = applicationProfileIDs
+            }
+            if merged.buttonRapidPressEnabled?[button.rawValue] == nil,
+               recovered.buttonRapidPressEnabled?[button.rawValue] == true {
+                var rapidPressEnabled = merged.buttonRapidPressEnabled ?? [:]
+                rapidPressEnabled[button.rawValue] = true
+                merged.buttonRapidPressEnabled = rapidPressEnabled
+            }
+            guard let recoveredSecondary =
+                recovered.secondaryButtonBindings[button.rawValue] else { continue }
+            var secondary = merged.secondaryButtonBindings[button.rawValue] ?? [:]
+            for (triggerKey, binding) in recoveredSecondary
+            where secondary[triggerKey] == nil {
+                secondary[triggerKey] = binding
+            }
+            if !secondary.isEmpty {
+                merged.secondaryButtonBindings[button.rawValue] = secondary
+            }
+        }
+        merged.interactionSettings = Self.mergingRecoveredInteractionSettings(
+            kept: merged.interactionSettings,
+            discarded: recovered.interactionSettings
+        )
+        return merged
+    }
+
+    /// Complementary recovery merge for interaction settings. Existing explicit values win,
+    /// but custom timing and custom hold modes from different snapshots are both retained.
+    private static func mergingRecoveredInteractionSettings(
+        kept: RemoteButtonInteractionSettings?,
+        discarded: RemoteButtonInteractionSettings?
+    ) -> RemoteButtonInteractionSettings? {
+        guard let discarded, hasCustomInteractionSettings(discarded) else { return kept }
+        let recovered = sanitizingRecoveredInteractionSettings(discarded)
+        guard var merged = kept else { return recovered }
+        guard hasCustomInteractionSettings(merged) else { return recovered }
+        let defaultTiming = RemoteButtonGestureTiming()
+        if merged.doubleClickMilliseconds == defaultTiming.doubleClickMilliseconds,
+           recovered.doubleClickMilliseconds != defaultTiming.doubleClickMilliseconds {
+            merged.doubleClickMilliseconds = recovered.doubleClickMilliseconds
+        }
+        if merged.longPressMilliseconds == defaultTiming.longPressMilliseconds,
+           recovered.longPressMilliseconds != defaultTiming.longPressMilliseconds {
+            merged.longPressMilliseconds = recovered.longPressMilliseconds
+        }
+        let migrated = Set(merged.migratedRepeatButtons ?? [])
+        for (button, mode) in recovered.modes {
+            if let existing = merged.modes[button] {
+                guard existing == RemoteButtonHoldMode.repeatSingle.rawValue,
+                      migrated.contains(button),
+                      mode != existing else { continue }
+            }
+            merged.modes[button] = mode
+            if merged.modes[button] == RemoteButtonHoldMode.repeatSingle.rawValue,
+               recovered.migratedRepeatButtons?.contains(button) == true {
+                var mergedMigrated = merged.migratedRepeatButtons ?? []
+                if !mergedMigrated.contains(button) {
+                    mergedMigrated.append(button)
+                }
+                merged.migratedRepeatButtons = mergedMigrated
+            } else {
+                merged.migratedRepeatButtons?.removeAll { $0 == button }
+            }
+        }
+        return merged
+    }
+
+    /// A migration marker is only meaningful while the stored mode is the synthesized
+    /// `repeatSingle`. Older payloads can pair the marker with another mode; normalize before
+    /// merging so the marker cannot make a real hold choice look replaceable.
+    private static func sanitizingRecoveredInteractionSettings(
+        _ settings: RemoteButtonInteractionSettings
+    ) -> RemoteButtonInteractionSettings {
+        guard let migrated = settings.migratedRepeatButtons else { return settings }
+        var normalized = settings
+        normalized.migratedRepeatButtons = migrated.filter { button in
+            normalized.modes[button] == RemoteButtonHoldMode.repeatSingle.rawValue
+        }
+        return normalized
+    }
+
+    /// Fill display-only metadata. Identifiers are deliberately not copied: they may already
+    /// belong to another active profile and must be proven, not guessed.
+    private static func fillMissingRemoteProfileDisplayFields(
+        in target: inout RemoteDeviceProfile,
+        from recovered: RemoteDeviceProfile
+    ) {
+        if target.model == .unknown, recovered.model != .unknown {
+            target.model = recovered.model
+        }
+        if target.lastKnownBluetoothName == nil {
+            target.lastKnownBluetoothName = recovered.lastKnownBluetoothName
+        }
+        if target.customName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !recovered.customName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           RemoteDeviceIdentity.legacyToken(storedName: recovered.customName) == nil {
+            target.customName = recovered.customName
+        }
+    }
+
+    /// Fill identifiers only when no other active profile already owns them. This keeps the
+    /// recovered UUID reusable by later BLE/HID registration without creating a duplicate.
+    private static func fillUniqueRecoveredIdentifiers(
+        in target: inout RemoteDeviceProfile,
+        from recovered: RemoteDeviceProfile,
+        activeProfileID: UUID,
+        active: [RemoteDeviceProfile]
+    ) {
+        let others = active.filter { $0.id != activeProfileID }
+        if target.hardwareIdentity == nil,
+           let identity = recovered.hardwareIdentity,
+           !identity.isEmpty,
+           !others.contains(where: { $0.hardwareIdentity == identity }) {
+            target.hardwareIdentity = identity
+        }
+        if target.hidFingerprint == nil,
+           let fingerprint = recovered.hidFingerprint,
+           !fingerprint.isEmpty,
+           !others.contains(where: { $0.hidFingerprint == fingerprint }) {
+            target.hidFingerprint = fingerprint
+        }
+        if target.bluetoothIdentifier == nil,
+           let identifier = recovered.bluetoothIdentifier,
+           !others.contains(where: { $0.bluetoothIdentifier == identifier }) {
+            let matchesHIDFingerprint = target.hidFingerprint.map { fingerprint in
+                RemoteIdentityFingerprint.candidates(for: identifier).contains(fingerprint)
+            } ?? true
+            if matchesHIDFingerprint {
+                target.bluetoothIdentifier = identifier
+            }
+        }
+    }
+
+    /// A recovered profile can only be attached when one active profile wins at the strongest
+    /// available identity tier. Ambiguous matches stay untouched.
+    private static func uniqueRecoveryTargetID(
+        for recovered: RemoteDeviceProfile,
+        in active: [RemoteDeviceProfile]
+    ) -> UUID? {
+        func uniqueMatch(_ matches: [RemoteDeviceProfile]) -> UUID? {
+            matches.count == 1 ? matches[0].id : nil
+        }
+        func hardwareIdentity(_ profile: RemoteDeviceProfile) -> String? {
+            profile.hardwareIdentity
+                ?? RemoteDeviceIdentity.legacyToken(storedName: profile.customName)
+        }
+        if let identity = hardwareIdentity(recovered), !identity.isEmpty {
+            let matches = active.filter { hardwareIdentity($0) == identity }
+            if !matches.isEmpty { return uniqueMatch(matches) }
+            let activeHasIdentity = active.contains {
+                hardwareIdentity($0)?.isEmpty == false
+            }
+            if activeHasIdentity { return nil }
+        }
+        if let fingerprint = recovered.hidFingerprint, !fingerprint.isEmpty {
+            let matches = active.filter { $0.hidFingerprint == fingerprint }
+            if !matches.isEmpty { return uniqueMatch(matches) }
+            // No active profile has this HID. If the active profile sharing the Bluetooth
+            // identifier already has a different HID, the two records contradict each other.
+            // If it has no HID at all, the HID was never captured for the active split and
+            // Bluetooth identity is still the only available link.
+            guard let identifier = recovered.bluetoothIdentifier else { return nil }
+            let sameBluetooth = active.filter { $0.bluetoothIdentifier == identifier }
+            if sameBluetooth.contains(where: { $0.hidFingerprint?.isEmpty == false }) {
+                return nil
+            }
+            return uniqueMatch(sameBluetooth)
+        }
+        if let identifier = recovered.bluetoothIdentifier {
+            return uniqueMatch(active.filter { $0.bluetoothIdentifier == identifier })
+        }
+        return nil
+    }
+
+    /// Move scoped bindings from replaced profiles to the kept profile.
+    ///
+    /// Existing bindings on the kept profile win. The method is idempotent and returns the
+    /// number of moved bindings.
+    @discardableResult
+    private func remapScopedBindings(_ replacements: [UUID: UUID]) -> Int {
+        guard !replacements.isEmpty else { return 0 }
+        struct ScopedBindingKey: Hashable {
+            let profileID: UUID
+            let button: RemoteButton
+            let trigger: ButtonTrigger
+        }
+        var result: [UnifiedButtonBinding] = []
+        var occupied = Set<ScopedBindingKey>()
+        for binding in unifiedBaseBindings {
+            guard let profileID = binding.remoteProfileID else {
+                result.append(binding)
+                continue
+            }
+            if replacements[profileID] != nil { continue }
+            result.append(binding)
+            occupied.insert(ScopedBindingKey(
+                profileID: profileID,
+                button: binding.button,
+                trigger: binding.trigger
+            ))
+        }
+        var moved = 0
+        var conflicts: [UnifiedButtonBinding] = []
+        for binding in unifiedBaseBindings {
+            guard let profileID = binding.remoteProfileID,
+                  let targetID = replacements[profileID],
+                  targetID != profileID else { continue }
+            var remapped = binding
+            remapped.remoteProfileID = targetID
+            let key = ScopedBindingKey(
+                profileID: targetID,
+                button: binding.button,
+                trigger: binding.trigger
+            )
+            guard occupied.insert(key).inserted else {
+                conflicts.append(remapped)
+                continue
+            }
+            result.append(remapped)
+            moved += 1
+        }
+        if !conflicts.isEmpty {
+            persistScopedBindingConflicts(conflicts)
+        }
+        guard moved > 0 || !conflicts.isEmpty else { return 0 }
+        unifiedBaseBindings = result
+        return moved
+    }
+
+    /// Keep a conflicting old binding out of the active list but do not discard the bytes.
+    /// The kept profile's explicit binding wins; the old value remains auditable here.
+    private func persistScopedBindingConflicts(_ conflicts: [UnifiedButtonBinding]) {
+        guard !conflicts.isEmpty else { return }
+        var stored: [UnifiedButtonBinding] = []
+        if let data = defaults.data(forKey: Self.remappedScopedBindingConflictsKey) {
+            if let decoded = try? JSONDecoder().decode(
+                [UnifiedButtonBinding].self,
+                from: data
+            ) {
+                stored = decoded
+            } else {
+                let corruptKey = Self.remappedScopedBindingConflictsKey + ".corrupt"
+                if defaults.data(forKey: corruptKey) == nil {
+                    defaults.set(data, forKey: corruptKey)
+                }
+                AppLogger.shared.write(
+                    "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed " +
+                        "result=archive_preserved_unreadable"
+                )
+            }
+        }
+        stored.append(contentsOf: conflicts)
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        defaults.set(data, forKey: Self.remappedScopedBindingConflictsKey)
+        AppLogger.shared.write(
+            "SETTINGS REMOTE_PROFILE_RECOVERY phase=completed " +
+                "result=conflict_preserved bindings=\(conflicts.count)"
+        )
     }
 
     private func saveRemoteDeviceProfiles() {

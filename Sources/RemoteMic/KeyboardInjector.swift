@@ -89,6 +89,7 @@ enum KeyboardInjector {
         private var optionHoldTask: AnyObject?
         private var optionReleaseTask: AnyObject?
         private var commandReleaseTask: AnyObject?
+        private var modifierReleaseGeneration: UInt64 = 0
         private(set) var isWindowPickerActive = false
         /// 窗口层里是否已经用方向键选中过某个窗口（原生语义：选中后 Enter/Esc 才响应）。
         private(set) var pickerHasHighlight = false
@@ -220,9 +221,12 @@ enum KeyboardInjector {
                 pickerHasHighlight = false
                 commandReleasePending = true
                 hasPendingRelease = true
+                modifierReleaseGeneration &+= 1
+                let generation = modifierReleaseGeneration
                 commandReleaseTask = scheduler(Self.windowPickerCommandReleaseMilliseconds) {
                     [weak self] in
-                    _ = self?.releaseCommandForWindowPicker()
+                    guard let self, self.modifierReleaseGeneration == generation else { return }
+                    _ = self.releaseCommandForWindowPicker()
                 }
                 return pressed && released
             }
@@ -265,8 +269,10 @@ enum KeyboardInjector {
                 return post(leftCommandKeyCode, isDown: false, flags: [], role: "command")
             }
             hasPendingRelease = true
+            modifierReleaseGeneration &+= 1
+            let generation = modifierReleaseGeneration
             optionHoldTask = scheduler(Self.optionHoldMilliseconds) { [weak self] in
-                guard let self else { return }
+                guard let self, self.modifierReleaseGeneration == generation else { return }
                 _ = self.post(
                     KeyboardInjector.leftCommandKeyCode,
                     isDown: false,
@@ -275,7 +281,7 @@ enum KeyboardInjector {
                 )
                 self.optionReleaseTask = self.scheduler(Self.optionReleaseMilliseconds) {
                     [weak self] in
-                    guard let self else { return }
+                    guard let self, self.modifierReleaseGeneration == generation else { return }
                     _ = self.post(
                         KeyboardInjector.leftOptionKeyCode,
                         isDown: false,
@@ -303,6 +309,7 @@ enum KeyboardInjector {
         @discardableResult
         func forceReleaseModifiersIfNeeded() -> Bool {
             guard hasPendingRelease else { return true }
+            modifierReleaseGeneration &+= 1
             let commandReleased = post(
                 leftCommandKeyCode,
                 isDown: false,
@@ -456,10 +463,14 @@ enum KeyboardInjector {
         return ScrollRegionInjector.scrollToEdge(edge, learnedTarget: learned).outcome
     }
 
-    static let defaultScrollPagePoster: (ScrollPageDirection) -> ScrollPageOutcome = { direction in
+    static let defaultScrollPagePoster: (ScrollPageDirection, ScrollPageStep) -> ScrollPageOutcome = { direction, step in
         let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         let learned = ScrollRegionTargetStore.shared.target(for: bundleIdentifier)
-        return ScrollRegionInjector.scrollPage(direction: direction, learnedTarget: learned).outcome
+        return ScrollRegionInjector.scrollPage(
+            direction: direction,
+            step: step,
+            learnedTarget: learned
+        ).outcome
     }
 
     private static let focusRequests = ApplicationFocusRequestGate()
@@ -509,15 +520,35 @@ enum KeyboardInjector {
         _ mode: VoiceKeyMode,
         isPressed: Bool,
         accessibilityTrusted: () -> Bool = { isAccessibilityTrusted },
-        keyStatePoster: KeyStatePoster = postKeyState
+        keyStatePoster: KeyStatePoster = postKeyState,
+        logger: (String) -> Void = AppLogger.shared.write
     ) -> Bool {
-        guard accessibilityTrusted() else { return false }
+        let edge = isPressed ? "down" : "up"
+        guard accessibilityTrusted() else {
+            if mode == .function {
+                logger(
+                    "VOICE KEY fn_submit mode=fn edge=\(edge) result=rejected " +
+                        "reason=accessibility_denied source=software synthetic=true " +
+                        "target_response=unknown"
+                )
+            }
+            return false
+        }
         let flags = isPressed ? mode.eventFlags : []
-        return keyStatePoster(
+        let submitted = keyStatePoster(
             mode.keyCode,
             isPressed,
             flags
         )
+        if mode == .function {
+            logger(
+                "VOICE KEY fn_submit mode=fn edge=\(edge) " +
+                    "result=\(submitted ? "submitted" : "failed") source=software " +
+                    "synthetic=true event_flags=\(ShortcutEventSequence.diagnosticFlags(flags)) " +
+                    "target_response=unknown"
+            )
+        }
+        return submitted
     }
 
     static func recordedShortcut(
@@ -563,7 +594,7 @@ enum KeyboardInjector {
         keyPoster: KeyPoster = { postKey(code: $0, flags: $1) },
         keyStatePoster: KeyStatePoster = postKeyState,
         scrollPoster: ScrollPoster = { postScrollWheel(lines: $0) },
-        scrollPagePoster: (ScrollPageDirection) -> ScrollPageOutcome = defaultScrollPagePoster,
+        scrollPagePoster: (ScrollPageDirection, ScrollPageStep) -> ScrollPageOutcome = defaultScrollPagePoster,
         scrollEdgePoster: (ScrollEdge) -> ScrollPageOutcome = defaultScrollEdgePoster,
         systemKeyPoster: SystemKeyPoster = postSystemKey,
         shortcutEventPoster: (CGEvent) -> Bool = ShortcutEventSequence.post,
@@ -704,9 +735,13 @@ enum KeyboardInjector {
         case .scrollDown:
             scrollPoster(-scrollLineCount)
         case .pageUp:
-            return scrollPagePoster(.up).wasHandled
+            return scrollPagePoster(.up, .full).wasHandled
         case .pageDown:
-            return scrollPagePoster(.down).wasHandled
+            return scrollPagePoster(.down, .full).wasHandled
+        case .pageUpHalf:
+            return scrollPagePoster(.up, .half).wasHandled
+        case .pageDownHalf:
+            return scrollPagePoster(.down, .half).wasHandled
         case .scrollToTop:
             return scrollEdgePoster(.top).wasHandled
         case .scrollToBottom:
@@ -814,7 +849,10 @@ enum KeyboardInjector {
         // through a resign/become-key cycle, which clears the web composer's
         // focus for about two seconds. The focuser below reaches the running
         // instance directly, so the activation step is skipped instead.
-        if let frontmost = frontmostApplication(), frontmost.bundleIdentifier == application.bundleIdentifier {
+        // Reopening SayAll shows its settings window even when it already owns the menu bar.
+        if application != .remoteMic,
+           let frontmost = frontmostApplication(),
+           frontmost.bundleIdentifier == application.bundleIdentifier {
             AppLogger.shared.write("APP ACTION skipped bundle=\(application.bundleIdentifier) reason=already_frontmost")
             if application.focusStrategy != nil {
                 applicationFocuser(url, application, frontmost.processIdentifier, focusRequestID)

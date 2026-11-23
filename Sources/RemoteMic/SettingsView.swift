@@ -646,6 +646,9 @@ struct SettingsView: View {
     @State private var selectedChromecastControlID = "select"
     @State private var selectedStatisticsDate: Date?
     @State private var mappingEditingTarget: ShortcutEditingTarget?
+    /// 当前动作编辑状态属于哪台遥控器。跨型号切换会替换整个页面子树，
+    /// 这个设备标识让旧编辑区在清理完成前也不会显示到新遥控器页面上。
+    @State private var mappingPageStateDeviceID: UUID?
     @State private var mappingHoldEditingButton: RemoteButton?
     /// Clicking the same hold entry twice must still bring the editor into view, so the
     /// scroll is driven by a request token instead of the selection identity.
@@ -668,6 +671,16 @@ struct SettingsView: View {
     /// 聚焦与翻页滚动按 App 生效，App 在前台即可使用，和「打开 App」动作无关。
     /// 「聚焦与翻页」页面当前展开的 App；与按键页的编辑对象完全分开。
     @State private var applicationDetailProfileID: UUID?
+    /// 非空时 APP 档案页显示该 APP 的同窗口按键覆盖二级页。
+    @State private var applicationButtonSettingsProfileID: UUID?
+    @State private var applicationButtonEditingTarget: ShortcutEditingTarget?
+    @State private var applicationButtonActionFilter: MappingActionFilter = .all
+    @State private var applicationButtonEditingScrollRequest = 0
+    @State private var isApplicationButtonClearConfirmationPresented = false
+    @State private var isApplicationSchemeCreationPresented = false
+    @State private var applicationSchemeCreationTargetProfileID: UUID?
+    @State private var applicationSchemeName = ""
+    @State private var applicationSchemeFeedback: String?
     /// 正在确认移除的 APP 档案；非空时弹确认框。
     @State private var applicationPendingRemoval: CustomApplicationProfile?
     @State private var shortcutCaptureFeedback: ShortcutCaptureFeedback?
@@ -713,6 +726,10 @@ struct SettingsView: View {
         initialMappingActionFilter: String? = nil,
         initialMappingScrollsToGestureTiming: Bool = false,
         initialMappingVoiceSettingsPresented: Bool = false,
+        initialApplicationButtonSettingsProfileID: UUID? = nil,
+        initialApplicationButtonEditingButton: RemoteButton? = nil,
+        initialApplicationButtonEditingTrigger: ButtonTrigger = .singleClick,
+        initialApplicationButtonClearConfirmationPresented: Bool = false,
         supplementalSettings: SupplementalSettingsIntegration? = nil,
         sidebarAccountDisplayName: String? = nil,
         minimumContentSize: CGSize = CGSize(width: 980, height: 732)
@@ -782,8 +799,21 @@ struct SettingsView: View {
                 ShortcutEditingTarget(button: $0, trigger: initialMappingEditingTrigger)
             } : nil
         )
+        _mappingPageStateDeviceID = State(initialValue: model.settings.selectedRemoteProfileID)
         _mappingHoldEditingButton = State(initialValue: initialMappingHoldEditingButton)
         _isMappingVoiceSettingsPresented = State(initialValue: initialMappingVoiceSettingsPresented)
+        _applicationButtonSettingsProfileID = State(initialValue: initialApplicationButtonSettingsProfileID)
+        _applicationButtonEditingTarget = State(
+            initialValue: initialApplicationButtonEditingButton.map {
+                ShortcutEditingTarget(button: $0, trigger: initialApplicationButtonEditingTrigger)
+            }
+        )
+        _isApplicationButtonClearConfirmationPresented = State(
+            initialValue: initialApplicationButtonClearConfirmationPresented
+        )
+        _applicationButtonEditingScrollRequest = State(
+            initialValue: initialApplicationButtonEditingButton == nil ? 0 : 1
+        )
     }
 
     var body: some View {
@@ -802,7 +832,6 @@ struct SettingsView: View {
             guard url == URL(string: "sayall://membership") else { return .systemAction }
             guard membershipFeature.isFeatureVisible else { return .discarded }
             selectedSection = .membership
-            membershipFeature.refreshIfNeeded()
             return .handled
         })
         .frame(
@@ -820,7 +849,6 @@ struct SettingsView: View {
             refreshPermissionStates()
             loginItemService.refresh()
             macroFeature.setEditorActive(false)
-            membershipFeature.refreshIfNeeded()
             routePendingButtonProfileImportIfNeeded()
             if ButtonProfileMacroRefreshPolicy.shouldRefresh(section: selectedSection) {
                 macroFeature.reloadButtonProfileMacroLibrary()
@@ -859,6 +887,12 @@ struct SettingsView: View {
                 macroFeature.reloadButtonProfileMacroLibrary()
             }
         }
+        // 监听器必须挂在会跨型号页面替换保留的父层。按键页按型号在小米、Siri 和
+        // Chromecast 页面之间切换，挂在页内的 onChange 在跨型号切换时会被移除。
+        .onChange(of: settings.selectedRemoteProfileID) { _ in
+            guard !mappingInteractionBelongsToSelectedRemote else { return }
+            resetMappingPageForRemoteChange()
+        }
         .onDisappear {
             model.setMappingPageVisible(false)
             endMacMicrophoneShortcutCapture()
@@ -869,7 +903,6 @@ struct SettingsView: View {
             refreshPermissionStates()
             loginItemService.refresh()
             resumeCustomMappingIfPermissionsGranted()
-            membershipFeature.refreshIfNeeded()
         }
         .onReceive(privateFeature.$isFeatureVisible.removeDuplicates()) { isVisible in
             if !isVisible, selectedSection == .privateFeature {
@@ -938,7 +971,6 @@ struct SettingsView: View {
             membershipRequiredView: membershipFeature.membershipRequiredView(remoteAuthorizationDenied: true) {
                 isWebRemoteSessionPresented = false
                 selectedSection = .membership
-                membershipFeature.refreshIfNeeded()
             },
             onDiagnostic: { AppLogger.shared.write($0) }
         )
@@ -1136,8 +1168,13 @@ struct SettingsView: View {
                             } else {
                                 selectMappingProfile(nil)
                             }
-                            // 只打开动作编辑器；按住是独立分类，不随跳转展开。
+                            // 跳转明确选择的是新设备；父层设备监听不得把这次编辑目标清掉。
+                            mappingPageStateDeviceID = settings.selectedRemoteProfileID
+                            mappingEditingTarget = nil
                             mappingHoldEditingButton = nil
+                            isMappingVoiceSettingsPresented = false
+                            shortcutCaptureTarget = nil
+                            applicationShortcutCaptureProfileID = nil
                             mappingActionFilter = mappingFilterForConfiguredAction(
                                 button: button,
                                 trigger: trigger
@@ -1170,7 +1207,11 @@ struct SettingsView: View {
                             settings: settings,
                             holdSummaryProvider: { profileID, buttonRaw in
                                 guard let button = RemoteButton(rawValue: buttonRaw) else { return "" }
-                                return mappingHoldSummary(for: button, profileID: profileID)
+                                return profileHoldSummary(for: button, profileID: profileID)
+                            },
+                            holdModeProvider: { profileID, buttonRaw in
+                                guard let button = RemoteButton(rawValue: buttonRaw) else { return nil }
+                                return profileHoldMode(for: button, profileID: profileID)
                             },
                             onChooseApplication: { completion in
                                 chooseApplicationForProfile(completion)
@@ -1188,7 +1229,6 @@ struct SettingsView: View {
                             chromecastReservedControlIDs: buttonProfilesChromecastReservedControls,
                             membershipNotice: membershipFeature.membershipRequiredView(forButtonProfiles: true) {
                                 selectedSection = .membership
-                                membershipFeature.refreshIfNeeded()
                             }
                         )
                     }
@@ -1205,6 +1245,7 @@ struct SettingsView: View {
         case .membership:
             if membershipFeature.isFeatureVisible {
                 membershipFeature.settingsView()
+                    .onAppear { membershipFeature.refreshIfNeeded() }
             } else {
                 aboutPage
             }
@@ -1231,14 +1272,12 @@ struct SettingsView: View {
                 membershipFeature.commonPhrasesSettingsView(
                     onOpenMembership: {
                         selectedSection = .membership
-                        membershipFeature.refreshIfNeeded()
                     },
                     onReturn: { selectedSection = .mapping }
                 )
             } else {
                 membershipFeature.membershipRequiredView {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
             }
         case .transcripts:
@@ -1261,6 +1300,8 @@ struct SettingsView: View {
 
     private func settingsPage<Header: View, Content: View>(
         contentPadding: CGFloat = 22,
+        scrollTargetID: String? = nil,
+        scrollToken: Int = 0,
         @ViewBuilder header: () -> Header,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
@@ -1274,12 +1315,22 @@ struct SettingsView: View {
 
             Divider()
 
-            ScrollView(.vertical, showsIndicators: false) {
-                content()
-                    .padding(contentPadding)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    content()
+                        .padding(contentPadding)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .compatibilityScrollEdgeEffect()
+                .onChange(of: scrollToken) { _ in
+                    guard let scrollTargetID else { return }
+                    withAnimation { proxy.scrollTo(scrollTargetID, anchor: .top) }
+                }
+                .task {
+                    guard scrollToken > 0, let scrollTargetID else { return }
+                    proxy.scrollTo(scrollTargetID, anchor: .top)
+                }
             }
-            .compatibilityScrollEdgeEffect()
         }
     }
 
@@ -1305,13 +1356,6 @@ struct SettingsView: View {
                     VStack(spacing: 14) {
                         phoneConnectionsPanel
                         audioSettingsPanel
-                        #if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
-                        // Chromecast 卡片在系统 HID 或语音链路连接时显示；两者都不在时不渲染，
-                        // 与小米/苹果遥控器卡片一致。启用开关默认常开，语音键模式在语音键设置面板内。
-                        if model.isChromecastHIDPresent || model.chromecastStatus.isConnected {
-                            chromecastConnectionCard
-                        }
-                        #endif
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
@@ -1443,42 +1487,9 @@ struct SettingsView: View {
 
     #endif
 
-    #if SAYALL_CHROMECAST_ENABLED && canImport(SayAllChromecast)
-    /// 系统 HID 或语音链路连接时渲染；两者都不在时与小米/苹果遥控器卡片一样隐藏。
-    private var chromecastConnectionCard: some View {
-        GlassPanel {
-            HStack(alignment: .top, spacing: 14) {
-                ChromecastConnectionPhoto()
-                VStack(alignment: .leading, spacing: 9) {
-                    Text("chromecast.section_title")
-                        .font(.headline)
-                    Text("chromecast.section_subtitle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    connectionStatusLine(
-                        symbol: "antenna.radiowaves.left.and.right",
-                        text: localization.text(model.chromecastStatus.localizationKey),
-                        tint: model.chromecastStatus.isConnected ? .green : .orange
-                    )
-                    Text("chromecast.help.plain")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("chromecast.action.reconnect") {
-                        model.reconnectChromecast()
-                    }
-                    .compatibilityButtonStyle(.standard)
-                }
-                Spacer(minLength: 0)
-            }
-        }
-    }
-    #endif
-
     private var connectionMembershipRequiredView: some View {
         membershipFeature.membershipRequiredView {
             selectedSection = .membership
-            membershipFeature.refreshIfNeeded()
         }
     }
 
@@ -2080,70 +2091,159 @@ struct SettingsView: View {
     #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
     private var siriRemoteMappingPage: some View {
         hardwareMappingPage(includeSiriScrollArrow: true) {
-            SiriRemoteMappingCanvas(
-                selectedControlID: $selectedSiriRemoteControlID,
-                activeControlIDs: model.activeAppleRemoteControlIDs,
-                voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
-                labels: SiriRemoteMappingCanvas.Labels(
-                    voiceTitle: localization.text("siri_remote.mapping.voice.title"),
-                    voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
-                    voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
-                    missingPhoto: localization.text("siri_remote.mapping.photo.missing")
-                ),
-                buttonTitle: { controlID in
-                    siriRemoteButton(for: controlID)?.displayName(using: localization)
-                        ?? controlID
-                },
-                triggerTitle: { triggerID in
-                    ButtonTrigger(rawValue: triggerID)?.displayName(using: localization)
-                        ?? triggerID
-                },
-                actionSummary: { controlID, triggerID in
-                    guard let button = siriRemoteButton(for: controlID),
-                          let trigger = ButtonTrigger(rawValue: triggerID)
-                    else { return localization.text("action.disabled") }
-                    return mappingActionSummary(for: button, trigger: trigger)
-                },
-                holdSummary: { controlID in
-                    guard let button = siriRemoteButton(for: controlID) else {
-                        return localization.text("button_mapping.hold.entry")
-                    }
-                    return mappingHoldSummary(for: button)
-                },
-                reservedControlIDs: profileScopeReservedSiriControlIDs,
-                onEdit: { controlID, triggerID in
-                    guard let button = siriRemoteButton(for: controlID),
-                          let trigger = ButtonTrigger(rawValue: triggerID)
-                    else { return }
-                    selectedSiriRemoteControlID = controlID
-                    selectedRemoteButton = button
-                    mappingActionFilter = mappingFilterForConfiguredAction(
-                        button: button,
-                        trigger: trigger
-                    )
-                    // 重复点同一颗键时 mappingEditingTarget 不变，光靠 onChange 不会再滚，
-                    // 所以每次都单独发一次滚动请求。
-                    mappingFilterScrollRequest &+= 1
-                    // 点按键只打开它的动作编辑器；按住是独立分类，不能连带展开。
-                    mappingHoldEditingButton = nil
-                    mappingEditingTarget = ShortcutEditingTarget(
-                        button: button,
-                        trigger: trigger
-                    )
-                },
-                onEditHold: { controlID in
-                    guard let button = siriRemoteButton(for: controlID) else { return }
-                    selectedSiriRemoteControlID = controlID
-                    selectedRemoteButton = button
-                    mappingEditingTarget = nil
-                    shortcutCaptureTarget = nil
-                    applicationShortcutCaptureProfileID = nil
-                    mappingHoldEditingButton = button
-                    requestMappingEditorScroll(focusHold: true)
-                },
-                onVoiceSettings: presentMappingVoiceSettings
-            )
+            siriRemoteMappingCanvas
         }
+    }
+
+    #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+    /// 与宿主共享画布同一套来源/主题色语义；旧私有组件没有这些闭包时走下面的兼容分支。
+    private var siriRemoteMappingCanvas: some View {
+        SiriRemoteMappingCanvas(
+            selectedControlID: $selectedSiriRemoteControlID,
+            activeControlIDs: model.activeAppleRemoteControlIDs,
+            voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
+            labels: siriRemoteMappingLabels,
+            buttonTitle: siriRemoteCanvasButtonTitle,
+            triggerTitle: siriRemoteCanvasTriggerTitle,
+            actionSummary: siriRemoteCanvasActionSummary,
+            holdSummary: siriRemoteCanvasHoldSummary,
+            actionConfigured: siriRemoteCanvasActionConfigured,
+            actionSource: siriRemoteCanvasActionSource,
+            reservedControlIDs: profileScopeReservedSiriControlIDs,
+            onEdit: editSiriRemoteControl,
+            onEditHold: editSiriRemoteHold,
+            onVoiceSettings: presentMappingVoiceSettings
+        )
+    }
+    #else
+    private var siriRemoteMappingCanvas: some View {
+        SiriRemoteMappingCanvas(
+            selectedControlID: $selectedSiriRemoteControlID,
+            activeControlIDs: model.activeAppleRemoteControlIDs,
+            voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
+            labels: siriRemoteMappingLabels,
+            buttonTitle: siriRemoteCanvasButtonTitle,
+            triggerTitle: siriRemoteCanvasTriggerTitle,
+            actionSummary: siriRemoteCanvasActionSummary,
+            holdSummary: siriRemoteCanvasHoldSummary,
+            reservedControlIDs: profileScopeReservedSiriControlIDs,
+            onEdit: editSiriRemoteControl,
+            onEditHold: editSiriRemoteHold,
+            onVoiceSettings: presentMappingVoiceSettings
+        )
+    }
+    #endif
+
+    private var siriRemoteMappingLabels: SiriRemoteMappingCanvas.Labels {
+        #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+        return SiriRemoteMappingCanvas.Labels(
+            voiceTitle: localization.text("siri_remote.mapping.voice.title"),
+            voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
+            voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
+            missingPhoto: localization.text("siri_remote.mapping.photo.missing"),
+            inherited: localization.text("button_mapping.binding.inherited"),
+            unavailable: localization.text("button_mapping.binding.unavailable_short")
+        )
+        #else
+        return SiriRemoteMappingCanvas.Labels(
+            voiceTitle: localization.text("siri_remote.mapping.voice.title"),
+            voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
+            voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
+            missingPhoto: localization.text("siri_remote.mapping.photo.missing")
+        )
+        #endif
+    }
+
+    private var siriRemoteCanvasButtonTitle: (String) -> String {
+        { controlID in
+            siriRemoteButton(for: controlID)?.displayName(using: localization)
+                ?? controlID
+        }
+    }
+
+    private var siriRemoteCanvasTriggerTitle: (String) -> String {
+        { triggerID in
+            ButtonTrigger(rawValue: triggerID)?.displayName(using: localization)
+                ?? triggerID
+        }
+    }
+
+    private var siriRemoteCanvasActionSummary: (String, String) -> String {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return localization.text("action.disabled") }
+            return mappingActionSummary(for: button, trigger: trigger)
+        }
+    }
+
+    private var siriRemoteCanvasHoldSummary: (String) -> String {
+        { controlID in
+            guard let button = siriRemoteButton(for: controlID) else {
+                return localization.text("button_mapping.hold.entry")
+            }
+            return mappingHoldSummary(for: button)
+        }
+    }
+
+    #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+    private var siriRemoteCanvasActionConfigured: (String, String) -> Bool {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return false }
+            return mappingActionIsConfigured(for: button, trigger: trigger)
+        }
+    }
+
+    private var siriRemoteCanvasActionSource:
+        (String, String) -> SiriRemoteMappingCanvas.ActionSource {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return .base }
+            switch mappingActionSource(for: button, trigger: trigger) {
+            case .base: return .base
+            case .inherited: return .inherited
+            case .explicit: return .explicit
+            case .unavailable: return .unavailable
+            }
+        }
+    }
+    #endif
+
+    private func editSiriRemoteControl(_ controlID: String, _ triggerID: String) {
+        guard let button = siriRemoteButton(for: controlID),
+              let trigger = ButtonTrigger(rawValue: triggerID)
+        else { return }
+        selectedSiriRemoteControlID = controlID
+        selectedRemoteButton = button
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingActionFilter = mappingFilterForConfiguredAction(
+            button: button,
+            trigger: trigger
+        )
+        // 重复点同一颗键时 mappingEditingTarget 不变，光靠 onChange 不会再滚，
+        // 所以每次都单独发一次滚动请求。
+        mappingFilterScrollRequest &+= 1
+        // 点按键只打开它的动作编辑器；按住是独立分类，不能连带展开。
+        mappingHoldEditingButton = nil
+        mappingEditingTarget = ShortcutEditingTarget(
+            button: button,
+            trigger: trigger
+        )
+    }
+
+    private func editSiriRemoteHold(_ controlID: String) {
+        guard let button = siriRemoteButton(for: controlID) else { return }
+        selectedSiriRemoteControlID = controlID
+        selectedRemoteButton = button
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingEditingTarget = nil
+        shortcutCaptureTarget = nil
+        applicationShortcutCaptureProfileID = nil
+        mappingHoldEditingButton = button
+        requestMappingEditorScroll(focusHold: true)
     }
 
     private func siriRemoteButton(for controlID: String) -> RemoteButton? {
@@ -2220,6 +2320,7 @@ struct SettingsView: View {
                     else { return }
                     selectedChromecastControlID = controlID
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingActionFilter = mappingFilterForConfiguredAction(
                         button: button,
                         trigger: trigger
@@ -2238,6 +2339,7 @@ struct SettingsView: View {
                     guard let button = chromecastButton(for: controlID) else { return }
                     selectedChromecastControlID = controlID
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingEditingTarget = nil
                     shortcutCaptureTarget = nil
                     applicationShortcutCaptureProfileID = nil
@@ -2294,7 +2396,41 @@ struct SettingsView: View {
     /// 语音键没有可配置的单击/双击/长按动作，所以它不打开普通按键的编辑器；反之，打开普通按键
     /// 或按住编辑器时也会收起本面板（见 `hardwareMappingPage` 的 onChange），保证点击之后页面上
     /// 只有这一份与语音键有关的设置。再点一次语音键卡片收起。
+    /// 旧遥控器的编辑状态在新页面出现前不得参与布局或滚动。
+    private var mappingInteractionBelongsToSelectedRemote: Bool {
+        mappingPageStateDeviceID == settings.selectedRemoteProfileID
+    }
+
+    /// 切换到另一台遥控器后，按键页必须从干净状态开始：旧编辑目标、胶囊筛选、
+    /// 方案选择、语音面板和快捷键捕获都属于上一台设备，不能带到新页面。
+    /// 设备切换后固定在页面顶部；每个遥控器独立滚动位置留待后续单独实现。
+    private func resetMappingPageForRemoteChange() {
+        model.cancelButtonGestureLearning(reason: "remote_changed")
+        loadGestureTimingDraft()
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingEditingTarget = nil
+        mappingHoldEditingButton = nil
+        isMappingVoiceSettingsPresented = false
+        shortcutCaptureTarget = nil
+        applicationShortcutCaptureProfileID = nil
+        mappingActionFilter = .all
+        mappingMacroSearch = ""
+        mappingActionSave = .init()
+        mappingHoldSave = .init()
+        mappingProfileCreation = nil
+        shortcutCaptureFeedback = nil
+        gestureTimingSaveConfirmed = false
+        mappingContentIsScrolled = false
+        mappingEditorScrollTarget = "mapping-action-editor"
+        selectedRemoteButton = .ok
+        selectedSiriRemoteControlID = "select"
+        selectedChromecastControlID = "select"
+        // 方案属于具体设备；切换后回到基础映射，避免旧方案胶囊或作用域提示串到新设备。
+        editingMappingProfileID = nil
+    }
+
     private func presentMappingVoiceSettings() {
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
         mappingEditingTarget = nil
         mappingHoldEditingButton = nil
         shortcutCaptureTarget = nil
@@ -2323,8 +2459,32 @@ struct SettingsView: View {
     private func mappingConfiguration(for button: RemoteButton, trigger: ButtonTrigger) -> ConfiguredButtonAction {
         switch mappingDisplayConfiguration(for: button, trigger: trigger) {
         case let .explicit(value): return value.configured ?? .disabled
-        case .inherited: return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
-        case .unavailable: return .disabled
+        case .inherited, .unavailable:
+            // 失效引用在运行时回退基础映射，编辑器和按住判断必须使用同一个实际动作。
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+        }
+    }
+
+    /// 按指定方案解析动作。方案总览可能正在查看 A 方案，而按键页正在编辑 B 方案；
+    /// 任何方案作用域的摘要都必须显式传入要解析的方案。
+    private func mappingConfiguration(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?
+    ) -> ConfiguredButtonAction {
+        guard let profileID, macroFeature.supportsProfileButton(button.rawValue) else {
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+        }
+        switch macroFeature.displayProfileBinding(
+            device: settings.selectedRemoteProfileID,
+            profile: profileID,
+            button: button,
+            trigger: trigger
+        ) {
+        case let .explicit(value):
+            return (value.configured ?? .disabled).normalizedForExecution
+        case .inherited, .unavailable:
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
         }
     }
 
@@ -2333,7 +2493,9 @@ struct SettingsView: View {
         switch mappingDisplayConfiguration(for: button, trigger: trigger) {
         case let .explicit(value): return value.isEditable
         case .inherited: return true
-        case .unavailable: return false
+        // A stale reference must be replaceable without clearing it first. The
+        // write goes through the same profile API as any other explicit value.
+        case .unavailable: return true
         }
     }
 
@@ -2421,6 +2583,34 @@ struct SettingsView: View {
         profileScopeItems
             .map { $0.displayName(using: localization) }
             .joined(separator: localization.text("common.list.separator"))
+    }
+
+    /// 当前方案里已存在原始绑定、但引用目标无法解析的按键手势。
+    /// 只有原始绑定存在时才允许批量清理；整份方案读取失败或组件不可用不能被误报成“失效覆盖”。
+    private var unavailableProfileBindings: [(button: RemoteButton, trigger: ButtonTrigger)] {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        guard let profile = editingMappingProfileID else { return [] }
+        return RemoteButton.allCases
+            .filter { macroFeature.supportsProfileButton($0.rawValue) }
+            .flatMap { button in
+                ButtonTrigger.allCases.compactMap { trigger in
+                    guard macroFeature.rawProfileBinding(
+                        device: settings.selectedRemoteProfileID,
+                        profile: profile,
+                        button: button,
+                        trigger: trigger
+                    ) != nil,
+                        case .unavailable = mappingDisplayConfiguration(
+                            for: button,
+                            trigger: trigger
+                        )
+                    else { return nil }
+                    return (button, trigger)
+                }
+            }
+        #else
+        return []
+        #endif
     }
 
     #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
@@ -2805,7 +2995,6 @@ struct SettingsView: View {
                     "MEMBERSHIP ENTRY source=mapping_profile_toolbar state=\(editingMappingProfileID == nil ? "create" : "copy") phase=requested result=requested"
                 )
                 selectedSection = .membership
-                membershipFeature.refreshIfNeeded()
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "crown.fill")
@@ -2935,8 +3124,12 @@ struct SettingsView: View {
                 holdSummary: { button in mappingHoldSummary(for: button) },
                 actionDetail: { button, trigger in mappingActionDetail(for: button, trigger: trigger) },
                 actionSource: { button, trigger in mappingActionSource(for: button, trigger: trigger) },
+                actionConfigured: { button, trigger in
+                    mappingActionIsConfigured(for: button, trigger: trigger)
+                },
                 onEdit: { button, trigger in
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingActionFilter = mappingFilterForConfiguredAction(
                         button: button,
                         trigger: trigger
@@ -2953,6 +3146,7 @@ struct SettingsView: View {
                 },
                 onEditHold: { button in
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingEditingTarget = nil
                     shortcutCaptureTarget = nil
                     applicationShortcutCaptureProfileID = nil
@@ -3014,10 +3208,12 @@ struct SettingsView: View {
                             }
                             configurationImportBanner
                             corruptedSettingsBanner
+                            mappingProfileUnavailableBanner
 
                             hardwareCanvas()
 
-                            if let target = mappingEditingTarget {
+                            if mappingInteractionBelongsToSelectedRemote,
+                               let target = mappingEditingTarget {
                                 // 分类胶囊和语音键、按键速度两块全局面板都不属于某一颗按键，
                                 // 因此放在编辑面板外面：胶囊在上，全局面板在面板之后。
                                 VStack(alignment: .leading, spacing: 16) {
@@ -3039,14 +3235,16 @@ struct SettingsView: View {
                                             .id("mapping-button-speed-tab")
                                     }
                                 }
-                            } else if let button = mappingHoldEditingButton {
+                            } else if mappingInteractionBelongsToSelectedRemote,
+                                      let button = mappingHoldEditingButton {
                                 mappingHoldEditorPanel(button)
                                     .id("mapping-hold-editor")
                             }
 
                             // 语音键的设置只在点击语音键之后出现，而且是页面上唯一的编辑面板：
                             // 选普通按键会收起它，点它会收起普通按键的编辑器。
-                            if isMappingVoiceSettingsPresented {
+                            if mappingInteractionBelongsToSelectedRemote,
+                               isMappingVoiceSettingsPresented {
                                 mappingVoiceSettingsPanel(includeSiriScrollArrow: includeSiriScrollArrow)
                                     .id("mapping-voice-settings")
                             }
@@ -3076,19 +3274,6 @@ struct SettingsView: View {
                     .id(settings.selectedRemoteProfileID)
                     .compatibilityScrollEdgeEffect()
                 }
-                .onChange(of: settings.selectedRemoteProfileID) { _ in
-                    model.cancelButtonGestureLearning(reason: "remote_changed")
-                    loadGestureTimingDraft()
-                    // 编辑器属于上一只遥控器；切换设备后不得把旧编辑区带到新页面。
-                    mappingEditingTarget = nil
-                    mappingHoldEditingButton = nil
-                    isMappingVoiceSettingsPresented = false
-                    shortcutCaptureTarget = nil
-                    applicationShortcutCaptureProfileID = nil
-                    DispatchQueue.main.async {
-                        proxy.scrollTo("mapping-page-top", anchor: .top)
-                    }
-                }
                 .onChange(of: settings.selectedRemoteProfile?.model) { _ in
                     model.cancelButtonGestureLearning(reason: "remote_model_changed")
                     loadGestureTimingDraft()
@@ -3100,22 +3285,23 @@ struct SettingsView: View {
                             proxy.scrollTo("mapping-gesture-timing", anchor: .top)
                         }
                     }
-                    guard mappingEditingTarget != nil
-                        || mappingHoldEditingButton != nil
-                        || isMappingVoiceSettingsPresented
-                    else { return }
-                    // The hold editor has its own anchor; scrolling to the action editor
-                    // would land on the page top when only the hold editor is open.
-                    let anchor = isMappingVoiceSettingsPresented
+                    // 只恢复属于当前遥控器的编辑区。跨型号切换时旧状态可能还没被父层清理，
+                    // 设备标识会先把它挡在布局和滚动之外，避免“先到顶部再滚下去”。
+                    guard mappingInteractionBelongsToSelectedRemote else { return }
+                    let wantsVoice = isMappingVoiceSettingsPresented
+                    let wantsAction = mappingEditingTarget != nil
+                    let wantsHold = mappingHoldEditingButton != nil
+                    guard wantsVoice || wantsAction || wantsHold else { return }
+                    let anchor = wantsVoice
                         ? "mapping-voice-settings"
-                        : (mappingEditingTarget == nil ? "mapping-hold-editor" : "mapping-action-filter")
+                        : (wantsAction ? "mapping-action-filter" : "mapping-hold-editor")
                     DispatchQueue.main.async {
                         proxy.scrollTo(anchor, anchor: .top)
                     }
                 }
                 .onChange(of: mappingEditingTarget?.id) { targetID in
                     mappingActionSave = .init()
-                    guard targetID != nil else { return }
+                    guard targetID != nil, mappingInteractionBelongsToSelectedRemote else { return }
                     isMappingVoiceSettingsPresented = false
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -3126,7 +3312,7 @@ struct SettingsView: View {
                 }
                 .onChange(of: mappingHoldEditingButton?.rawValue) { buttonID in
                     clearMappingHoldFeedbackForChangedButton()
-                    guard buttonID != nil else { return }
+                    guard buttonID != nil, mappingInteractionBelongsToSelectedRemote else { return }
                     isMappingVoiceSettingsPresented = false
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -3150,6 +3336,7 @@ struct SettingsView: View {
                     }
                 }
                 .onChange(of: mappingVoiceSettingsRequest) { _ in
+                    guard mappingInteractionBelongsToSelectedRemote else { return }
                     // 面板是这一刻才插进视图树的，锚点要等下一轮布局完成才可滚动。
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -3259,6 +3446,45 @@ struct SettingsView: View {
         }
     }
 
+    /// 方案覆盖引用的快捷键/动作已不存在时，页面必须明确指出并给出批量恢复入口。
+    /// 执行路径已经回退基础映射，这里不能继续用笼统的「配置不可用」让用户以为整颗键失效。
+    @ViewBuilder
+    private var mappingProfileUnavailableBanner: some View {
+        let bindings = unavailableProfileBindings
+        if !bindings.isEmpty {
+            GlassPanel {
+                HStack(alignment: .top, spacing: 11) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.orange)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(String(
+                            format: localization.text("button_mapping.profile_unavailable.title"),
+                            bindings.count
+                        ))
+                        .font(.system(size: 13, weight: .semibold))
+                        Text(localization.text("button_mapping.profile_unavailable.detail"))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if !isMappingProfilePreviewOnly {
+                        Button {
+                            clearUnavailableProfileBindings(bindings)
+                        } label: {
+                            Text(localization.text("button_mapping.profile_unavailable.clear"))
+                                .font(.system(size: 12))
+                        }
+                        .compatibilityButtonStyle(.standard)
+                        .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
     private var mappingHeaderToggle: some View {
         Toggle("button_mapping.toggle.enabled", isOn: Binding(
             get: { settings.customMappingEnabled },
@@ -3303,13 +3529,15 @@ struct SettingsView: View {
                 Text(localization.text("button_mapping.save.unknown")).foregroundStyle(.red)
                     .help(localization.text("button_mapping.save.unknown"))
             } else if unavailable {
-                Text(localization.text("button_mapping.save.unavailable")).foregroundStyle(.red)
+                // 具体原因和基础回退由下方状态行说明；标题只保留短状态，避免再次变成
+                // 一个无法定位失败的笼统「配置不可用」。
+                Text(localization.text("button_mapping.binding.unavailable_short"))
+                    .foregroundStyle(.orange)
             } else if !canWrite {
                 if editingMappingProfileID != nil && membershipCanUnlock {
                     Text(localization.text("button_mapping.save.read_only"))
                     Button(localization.text("button_mapping.save.membership")) {
                         selectedSection = .membership
-                        membershipFeature.refreshIfNeeded()
                     }.buttonStyle(.link)
                 } else if incompatible {
                     Text(localization.text("button_mapping.save.unsupported"))
@@ -3487,13 +3715,16 @@ struct SettingsView: View {
                     Divider()
                     mappingVoiceFnTapControl
                 }
-                // 触摸面（滑动箭头/光标）只有具备触摸面的遥控器才显示，页面请求之外再加一道能力门禁。
+                // 触摸面（滑动箭头/光标反馈）只有具备触摸面的遥控器才显示，页面请求之外再加一道能力门禁。
                 if TouchSurfaceControlApplicability.isApplicable(
                     capabilities: capabilities,
                     pageRequestsControl: includeSiriScrollArrow
                 ) {
                     Divider()
-                    siriRemoteScrollArrowControl
+                    HStack(alignment: .top, spacing: 28) {
+                        siriRemoteScrollArrowControl
+                        siriRemoteCursorFeedbackControl
+                    }
                 }
                 HStack {
                     Spacer(minLength: 0)
@@ -3504,18 +3735,55 @@ struct SettingsView: View {
     }
 
     private var siriRemoteScrollArrowControl: some View {
-        Toggle(isOn: $settings.siriRemoteScrollArrowReversed) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(localization.text("siri_remote.scroll_arrow.reverse.title"))
-                    .font(.system(size: 13, weight: .medium))
-                Text(localization.text("siri_remote.scroll_arrow.reverse.detail"))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        siriRemoteTouchToggle(
+            icon: "arrow.up.arrow.down",
+            titleKey: "siri_remote.scroll_arrow.reverse.title",
+            detailKey: "siri_remote.scroll_arrow.reverse.detail",
+            helpKey: "siri_remote.scroll_arrow.reverse.help",
+            isOn: $settings.siriRemoteScrollArrowReversed
+        )
+    }
+
+    private var siriRemoteCursorFeedbackControl: some View {
+        siriRemoteTouchToggle(
+            icon: "computermouse",
+            titleKey: "siri_remote.cursor_feedback.visible.title",
+            detailKey: "siri_remote.cursor_feedback.visible.detail",
+            helpKey: "siri_remote.cursor_feedback.visible.help",
+            isOn: Binding(
+                get: { settings.siriRemoteCursorFeedbackVisible },
+                set: { model.setSiriRemoteCursorFeedbackVisible($0) }
+            )
+        )
+    }
+
+    private func siriRemoteTouchToggle(
+        icon: String,
+        titleKey: String,
+        detailKey: String,
+        helpKey: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: isOn) {
+                Label {
+                    Text(localization.text(titleKey))
+                        .font(.system(size: 13, weight: .medium))
+                } icon: {
+                    Image(systemName: icon)
+                        .frame(width: 18, height: 18)
+                        .foregroundStyle(Color.accentColor)
+                }
             }
+            .toggleStyle(.switch)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(localization.text(helpKey))
+            Text(localization.text(detailKey))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .toggleStyle(.switch)
-        .help(localization.text("siri_remote.scroll_arrow.reverse.help"))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var mappingVoiceKeyModeControl: some View {
@@ -3754,6 +4022,11 @@ struct SettingsView: View {
         let status = model.remoteCardStatus(for: profile, history: history)
         let recovering = status == .connecting
         let appleNeedsEnable = profile.model.isAppleSiriRemote && model.siriRemoteActivationNeeded
+        let canRecoverVoice = !appleNeedsEnable && model.remoteCardCanRecoverAudio(
+            for: profile,
+            status: status,
+            history: history
+        )
         let level = connected ? model.batteryLevel(for: profile.id) : nil
         let power = connected ? model.powerState(for: profile.id) : nil
         return RemoteDeviceCard(
@@ -3768,8 +4041,13 @@ struct SettingsView: View {
                 && RemoteBatteryPresentationPolicy.shouldShowBattery(model: profile.model, level: level, powerState: power),
             enableTitle: appleNeedsEnable ? localization.text("siri_remote.activation.enable") : nil,
             membershipTitle: requiresSiriRemoteMembership(for: profile) ? localization.text("remote.card.open_membership") : nil,
+            voiceRecoveryTitle: canRecoverVoice ? localization.text("remote.card.recover_voice") : nil,
+            voiceRecoveryHelp: canRecoverVoice ? localization.text("remote.card.recover_voice.help") : nil,
             connectionTitle: history ? localization.text(recovering ? "connection.history.cancel" : "connection.history.connect") : nil,
             actionsDisabled: model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote,
+            voiceRecoveryDisabled: model.isStreaming
+                || model.activePhysicalVoiceControlSource == .siriRemote
+                || model.isRemoteVoiceRecoveryInFlight,
             connectionDisabled: !recovering && !model.canConnectRemoteProfile(profile.id),
             onSelect: {
                 model.noteManualRemoteProfileSelection()
@@ -3778,8 +4056,8 @@ struct SettingsView: View {
             onEnable: { model.activateSiriRemoteFromCard() },
             onMembership: {
                 selectedSection = .membership
-                membershipFeature.refreshIfNeeded()
             },
+            onRecoverVoice: { model.recoverRemoteVoiceAudio() },
             onConnect: {
                 if recovering { model.cancelRemoteConnection(profile.id) }
                 else { model.connectRemoteProfile(profile.id) }
@@ -3824,8 +4102,15 @@ struct SettingsView: View {
                 }
                 .font(.system(size: 12))
             case .unavailable:
-                HStack(spacing: 8) {
-                    Text(localization.text("button_mapping.save.unavailable")).foregroundStyle(.red)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(String(
+                        format: localization.text("button_mapping.binding.unavailable_detail"),
+                        baseMappingActionSummary(for: button, trigger: trigger)
+                    ))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                     if !isMappingProfilePreviewOnly {
                         Button(localization.text("button_mapping.binding.clear_override")) {
                             clearMappingOverride(button: button, trigger: trigger)
@@ -3840,7 +4125,8 @@ struct SettingsView: View {
 
     private func explicitProfileBindingLabel(_ value: MappingBindingDisplay) -> String {
         if value.configured?.action == .disabled {
-            return localization.text("button_mapping.action.profile_disabled")
+            // 方案里的 disabled 表示“本方案不设置动作”，不是禁用按键。
+            return localization.text("button_mapping.action.profile_not_set")
         }
         guard value.isEditable, let configured = value.configured else {
             return localization.text("button_mapping.save.read_only")
@@ -3883,6 +4169,59 @@ struct SettingsView: View {
             NoticeCenter.shared.show(Notice(tier: .error, title: title))
         }
         AppLogger.shared.write("BUTTON CONFIGURATION operation_id=\(operationID) action=clear_override phase=completed result=\(String(describing: outcome)) reason=\(outcome == .saved ? "storage_confirmed" : outcome == .unknown ? "reload_failed" : "storage_failed")")
+    }
+
+    /// 一次清除当前方案里所有引用失效的覆盖。单键失败不回滚已成功项，页面按剩余数量继续提示。
+    private func clearUnavailableProfileBindings(
+        _ bindings: [(button: RemoteButton, trigger: ButtonTrigger)]
+    ) {
+        guard let profile = editingMappingProfileID, !isMappingProfilePreviewOnly else { return }
+        let operationID = UUID().uuidString
+        AppLogger.shared.write(
+            "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                "action=clear_unavailable phase=requested result=requested count=\(bindings.count)"
+        )
+        var cleared = 0
+        for item in bindings {
+            if macroFeature.writeProfileBinding(
+                nil,
+                profile: profile,
+                button: item.button,
+                trigger: item.trigger,
+                displayName: nil
+            ) {
+                cleared += 1
+            }
+        }
+        let reloaded = macroFeature.reloadMappingProfiles()
+        guard reloaded else {
+            NoticeCenter.shared.show(Notice(
+                tier: .error,
+                title: String(
+                    format: localization.text("button_mapping.profile_unavailable.reload_failed"),
+                    cleared
+                )
+            ))
+            AppLogger.shared.write(
+                "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                    "action=clear_unavailable phase=completed result=unknown " +
+                    "reason=reload_failed cleared=\(cleared)"
+            )
+            return
+        }
+        let remaining = unavailableProfileBindings.count
+        let titleKey = remaining == 0
+            ? "button_mapping.profile_unavailable.cleared"
+            : "button_mapping.profile_unavailable.clear_failed"
+        NoticeCenter.shared.show(Notice(
+            tier: remaining == 0 ? .tip : .error,
+            title: String(format: localization.text(titleKey), cleared)
+        ))
+        AppLogger.shared.write(
+            "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                "action=clear_unavailable phase=completed result=" +
+                "\(remaining == 0 ? "cleared" : "partial") cleared=\(cleared) remaining=\(remaining)"
+        )
     }
 
     private func mappingTriggerEditor(
@@ -4037,8 +4376,7 @@ struct SettingsView: View {
         if let profile = editingMappingProfileID, macroFeature.supportsProfileButton(button.rawValue) {
             switch macroFeature.displayProfileHoldMode(profile: profile, button: button) {
             case let .explicit(mode): return mode
-            case .unavailable: return .once
-            case .inherited: break
+            case .unavailable, .inherited: break
             }
         }
         return settings.interactionSettings.mode(for: button) ?? .once
@@ -4054,8 +4392,7 @@ struct SettingsView: View {
         if let profileID, macroFeature.supportsProfileButton(button.rawValue) {
             switch macroFeature.displayProfileHoldMode(profile: profileID, button: button) {
             case let .explicit(value): mode = value
-            case .inherited: mode = settings.interactionSettings.mode(for: button)
-            case .unavailable: return localization.text("button_mapping.save.unavailable")
+            case .unavailable, .inherited: mode = settings.interactionSettings.mode(for: button)
             }
         } else { mode = settings.interactionSettings.mode(for: button) }
         guard let mode, mode != .once else {
@@ -4071,18 +4408,76 @@ struct SettingsView: View {
         case .repeatSingle, .once: "button_mapping.hold.repeat_prefix"
         }
         return localization.text(prefixKey) +
-            mappingHoldActionSummary(for: button, trigger: trigger)
+            mappingHoldActionSummary(for: button, trigger: trigger, profileID: profileID)
+    }
+
+    /// 方案页正在查看的方案可能与按键页正在编辑的方案不同。
+    /// 按住标签的模式和动作都必须按传入的方案解析。
+    private func profileHoldPresentation(
+        for button: RemoteButton,
+        profileID: UUID
+    ) -> ProfileHoldPresentation? {
+        ProfileHoldPresentationResolver.resolve(
+            button: button,
+            profileID: profileID,
+            profileMode: { profile, button in
+                macroFeature.displayProfileHoldMode(profile: profile, button: button)
+            },
+            baseMode: { button in
+                settings.interactionSettings.mode(for: button)
+            },
+            profileAction: { profile, button, trigger in
+                mappingConfiguration(for: button, trigger: trigger, profileID: profile)
+            },
+            baseAction: { button, trigger in
+                settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+            }
+        )
+    }
+
+    private func profileHoldSummary(for button: RemoteButton, profileID: UUID) -> String {
+        guard let presentation = profileHoldPresentation(for: button, profileID: profileID) else {
+            return ""
+        }
+        return presentation.summary(
+            actionSummary: { configured in
+                if configured.action == .disabled {
+                    return localization.text("button_mapping.action.profile_not_set")
+                }
+                return holdActionSummary(configured)
+            },
+            text: { localization.text($0) }
+        )
+    }
+
+    private func profileHoldMode(for button: RemoteButton, profileID: UUID) -> String? {
+        profileHoldPresentation(for: button, profileID: profileID)?.rawMode
     }
 
     /// 按住提示里的动作摘要：方向类动作统一用符号，不再随宽度在「方向左 / ←」之间摇摆。
     private func mappingHoldActionSummary(for button: RemoteButton, trigger: ButtonTrigger) -> String {
-        let configured = mappingConfiguration(for: button, trigger: trigger)
+        mappingHoldActionSummary(
+            for: button,
+            trigger: trigger,
+            profileID: editingMappingProfileID
+        )
+    }
+
+    private func mappingHoldActionSummary(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?
+    ) -> String {
+        holdActionSummary(mappingConfiguration(for: button, trigger: trigger, profileID: profileID))
+    }
+
+    private func holdActionSummary(_ configured: ConfiguredButtonAction) -> String {
         switch configured.action {
         case .arrowUp: return "↑"
         case .arrowDown: return "↓"
         case .arrowLeft: return "←"
         case .arrowRight: return "→"
-        default: return mappingActionSummary(for: button, trigger: trigger)
+        default: return actionSummary(configured)
         }
     }
 
@@ -4715,13 +5110,14 @@ struct SettingsView: View {
         selectedAction: ButtonAction,
         installedBundleIdentifiers: Set<String>,
         isManagedPowerAction: Bool,
+        showsCustomShortcutNavigation: Bool = true,
         onSelect: @escaping (ButtonAction) -> Void
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(localization.text(category.localizationKey))
                     .font(.system(size: 14, weight: .semibold))
-                if category == .basicKeys {
+                if category == .basicKeys, showsCustomShortcutNavigation {
                     Spacer(minLength: 8)
                     Button("button_mapping.action_filter.custom_shortcuts") {
                         applicationShortcutCaptureProfileID = nil
@@ -4898,7 +5294,6 @@ struct SettingsView: View {
             if !membershipFeature.canUseCommonPhrases {
                 membershipFeature.membershipRequiredView {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
                 .frame(minWidth: 170)
                 .accessibilityIdentifier("common-phrases-membership")
@@ -4909,7 +5304,6 @@ struct SettingsView: View {
                     selectedSection = .commonPhrases
                 } else {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
             } label: {
                 mappingActionLabel(
@@ -5147,7 +5541,18 @@ struct SettingsView: View {
     }
 
     private var applicationsPage: some View {
-        settingsPage {
+        applicationsPageContent
+            .sheet(isPresented: $isApplicationSchemeCreationPresented) {
+                applicationSchemeCreationSheet()
+            }
+    }
+
+    private var applicationsPageContent: some View {
+        if let profileID = applicationButtonSettingsProfileID,
+           let profile = settings.customApplicationProfile(id: profileID) {
+            return AnyView(applicationButtonSettingsPage(profile))
+        }
+        return AnyView(settingsPage {
             VStack(alignment: .leading, spacing: 6) {
                 PageHeader(title: localization.text("settings.section.applications"))
                 Text("custom_application.page.subtitle")
@@ -5166,7 +5571,7 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
             }
-        }
+        })
     }
 
     private var resolvedApplicationProfileID: UUID? {
@@ -5359,6 +5764,8 @@ struct SettingsView: View {
                     applicationSectionCard { scrollRegionEditor(profile) }
 
                     applicationSectionCard { applicationBindingSection(profile) }
+
+                    applicationSectionCard { applicationButtonSettingsEntry(profile) }
                 }
             }
         } else {
@@ -5366,6 +5773,598 @@ struct SettingsView: View {
                 Text("custom_application.not_configured")
                     .font(.system(size: 12))
                     .foregroundStyle(Color.accentColor)
+            }
+        }
+    }
+
+    private func applicationButtonSettingsEntry(_ profile: CustomApplicationProfile) -> some View {
+        let count = profile.buttonBindings?.count ?? 0
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("application_buttons.entry.title")
+                .font(.system(size: 14, weight: .semibold))
+            Text(String(format: localization.text("application_buttons.entry.summary"), count))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("application_buttons.entry.hint")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer(minLength: 0)
+                Button("application_buttons.entry.open") {
+                    applicationDetailProfileID = profile.id
+                    applicationButtonEditingTarget = nil
+                    applicationButtonActionFilter = .all
+                    applicationButtonSettingsProfileID = profile.id
+                }
+                .compatibilityButtonStyle(.prominent)
+            }
+        }
+    }
+
+    private func applicationSchemeSection(_ profile: CustomApplicationProfile) -> some View {
+        let profiles = macroFeature.mappingProfiles(device: settings.selectedRemoteProfileID)
+            .filter { !$0.isDefault }
+        let componentAvailable = !macroFeature.mappingProfiles(
+            device: settings.selectedRemoteProfileID
+        ).isEmpty
+        let current = profile.mappingProfileID.flatMap { id in
+            profiles.first { $0.id == id }
+        }
+        let assignedButUnavailable = profile.mappingProfileID != nil && current == nil
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("application_profile.section.title")
+                .font(.system(size: 14, weight: .semibold))
+            HStack(spacing: 12) {
+                Picker(selection: Binding(
+                    get: { profile.mappingProfileID },
+                    set: { selected in
+                        guard componentAvailable, selected != profile.mappingProfileID
+                        else { return }
+                        guard settings.setApplicationMappingProfileID(
+                            selected,
+                            applicationProfileID: profile.id
+                        ) else {
+                            applicationSchemeFeedback = localization.text(
+                                "application_profile.assign_failed"
+                            )
+                            return
+                        }
+                        applicationSchemeFeedback = nil
+                    }
+                )) {
+                    Text("application_profile.default").tag(nil as UUID?)
+                    if assignedButUnavailable, let mappingProfileID = profile.mappingProfileID {
+                        Text("application_profile.page.unavailable")
+                            .tag(Optional(mappingProfileID))
+                    }
+                    ForEach(profiles) { scheme in
+                        Text(scheme.name).tag(Optional(scheme.id))
+                    }
+                } label: {
+                    EmptyView()
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 180, maxWidth: 280, alignment: .leading)
+                .disabled(!componentAvailable)
+
+                Spacer(minLength: 0)
+
+                Button("application_profile.save_as_new") {
+                    applicationSchemeCreationTargetProfileID = profile.id
+                    applicationSchemeName = String(
+                        format: localization.text("application_profile.create.default_name"),
+                        profile.displayName
+                    )
+                    applicationSchemeFeedback = nil
+                    isApplicationSchemeCreationPresented = true
+                }
+                .compatibilityButtonStyle(.prominent)
+                .disabled(!componentAvailable)
+            }
+            Text(assignedButUnavailable
+                ? localization.text("application_profile.unavailable")
+                : current == nil
+                    ? localization.text("application_profile.default.detail")
+                    : localization.text("application_profile.assigned.detail"))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let current, profile.mappingProfileID != nil {
+                let shared = max(settings.applicationProfilesSharingMappingProfile(current.id) - 1, 0)
+                if shared > 0 {
+                    Text(String(format: localization.text("application_profile.shared"), shared))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !componentAvailable {
+                Text("application_profile.component_unavailable")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let feedback = applicationSchemeFeedback {
+                Text(feedback)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func applicationSchemeCreationSheet() -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("application_profile.create.title")
+                .font(.system(size: 16, weight: .semibold))
+            Text("application_profile.create.hint")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("application_profile.create.name", text: $applicationSchemeName)
+                .textFieldStyle(.roundedBorder)
+            if let feedback = applicationSchemeFeedback {
+                Text(feedback)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer(minLength: 0)
+                Button("application_profile.create.cancel") {
+                    isApplicationSchemeCreationPresented = false
+                    applicationSchemeFeedback = nil
+                }
+                .compatibilityButtonStyle(.standard)
+                Button("application_profile.create.save") {
+                    saveApplicationSchemeAsNew()
+                }
+                .compatibilityButtonStyle(.prominent)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+    }
+
+    private func saveApplicationSchemeAsNew() {
+        let trimmed = applicationSchemeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            applicationSchemeFeedback = localization.text("application_profile.create.invalid_name")
+            return
+        }
+        guard let targetID = applicationSchemeCreationTargetProfileID,
+              let target = settings.customApplicationProfile(id: targetID)
+        else {
+            applicationSchemeFeedback = localization.text("application_profile.create.failed")
+            return
+        }
+        let deviceID = settings.selectedRemoteProfileID
+        let targetOperations = ApplicationSchemeOperation.table { button, trigger in
+            settings.configuredAction(
+                for: button,
+                trigger: trigger,
+                profileID: deviceID,
+                applicationBundleIdentifier: target.bundleIdentifier
+            )
+        }
+        let candidates = macroFeature.mappingProfiles(device: deviceID)
+            .filter { !$0.isDefault }
+            .map { scheme in
+                (id: scheme.id, operations: ApplicationSchemeOperation.table { button, trigger in
+                    macroFeature.assignedApplicationBinding(
+                        mappingProfileID: scheme.id,
+                        device: deviceID,
+                        button: button,
+                        trigger: trigger
+                    ) ?? settings.configuredGlobalAction(
+                        for: button,
+                        trigger: trigger,
+                        profileID: deviceID
+                    )
+                })
+            }
+        // 只比较「按键 → 操作」。名称、方案 ID、APP 档案、绑定顺序和快捷键展示
+        // 文字都不参与，否则同一套配置会被重复保存成多个方案。
+        if let existingID = ApplicationSchemeMatcher.matchingSchemeID(
+            target: targetOperations,
+            candidates: candidates
+        ) {
+            _ = settings.setApplicationMappingProfileID(existingID, applicationProfileID: target.id)
+            _ = settings.clearApplicationButtonOverrides(
+                applicationProfileID: target.id,
+                buttons: Set(RemoteButton.profileScopeDisplayOrder)
+            )
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=reuse_existing scope=app result=success"
+            )
+            applicationSchemeFeedback = nil
+            isApplicationSchemeCreationPresented = false
+            return
+        }
+        var bindings: [UnifiedButtonBinding] = []
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ButtonTrigger.allCases {
+                let configured = settings.configuredAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: deviceID,
+                    applicationBundleIdentifier: target.bundleIdentifier
+                )
+                guard configured.action != .disabled else { continue }
+                bindings.append(UnifiedButtonBinding(
+                    remoteProfileID: nil,
+                    button: button,
+                    trigger: trigger,
+                    configured: configured
+                ))
+            }
+        }
+        guard let created = macroFeature.createMappingProfile(
+            named: trimmed,
+            copying: nil,
+            bindings: bindings,
+            holdModes: [:]
+        ) else {
+            applicationSchemeFeedback = localization.text("application_profile.create.failed")
+            return
+        }
+        _ = settings.setApplicationMappingProfileID(created, applicationProfileID: target.id)
+        // 菜单键与 TV 键不在键位方案的作用域内，只能保留为 APP 逐项覆盖。
+        _ = settings.clearApplicationButtonOverrides(
+            applicationProfileID: target.id,
+            buttons: Set(RemoteButton.profileScopeDisplayOrder)
+        )
+        _ = macroFeature.reloadMappingProfiles()
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT action=save_as_new scope=app result=success"
+        )
+        applicationSchemeFeedback = nil
+        isApplicationSchemeCreationPresented = false
+    }
+
+    private func applicationButtonSettingsPage(_ profile: CustomApplicationProfile) -> some View {
+        let reserved = Set(RemoteButton.allCases.filter {
+            !ApplicationButtonBindingScope.buttons.contains($0)
+        })
+        return settingsPage(
+            scrollTargetID: applicationButtonEditingTarget == nil ? nil : "application-button-editor",
+            scrollToken: applicationButtonEditingScrollRequest
+        ) {
+            HStack(spacing: 10) {
+                Button("application_buttons.back") {
+                    applicationButtonSettingsProfileID = nil
+                    applicationButtonEditingTarget = nil
+                    applicationButtonActionFilter = .all
+                    applicationButtonEditingScrollRequest = 0
+                }
+                .compatibilityButtonStyle(.standard)
+                .frame(minWidth: 72, minHeight: 44, alignment: .leading)
+                Text(String(format: localization.text("application_buttons.page.title"), profile.displayName))
+                    .font(.system(size: 24, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("application_buttons.page.subtitle")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                applicationSectionCard { applicationSchemeSection(profile) }
+
+                HStack(spacing: 10) {
+                    Text(String(format: localization.text("application_buttons.page.count"),
+                        profile.buttonBindings?.count ?? 0))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button("application_buttons.page.clear_all") {
+                        isApplicationButtonClearConfirmationPresented = true
+                    }
+                    .compatibilityButtonStyle(.standard)
+                    .disabled(profile.buttonBindings?.isEmpty ?? true)
+                }
+
+                if isApplicationButtonClearConfirmationPresented {
+                    GlassPanel {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("application_buttons.clear.title")
+                                .font(.system(size: 14, weight: .semibold))
+                            Text("application_buttons.clear.message")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack {
+                                Spacer(minLength: 0)
+                                Button("common.action.cancel") {
+                                    isApplicationButtonClearConfirmationPresented = false
+                                }
+                                .compatibilityButtonStyle(.standard)
+                                Button("application_buttons.clear.action") {
+                                    _ = settings.clearApplicationButtonOverrides(applicationProfileID: profile.id)
+                                    applicationButtonEditingTarget = nil
+                                    isApplicationButtonClearConfirmationPresented = false
+                                }
+                                .compatibilityButtonStyle(.prominent)
+                            }
+                        }
+                    }
+                }
+
+                GlassPanel {
+                    RemoteMappingCanvas(
+                        selectedButton: Binding(
+                            get: { applicationButtonEditingTarget?.button ?? .ok },
+                            set: { _ in }
+                        ),
+                        activeButtons: [],
+                        voiceActive: false,
+                        actionSummary: { button, trigger in
+                            applicationButtonSummary(profile, button: button, trigger: trigger)
+                        },
+                        holdSummary: { _ in "" },
+                        actionDetail: { button, trigger in
+                            applicationButtonDetail(profile, button: button, trigger: trigger)
+                        },
+                        onEdit: { button, trigger in
+                            applicationButtonEditingTarget = ShortcutEditingTarget(
+                                button: button,
+                                trigger: trigger
+                            )
+                            applicationButtonEditingScrollRequest &+= 1
+                        },
+                        onEditHold: { _ in },
+                        reservedButtons: reserved,
+                        hidesUnavailableCards: true
+                    )
+                }
+
+                if let target = applicationButtonEditingTarget {
+                    applicationButtonSettingsEditor(profile, target: target)
+                        .id("application-button-editor")
+                }
+            }
+        }
+    }
+
+    private func applicationButtonSummary(
+        _ profile: CustomApplicationProfile,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> String {
+        let status = localization.text("application_buttons.short.global")
+        if let configured = ApplicationButtonBindingResolver.override(
+            in: profile.buttonBindings,
+            button: button,
+            trigger: trigger
+        ) {
+            let action = configured.action == .disabled
+                ? localization.text("button_mapping.action.no_action")
+                : actionSummary(configured)
+            return "\(localization.text("application_buttons.short.app")) · \(action)"
+        }
+        return "\(status) · \(applicationButtonGlobalSummary(profile, button: button, trigger: trigger))"
+    }
+
+    private func applicationButtonGlobalSummary(
+        _ profile: CustomApplicationProfile,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> String {
+        let configured = settings.configuredAction(
+            for: button,
+            trigger: trigger,
+            profileID: settings.selectedRemoteProfileID,
+            applicationBundleIdentifier: profile.bundleIdentifier
+        )
+        guard configured.action != .disabled else {
+            let explicit = settings.hasExplicitBaseBinding(
+                for: button,
+                trigger: trigger,
+                profileID: settings.selectedRemoteProfileID
+            ) || settings.configuredActionOverride?(
+                settings.selectedRemoteProfileID,
+                button,
+                trigger
+            ) != nil
+                || settings.applicationAssignedProfileHasBinding(
+                    for: button,
+                    trigger: trigger,
+                    bundleIdentifier: profile.bundleIdentifier
+                )
+            return localization.text(explicit
+                ? "button_mapping.action.no_action"
+                : "button_mapping.action.not_set")
+        }
+        return actionSummary(configured)
+    }
+
+    private func applicationButtonDetail(
+        _ profile: CustomApplicationProfile,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> String {
+        if let configured = ApplicationButtonBindingResolver.override(
+            in: profile.buttonBindings,
+            button: button,
+            trigger: trigger
+        ) {
+            let action = configured.action == .disabled
+                ? localization.text("button_mapping.action.no_action")
+                : actionSummary(configured)
+            return "\(localization.text("application_buttons.editor.overridden")) · \(action)"
+        }
+        return "\(localization.text("application_buttons.editor.inherited")) · " +
+            applicationButtonGlobalSummary(profile, button: button, trigger: trigger)
+    }
+
+    private func applicationButtonSettingsEditor(
+        _ profile: CustomApplicationProfile,
+        target: ShortcutEditingTarget
+    ) -> some View {
+        let configured = ApplicationButtonBindingResolver.override(
+            in: profile.buttonBindings,
+            button: target.button,
+            trigger: target.trigger
+        ) ?? settings.configuredAction(
+            for: target.button,
+            trigger: target.trigger,
+            profileID: settings.selectedRemoteProfileID
+        )
+        let isOverridden = ApplicationButtonBindingResolver.hasOverride(
+            in: profile.buttonBindings,
+            button: target.button,
+            trigger: target.trigger
+        )
+        let installedBundleIdentifiers = PresetApplication.installedBundleIdentifiers
+        let actions = ButtonAction.pickerActions(
+            installedBundleIdentifiers: installedBundleIdentifiers,
+            current: configured.action,
+            experimentalContinuousRecordingEnabled: false
+        ).filter { $0 != .combinationAction }
+        return GlassPanel {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("\(target.button.displayName(using: localization)) · \(target.trigger.displayName(using: localization))")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text(isOverridden
+                            ? "application_buttons.editor.overridden"
+                            : "application_buttons.editor.inherited")
+                            .font(.system(size: 12))
+                            .foregroundStyle(isOverridden ? Color.accentColor : .secondary)
+                    }
+                    Spacer(minLength: 8)
+                    if isOverridden {
+                        Button("application_buttons.editor.restore") {
+                            _ = settings.setApplicationButtonOverride(
+                                nil,
+                                applicationProfileID: profile.id,
+                                button: target.button,
+                                trigger: target.trigger
+                            )
+                        }
+                        .compatibilityButtonStyle(.standard)
+                    }
+                    Button("button_mapping.action.no_action") {
+                        _ = settings.setApplicationButtonOverride(
+                            .disabled,
+                            applicationProfileID: profile.id,
+                            button: target.button,
+                            trigger: target.trigger
+                        )
+                    }
+                    .compatibilityButtonStyle(.standard)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(MappingActionFilter.visibleCases(macroFeatureVisible: false).filter {
+                            $0 != .hold && $0 != .buttonSpeed && $0 != .combinations &&
+                                $0 != .commonPhrases && $0 != .custom
+                        }) { filter in
+                            Button {
+                                applicationButtonActionFilter = filter
+                            } label: {
+                                Text(localization.text(filter.localizationKey))
+                                    .font(.system(size: 13, weight: applicationButtonActionFilter == filter ? .semibold : .medium))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 11)
+                                    .frame(minHeight: 28)
+                                    .foregroundStyle(applicationButtonActionFilter == filter
+                                        ? Color(nsColor: .alternateSelectedControlTextColor)
+                                        : Color.secondary)
+                                    .background(applicationButtonActionFilter == filter
+                                        ? Color.accentColor : Color.clear, in: Capsule())
+                                    .overlay {
+                                        Capsule().stroke(applicationButtonActionFilter == filter
+                                            ? Color.clear : Color.secondary.opacity(0.22))
+                                    }
+                                    .contentShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+
+                ForEach(ButtonActionCategory.allCases.filter(applicationButtonActionFilter.includes)) { category in
+                    let groupedActions = actions.filter {
+                        $0.category == category && $0 != .customShortcut && $0 != .focusInput &&
+                            $0 != .openCommonPhrases && $0 != .disabled && $0 != .openCustomApplication
+                    }
+                    if !groupedActions.isEmpty {
+                        mappingActionGroup(
+                            category: category,
+                            actions: groupedActions,
+                            selectedAction: configured.action,
+                            installedBundleIdentifiers: installedBundleIdentifiers,
+                            isManagedPowerAction: false,
+                            showsCustomShortcutNavigation: false
+                        ) { action in
+                            _ = settings.setApplicationButtonOverride(
+                                ConfiguredButtonAction(action: action, shortcut: nil),
+                                applicationProfileID: profile.id,
+                                button: target.button,
+                                trigger: target.trigger
+                            )
+                        }
+                    }
+                    if category == .customShortcuts,
+                       applicationButtonActionFilter == .customShortcuts || configured.action == .customShortcut {
+                        KeyboardShortcutPicker(shortcut: configured.shortcut) { shortcut in
+                            _ = settings.setApplicationButtonOverride(
+                                ConfiguredButtonAction(action: .customShortcut, shortcut: shortcut),
+                                applicationProfileID: profile.id,
+                                button: target.button,
+                                trigger: target.trigger
+                            )
+                        }
+                        .id("application-button-shortcut-\(target.id)")
+                    }
+                    if category == .applications,
+                       configured.action == .openCustomApplication || applicationButtonActionFilter == .applications {
+                        applicationButtonTargetPicker(profile, target: target, configured: configured)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applicationButtonTargetPicker(
+        _ profile: CustomApplicationProfile,
+        target: ShortcutEditingTarget,
+        configured: ConfiguredButtonAction
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("custom_application.target")
+                .font(.system(size: 14, weight: .semibold))
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 150), spacing: 8)],
+                alignment: .leading,
+                spacing: 8
+            ) {
+                ForEach(settings.customApplicationProfiles) { candidate in
+                    profileSelectionButton(
+                        candidate,
+                        selected: configured.applicationProfileID == candidate.id
+                    ) {
+                        _ = settings.setApplicationButtonOverride(
+                            ConfiguredButtonAction(
+                                action: .openCustomApplication,
+                                shortcut: nil,
+                                applicationProfileID: candidate.id
+                            ),
+                            applicationProfileID: profile.id,
+                            button: target.button,
+                            trigger: target.trigger
+                        )
+                    }
+                }
             }
         }
     }
@@ -6238,14 +7237,18 @@ struct SettingsView: View {
             case let .explicit(value):
                 if let configured = value.configured {
                     if configured.action == .disabled {
-                        return localization.text("button_mapping.action.profile_disabled")
+                        // 方案里的 disabled 是“未设置动作”，不是禁用按键。
+                        return localization.text("button_mapping.action.profile_not_set")
                     }
                     // 卡片宽度固定：显式动作只显示动作名，来源在编辑区头部
                     // 用「本方案 · <动作>」完整呈现，避免长动作名被前缀挤掉。
                     return profileActionSummary(configured)
                 }
                 return value.compact
-            case .unavailable: return localization.text("button_mapping.save.unavailable")
+            case .unavailable:
+                // 失效引用在执行路径回退基础映射；卡片显示实际会执行的动作，
+                // 由右上角警告图标和悬停详情说明来源，而不是让整格看起来不可用。
+                return baseMappingActionSummary(for: button, trigger: trigger)
             case .inherited:
                 // 窄卡片不拼接「默认 ·」文字前缀：英文会把动作名挤成
                 // 「Default · No…」。来源由卡片上的链接图标和悬停帮助表达。
@@ -6288,6 +7291,14 @@ struct SettingsView: View {
         )
     }
 
+    /// 失效引用显示的虽然是可执行的基础动作，但来源仍是警告态，不能和显式配置同样使用主题色。
+    private func mappingActionIsConfigured(for button: RemoteButton, trigger: ButtonTrigger) -> Bool {
+        if case .unavailable = mappingDisplayConfiguration(for: button, trigger: trigger) {
+            return false
+        }
+        return mappingConfiguration(for: button, trigger: trigger).action != .disabled
+    }
+
     /// 悬停用的完整形态，和 `mappingActionSummary` 同一来源。
     private func mappingActionSource(for button: RemoteButton,
                                      trigger: ButtonTrigger) -> RemoteMappingActionSource {
@@ -6311,6 +7322,9 @@ struct SettingsView: View {
                     baseMappingActionSummary(for: button, trigger: trigger)
             case let .explicit(value):
                 guard let configured = value.configured else { return value.detailed }
+                if configured.action == .disabled {
+                    return localization.text("button_mapping.action.profile_not_set")
+                }
                 let summary = profileActionSummary(configured)
                 let source = String(
                     format: localization.text("button_mapping.source.profile"),
@@ -6319,7 +7333,10 @@ struct SettingsView: View {
                 return value.detailed.isEmpty || value.detailed == summary
                     ? source : source + " · " + value.detailed
             case .unavailable:
-                return localization.text("button_mapping.save.unavailable")
+                return String(
+                    format: localization.text("button_mapping.binding.unavailable_detail"),
+                    baseMappingActionSummary(for: button, trigger: trigger)
+                )
             }
         }
         if case let .explicit(value) = display {

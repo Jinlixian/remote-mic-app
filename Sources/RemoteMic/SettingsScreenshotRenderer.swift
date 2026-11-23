@@ -1,5 +1,8 @@
 import AppKit
 import SwiftUI
+#if canImport(SayAllButtonProfiles)
+import SayAllButtonProfiles
+#endif
 
 @MainActor
 enum SettingsScreenshotRenderer {
@@ -107,6 +110,15 @@ enum SettingsScreenshotRenderer {
         ] == "1"
         let onlySection = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_SECTION"]
         let interactive = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_INTERACTIVE"] == "1"
+        let showsApplicationButtons = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTONS"
+        ] == "1"
+        let opensApplicationButtonEditor = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_EDITOR"
+        ] == "1"
+        let showsApplicationButtonClearConfirmation = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTON_CLEAR"
+        ] == "1"
         let mappingScenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_MAPPING_SCENARIO"]
         let membershipAccess = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_MEMBERSHIP_ACCESS"
@@ -163,11 +175,19 @@ enum SettingsScreenshotRenderer {
                 bundleIdentifier: "com.apple.Safari",
                 applicationPath: "/Applications/Does Not Exist.app"
             ))
-            settings.addCustomApplicationProfile(CustomApplicationProfile(
+            let finderID = settings.addCustomApplicationProfile(CustomApplicationProfile(
                 displayName: "Finder",
                 bundleIdentifier: "com.apple.finder",
                 applicationPath: "/Applications/Does Not Exist.app"
             ))
+            if showsApplicationButtons {
+                _ = settings.setApplicationButtonOverride(
+                    ConfiguredButtonAction(action: .commandCopy, shortcut: nil),
+                    applicationProfileID: finderID,
+                    button: .ok,
+                    trigger: .singleClick
+                )
+            }
         }
         if ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_MISSING_ROUTINE"] == "1" {
             // Isolated upgrade fixture for the production cleanup page.
@@ -346,6 +366,54 @@ enum SettingsScreenshotRenderer {
                     copying: nil, bindings: [binding], holdModes: [RemoteButton.ok.rawValue: "once"])
             }
             if mappingScenario == "viewer" { model.macroFeature.updateButtonProfilesAccess(.requiresPlus) }
+            #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+            if mappingScenario == "unavailable" {
+                let device = settings.selectedRemoteProfileID
+                settings.setBaseBinding(
+                    ConfiguredButtonAction(action: .pageUp, shortcut: nil),
+                    for: .up,
+                    trigger: .singleClick,
+                    profileID: device
+                )
+                settings.setBaseBinding(
+                    ConfiguredButtonAction(action: .pageDown, shortcut: nil),
+                    for: .down,
+                    trigger: .singleClick,
+                    profileID: device
+                )
+                let profileID = model.macroFeature.createMappingProfile(
+                    named: language == .english ? "Missing References" : "引用失效",
+                    copying: nil,
+                    bindings: [
+                        .init(
+                            remoteProfileID: nil,
+                            button: .ok,
+                            trigger: .singleClick,
+                            configured: .init(action: .commandCopy, shortcut: nil)
+                        )
+                    ],
+                    holdModes: [:]
+                )
+                if let profileID {
+                    // Both cells point at a shortcut ID that is deliberately absent from
+                    // this isolated fixture. The production view must show the base
+                    // fallback and the repair banner, not a dead "configuration unavailable".
+                    model.macroFeature.setRawProfileBinding(
+                        .shortcut(profileKey: "shortcut.screenshot-missing"),
+                        profile: profileID,
+                        button: .up,
+                        trigger: .singleClick
+                    )
+                    model.macroFeature.setRawProfileBinding(
+                        .shortcut(profileKey: "shortcut.screenshot-missing"),
+                        profile: profileID,
+                        button: .down,
+                        trigger: .singleClick
+                    )
+                    seededProfileID = profileID
+                }
+            }
+            #endif
         }
         if membershipAccess == "allowed" {
             model.membershipFeature.applyScreenshotState(isFeatureVisible: true, accessDecision: .allowed(validUntil: .distantFuture))
@@ -411,6 +479,10 @@ enum SettingsScreenshotRenderer {
                 initialMappingActionFilter: initialActionFilter,
                 initialMappingScrollsToGestureTiming: section == .mapping && showsGestureTiming,
                 initialMappingVoiceSettingsPresented: section == .mapping && opensVoiceSettings,
+                initialApplicationButtonSettingsProfileID: showsApplicationButtons
+                    ? settings.customApplicationProfiles.last?.id : nil,
+                initialApplicationButtonEditingButton: opensApplicationButtonEditor ? .ok : nil,
+                initialApplicationButtonClearConfirmationPresented: showsApplicationButtonClearConfirmation,
                 supplementalSettings: supplementalSettings,
                 sidebarAccountDisplayName: sidebarAccountDisplayName
             ).environmentObject(localization).noticeHost())
@@ -454,6 +526,10 @@ enum SettingsScreenshotRenderer {
                 initialMappingActionFilter: initialActionFilter,
                 initialMappingScrollsToGestureTiming: section == .mapping && showsGestureTiming,
                 initialMappingVoiceSettingsPresented: section == .mapping && opensVoiceSettings,
+                initialApplicationButtonSettingsProfileID: showsApplicationButtons
+                    ? settings.customApplicationProfiles.last?.id : nil,
+                initialApplicationButtonEditingButton: opensApplicationButtonEditor ? .ok : nil,
+                initialApplicationButtonClearConfirmationPresented: showsApplicationButtonClearConfirmation,
                 supplementalSettings: supplementalSettings,
                 sidebarAccountDisplayName: sidebarAccountDisplayName,
                 minimumContentSize: .zero
@@ -539,6 +615,12 @@ enum SettingsScreenshotRenderer {
                 dismissal: .manual,
                 position: .bottom,
                 dismissible: false
+            ))
+        case "common-phrase-input-unavailable":
+            NoticeCenter.shared.show(Notice(
+                tier: .error,
+                title: localization.text("common_phrases.error.input_unavailable"),
+                dismissal: .manual
             ))
         default:
             return

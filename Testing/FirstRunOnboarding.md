@@ -2,6 +2,135 @@
 
 > 执行本手册或修改 Onboarding 前，先完整阅读跨平台产品规范 [`feature/first-run-onboarding/PRODUCT_SPEC.md`](../feature/first-run-onboarding/PRODUCT_SPEC.md) 和 [macOS 平台适配](../feature/first-run-onboarding/platform-macos.md)。未来 Windows 测试应从同一产品规范出发，并使用 [Windows 平台适配](../feature/first-run-onboarding/platform-windows.md) 建立独立测试手册。
 
+## 连接页右栏去重、遥控器放大、配对动画与文案收紧（2026-11-20）
+
+适用版本为包含本修改的 `main` 或对应候选；验证分支为 `codex/onboarding-remote-pairing-animation-ui-20261121`。影响分类为局部 UI 与文案变化：连接页右栏移除与左栏重复的连接检查面板；小米实体遥控器图在 `1020 × 772` 窗口内由 `190 × 285 pt` 放大到 `300 × 450 pt`，苹果遥控器图由 `1.8× / 190 × 360 pt` 放大到 `2.5× / 300 × 450 pt`；小米遥控器尚未连接时 Home 与 Menu 同步呼吸，苹果遥控器尚未连接时返回与音量加同步呼吸；连接页文案去掉末尾句号。步骤顺序、连接判定、普通按键门禁、音频、持久化和语音键生命周期均不变。
+
+### 验证步骤
+
+1. 使用生产离屏入口生成中文、英文、浅色和深色的 `04-remote.png`，分别覆盖 `xiaomi_remote` 与 `siri_remote`。预期：右栏底部不再出现“连接检查”面板，左栏状态卡仍然显示连接和按键结果。
+2. 分别选择小米蓝牙遥控器 2 Pro 和小米蓝牙遥控器 2。预期：两者都显示唤醒和 Home + Menu 两步；2 Pro 的唤醒步骤为“长按 TV 键约 2 秒，直到遥控器底部白灯开始闪烁”，小米蓝牙遥控器 2 的唤醒步骤只保留“长按 TV 键约 2 秒”，不出现白灯提示。型号未知时同样使用不带白灯的短唤醒文案。
+3. 检查右栏遥控器图。预期：小米和苹果遥控器都明显大于修改前，完整落在 `1020 × 772` 内容区内，不被裁切，底部留白不挤压左栏或底部导航。
+4. 在未连接状态进入两种小米连接页。预期：Home 与 Menu 两颗键同时出现同相位高亮并持续呼吸；高亮中心与按键中心重合。RC001 与 RC003 都必须显示动画。
+5. 在未连接状态进入苹果遥控器连接页。预期：返回与音量加两颗键同时出现同相位高亮并持续呼吸；高亮中心与按键中心重合，不得亮到音量减、TV 或播放键。
+6. 开启“减弱动态效果”后重新进入连接页。预期：两组高亮都保留静态显示，不播放呼吸动画。
+7. 连接所选遥控器并收到普通按键。预期：配对高亮停止，左栏状态卡继续按原门禁更新。
+8. 检查连接页所有静态文案和状态说明。预期：末尾不加句号；内部句子标点保留。苹果遥控器第 5 步写“名称可能是一串序列号或‘蓝牙设备’”。
+9. 在 `1020 × 772` 和更大的窗口尺寸分别检查两种遥控器。预期：遥控器图保持居中，高亮始终贴合按键；窗口放大或缩小时不得出现圆环漂移。
+10. 依次进入权限、音频、语音测试和普通按键页。预期：这些页面的右栏检查面板不受本次修改影响。
+11. 切换到 iPhone / Apple Watch 或 Web 远程控制方式并进入连接页。预期：右栏同样不再重复连接检查，二维码、会员入口和原有状态卡不被裁切。
+
+失败判定：右栏仍显示“连接检查”或两项检查；小米蓝牙遥控器 2 仍显示白灯步骤，或它的唤醒步骤被整条删除；遥控器仍为旧尺寸、被裁切或挤压导航；动画只覆盖一颗键、位置偏移、窗口缩放后漂移或连接后仍继续播放；减弱动态效果下仍播放动画；连接页文案仍以句号结尾；其他页面的右栏面板被误删；iPhone / Web 连接页出现空白面板或布局跳动，均判定失败。
+
+验证边界：离屏截图只能证明静态布局、文案和高亮位置。真实窗口中的动画流畅度、减弱动态效果、真实 RC001 / RC003 / Apple Remote 连接、普通按键观察以及 iPhone / Web 连接仍须现场验收。本轮公开构建不包含 iPhone / Web 控制来源，未生成这两条路径的截图；苹果遥控器截图使用本地私有源码包构建，公开构建不编译该分支。另发现苹果遥控器英文五步卡在默认 `1020 × 772` 下会把“打开蓝牙设置”推到滚动区底部并部分裁切；这是左栏既有布局，去掉句号后仍未完全消除，未在本轮修改。
+
+### 本轮结果
+
+- 公开构建 `swift build --disable-keychain`：通过。
+- 设置 `SAYALL_SIRI_REMOTE_PACKAGE_PATH` 的苹果遥控器构建：通过。
+- `swift test --disable-keychain --filter OnboardingFlowTests`：124 项通过，包含 RC001 / RC003 唤醒文案差异和连接页末尾句号检查。
+- `swift test --disable-keychain --filter LocalizationTests`：10 项通过，四组去句号文案的中英文资源与测试期望一致。
+- 生产离屏入口生成 RC003 四张、RC001 一张、苹果遥控器四张，另用临时 `1400 × 1000` 内容尺寸生成小米和苹果遥控器各一张缩放核对图；全部为 PNG，默认窗口图 `2040 × 1600`，缩放核对图 `2800 × 2056`。逐张查看确认右栏检查面板已移除、遥控器放大、高亮同相位且中心落在按键本体上，默认尺寸和大窗口下位置一致。
+- RC003 四张按中文浅色、中文深色、英文浅色、英文深色顺序的 SHA-256 为 `96e7dec03d97c0bd6f3d6cc14b59039c1aabc89ff56e8c84c51e58d7da8945b1`、`5646fc3ca5758447f431012b1909dcc71bc7719707d477264a7a0f2e701ac7b9`、`9e688873a57893c054ba7c5b91b6efce0f02b91afdf98d144de87b18df2bc81d`、`4b8e30fc671971ae32326d189bc1e303247455becc58bacae27892abc54e9ae0`；RC001 核对图为 `c9c878b10863f55c57044850171d3cbba40f23501b692c93e14772835ebb7359`。
+- 苹果遥控器四张按同一顺序的 SHA-256 为 `64abc5ac95173ac16d6bc083b6224843dc1903419c88234eb2d4fd7bd4f538bc`、`9ecf2a2227e53c76ff4def9b6c3e22ad55b3dd1ccbe7fec3ed6324a48c280046`、`5f6ccdedbc4f8e113055fed67efd097a7a42f24890f4938b5e6c8882fd90abb8`、`61223ecc0264a1277a316205024e5d82b88e885b49e8608866a7c51794c729a6`。
+- 缩放核对图 SHA-256 为小米 `ecdc073df0526934a3a161a158b071de3e3bc65a019464c868151d7796f59bc8`、苹果 `0e29d86b7cdcb40cfae7cb7ffbb404ed7b24466dbe57bea10b89a5101cd090d1`。原始字节保存在仓库外目录 `/Users/andy/SayAllEvidence/onboarding-remote-pairing-animation-20261120/`，索引见 [`Screenshots/2026-11-20-onboarding-remote-pairing-animation/manifest.json`](../Screenshots/2026-11-20-onboarding-remote-pairing-animation/manifest.json)。
+- 动画在连接成功后的停止、真实窗口流畅度、减弱动态效果、苹果遥控器英文五步卡的既有裁切、iPhone / Web 连接页布局和真实遥控器现场均未在本轮验证。
+
+## 语音测试松键结束判定修复（2026-11-19）
+
+适用版本为包含本修改的 `main` 或对应候选；验证分支为 `fix/onboarding-voice-test-end-20261119`。影响分类为 Onboarding 流程行为变化：`voiceTest` 松键后必须结束本次尝试并进入文字等待，不改变页面布局、文案或音频链路。
+
+### 自动化与构建
+
+- `./scripts/test.sh`：通过，`RESULT passed=50 failed=0`；新增的语音流策略断言通过，应用 `swift build --disable-keychain` 成功。
+- `xcrun swift test --disable-keychain --filter OnboardingFlowTests`：本机仅安装 Command Line Tools，缺少完整 XCTest 和 Testing/Foundation cross-import overlay，未能运行；该用例由 CI 执行。
+- `SAYALL_PRIVATE_PLATFORM_MODE=public ./scripts/build-app.sh`：通过（`Build complete! (163.34s)`，`SANITIZE RELEASE PATHS result=passed`，ad-hoc 签名）。
+- CI：Public Swift tests and dual-architecture build、Apple Silicon、Intel Ventura、Repository governance 全部通过。运行：https://github.com/HD838A/remote-mic-app/actions/runs/44472820670
+- 回归覆盖点：`isStreaming=false` 且来源已清空时仍执行 `endVoiceAttempt()`；开始语音仍要求来源被接受；未开始的松键事件不产生动作。
+
+### 生产页面检查与截图
+
+- 本修复不改变静态布局，但属于 Onboarding 流程行为变化。按门禁仍需覆盖 `voiceTest` 页面的完成流程截图（中英文、浅色/深色），并在 PR 附件或持久链接提供。
+- 在截图和真机验收补齐前，PR 保持 Draft，不标记 Ready。
+
+### 真实设备验收
+
+- 使用小米 RC003 或 RC001、`MiRemoteV 2ch` 和微信输入法完成一次真实语音测试。
+- 预期：松键后侧边“语音键已按下并松开”完成，外部工具文字出现，页面允许进入 `controls`。
+- 失败判定：日志仍显示 `ONBOARDING TRANSCRIPT_TARGET ... phase=recording`，或侧边第一项不完成，或应用不进入文字等待。
+- 2026-11-19 实测（Build 176）：attempt 1 通过，`audio_received/scheduled/played=20400`，`focus_loss_count=0`，`transcript_wait_ms=728`；随后 `controls` 和 `complete` 通过，Onboarding 完成。该构建使用与 PR 相同行为修复的最小补丁；策略重构由 CI 覆盖。
+- 2026-11-21 已合入 `main`（合并提交 `08e0dae5`）。独立 build 413 在 RC003 上复验通过，证据见该 Bug 记录。
+
+### 验证边界
+
+- 单元测试只证明状态转换策略；真实遥控器信号、微信输入法上屏时机、权限变化和完整 Onboarding 旅程仍需真机验收。
+- 模拟事件、单元测试和构建不能替代真实遥控器与第三方输入法的文字上屏证据。
+
+## 小米 HID 先到的验证（2026-11-21）
+
+在系统蓝牙完成配对后，先按确定或方向键，再等待 BLE 语音链路握手。选中的型号确认后，向导应能将已收集的普通按键计入当前遥控器，并继续到音频设置。同型号的另一只遥控器、无法确认身份的报告和语音键都不能代替这一枚按键。RC001 和 RC003 分别验证首次配对及重跑向导。档案登记、迁移和映射保留由公开自动化覆盖，真实配对和向导旅程待验收。
+
+## 小米遥控器型号拆分与输入法指引更新（2026-11-18）
+
+适用版本为包含本修改的 `main` 或对应候选；验证分支为 `codex/onboarding-remote-models-20261118`。影响分类为控制来源选择、能力门禁、共享布局和工具页右栏内容变化。
+
+### 控制设备页
+
+1. 使用同时包含小米和苹果遥控器支持的构建进入控制设备页。预期：实体遥控器顺序为小米蓝牙遥控器 2 Pro、小米蓝牙遥控器 2、苹果遥控器 Type-C、苹果遥控器 Lightning。
+2. 公开构建（无苹果遥控器 Package）预期只显示前两张小米卡片。
+3. 在 `1020 × 772` 窗口检查中文、英文、浅色和深色。预期：4 行卡片、“更多控制方式”和“继续”均在首屏可见，左栏不依赖内部滚动；型号名称保持单行；中文最终字号不小于 12pt。
+4. 逐张点击 4 张卡片。预期：选中态、右栏真机图和连接页目标同步切换；不会因为另一只遥控器已连接而显示错误的已连接状态。
+5. 未选择小米型号时“继续”不可用。选择任一小米型号或苹果型号后可以继续。
+
+### RC003 已连接、选择 RC001
+
+1. 先让 RC003 连接并完成至少一次普通按键。保持 RC003 在线。
+2. 如果 RC001 已配对但未连接，在控制设备页选择“小米蓝牙遥控器 2”，进入连接页。
+3. 预期：连接页显示“正在查找小米蓝牙遥控器 2”，右栏显示 RC001 真机图；App 对 RC001 档案发起定向连接，而不是把 RC003 的已连接状态当成 RC001。
+4. 唤醒 RC001 并按普通键。预期：无需重启 App，RC001 连接并识别为小米蓝牙遥控器 2；普通按键只计入所选型号。
+5. 反向执行：RC001 已连接时选择 RC003，预期相同。
+6. 两只同时连接后切换卡片。预期：普通按键、语音和完成门禁只接受所选型号；按另一只的普通键或语音键不计数、不点亮成功状态，也不把选择切走。
+7. 如果新遥控器的档案型号尚未识别，第一份普通按键可显示“正在识别遥控器型号”。预期：型号确认前不能通过；确认是所选型号后继续，确认是另一型号时要求重新唤醒正确遥控器。
+
+### 语音与恢复
+
+1. RC001 和 RC003 分别完成一次真实语音文字上屏。预期：首字、尾字完整，正常松键不丢尾音，语音键生命周期不变。
+2. 覆盖极速按下/释放、连续两次会话、录音中断连并重连。预期：每次会话独立，异常中断有明确终态。
+3. 按另一只已识别小米遥控器的语音键。预期：不进入当前语音会话、不触发输入法、不点亮成功状态，日志记录脱敏的型号不匹配原因。
+4. 返回、退出续接、从关于页重跑。预期：型号选择保存和恢复正确，旧语音配置、音频设备和按键映射不被清除。
+
+### 输入工具右栏
+
+1. 选择豆包输入法，点击第 2 步。预期：显示新的豆包语音输入设置截图，麦克风为 SayAll；英文说明不再写 MiRemoteV 2ch。
+2. 选择微信输入法，点击第 2 步。预期：显示新的微信输入法语音输入设置截图，包含快捷键和麦克风 SayAll；英文说明与图一致。
+3. 点击第 4 步。预期：同一页上下显示微信 App 和飞书 App 两个截图块，标签分别为“微信 App / WeChat”和“飞书 App / Feishu”；两张图都能点击放大。
+4. 只点击第 4 步一次即算完成该步骤；继续按钮仍要求 4 个步骤全部查看。
+5. 中文、英文、浅色、深色分别检查右栏滚动、放大层、标签和说明文字，不得裁切或出现未翻译键名。
+
+### 截图入口
+
+- 控制来源页：`REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote`，用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL=rc001|rc003` 选择预置型号；新增 `REMOTE_MIC_ONBOARDING_SCREENSHOT_XIAOMI_MODEL=none` 可生成未选择型号的状态。
+- 工具页：`REMOTE_MIC_ONBOARDING_SCREENSHOT_VOICE_TOOL=doubao|weixin`，`REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_STEP=1|3` 分别查看第 2 步和第 4 步。
+- 语言和外观：`REMOTE_MIC_ONBOARDING_SCREENSHOT_LANGUAGE=zh-Hans|en`、`REMOTE_MIC_ONBOARDING_SCREENSHOT_APPEARANCE=light|dark`。
+- 检查 PNG 格式、尺寸和 SHA-256；截图字节保存在仓库外持久目录，仓库只保留索引。
+
+### 失败判定
+
+- 仍显示合并的“小米蓝牙遥控器 2 / 2 Pro”卡片。
+- 4 张卡顺序错误，或 `1020 × 772` 首屏需要滚动才能看到“继续”。
+- 选择 RC001 后仍以 RC003 的连接、按键或语音通过。
+- RC003 已连接时无法发起 RC001 连接，或必须重启 App。
+- 按错遥控器仍点亮连接、按键或语音成功状态。
+- 第 4 步只显示微信，或飞书截图无法放大、被裁切。
+- 豆包/微信第 2 步仍显示旧截图，或英文说明与图不一致。
+- 语音键生命周期、首字、尾字、连续会话或异常恢复出现回退。
+
+### 验证边界
+
+自动化覆盖卡片顺序、型号持久化、控制来源门禁、事件归属纯策略、右栏分组资源和放大层状态。离屏截图只证明静态布局和文案；真实 RC001/RC003 连接、HID/ATVV 事件、第三方输入法文字上屏和飞书写字板设置仍须实机验收。
+
+本轮结果（2026-11-18）：公开模式 `swift build --disable-keychain` 通过；`OnboardingFlowTests` 119 项、`LocalizationTests` 10 项通过；完整 `swift test --disable-keychain` 1522 项 / 112 个 suite 通过。生产离屏入口生成 17 张证据图（PNG，2040 × 1600），覆盖 RC001/RC003 选中态、公开 2 卡与完整 4 卡布局、连接页状态、豆包/微信第 2 步和第 4 步微信 + 飞书分组，中文/英文/浅色/深色；逐张查看确认无文字裁切、无重叠、4 卡顺序正确、RC001 与 RC003 右栏真机图不同且与选中型号一致。索引见 [`Screenshots/2026-11-18-onboarding-remote-models/manifest.json`](../Screenshots/2026-11-18-onboarding-remote-models/manifest.json)，原始字节保存在仓库外持久目录，PR 附件待上传。真实 RC003 已连接时连接 RC001、双设备切换、按错遥控器拒绝和两型号语音文字上屏仍未在本轮完成，不能以静态截图替代。
+
 ## 欢迎页隐藏 AI 配置提示入口（2026-11-15）
 
 适用版本为包含本修改的 `main` 或对应候选；验证分支为 `codex/hide-onboarding-ai-prompt-20261115`。本次只隐藏欢迎页底部的“让 AI 工具帮我配置”按钮，不改无屏配置命令、提示词生成逻辑、步骤顺序、完成门禁、持久化或语音链路。影响分类为局部 UI 变化。
@@ -79,6 +208,33 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 验证范围：自动化覆盖恢复状态、生产控件及门禁；截图覆盖本次新增状态的中英文、浅色与深色。实际系统授权、两代苹果遥控器及第三方文字上屏仍须由签名候选包完成，不能用离屏截图替代。日志收集沿用本手册入口；只记录状态、计数与原因码，不记录语音和文字内容。
 
 本轮结果：公开宿主 1040 项全量测试、Siri 编译开关下的 120 项定向测试通过。私有 Siri Remote Package 的 105 项测试通过。四组生产离屏截图各 9 张，均为 PNG、2040 × 1600，并逐张查看授权待处理的语音测试页。四张页面证据保存在 [`Screenshots/onboarding-siri-authorization-recovery/`](../Screenshots/onboarding-siri-authorization-recovery/)。输入框旁保留“复制诊断”操作。现场重新选择苹果遥控器并授权后已有文字，可以继续；该结果证明现有准备接口可恢复，不是新候选包的真机验收。真实系统授权保存失败的底层原因、不同遥控器代际和第三方工具仍待签名候选包验收。
+
+## 苹果遥控器语音测试组件缺失（2026-11-18）
+
+适用范围：Installer 收据仍存在，但本机 Siri Remote helper / LaunchDaemon 未安装的升级或自定义安装环境。
+
+测试前准备：
+
+1. 使用隔离测试机或虚拟机制造“App 已安装、Installer 收据存在、Siri Remote 系统组件缺失”的状态；不要手工删除用户机器的系统文件。
+2. 准备真实 A2854 或 A2540 遥控器、受支持虚拟音频设备和语音工具。
+3. 打开 `~/Library/Logs/RemoteMic/runtime.log`。
+
+操作步骤：
+
+1. 进入苹果遥控器语音测试页。预期：输入框旁显示“Siri Remote 组件未安装”和“安装组件”，不得显示“重新授权”。
+2. 点击“安装组件”。预期：请求一次管理员授权；安装期间不能显示已收音或通过。
+3. 在管理员授权窗口点击取消。预期：页面保留“安装组件”，不会自动重复弹窗，也不会误报为普通授权失败。
+4. 再次点击“安装组件”并允许授权。预期：系统 helper 和 LaunchDaemon 安装完成；页面离开组件缺失状态，随后才按真实授权、音频和文字门禁判断结果。
+5. 在已安装组件的环境重新进入语音测试页。预期：不再显示“安装组件”；授权待处理时仍显示“重新授权”。
+6. 使用已安装组件的苹果遥控器完成一次真实语音文字测试，并回归小米遥控器、手机或网页来源。预期：这些来源不出现组件安装入口，首字、尾字、连续会话和返回恢复保持原行为。
+
+失败判定：组件缺失仍显示“重新授权”、点击安装没有管理员授权、取消后入口消失、安装成功但仍显示组件缺失、未安装却显示已就绪、安装入口出现在非苹果遥控器来源，或真实语音文字未完成却被标记通过。
+
+验证范围：自动化覆盖失败原因优先级、恢复控件和生产门禁；离屏截图只证明静态 UI。真实管理员授权、SMJobBless、LaunchDaemon 状态、两代遥控器和第三方文字上屏必须由签名候选包人工验收，不能用单元测试或截图替代。
+
+日志重点核对：`APPLE REMOTE COMPONENT_INSTALL phase=requested action=install source=onboarding`、语音结果原因码 `voice.component_missing`，以及 `SIRI REMOTE COMPONENT state trigger=startup|status|onboarding_voice_test`。该状态行只包含 `build_supported`、`installer_receipt_present`、`helper_present`、`launch_daemon_present`、`component_installed`、`enabled`、`needs_user_action` 和 `audio_status`；用户复制的诊断摘要包含同一组脱敏字段。无需让用户执行 `test -x` 或检查系统路径，直接用上述日志字段判断组件是否安装。日志不得包含设备身份、用户内容、路径或凭据。
+
+本轮结果：`SAYALL_PRIVATE_PLATFORM_MODE=public swift test --disable-keychain --filter OnboardingFlowTests` 通过 114 项；增加 `SAYALL_SIRI_REMOTE_ENABLED` 编译开关后，`OnboardingFlowTests`、`SiriRemoteActivationTests`、`LocalizationTests` 与 `AppleRemoteComponentInstallationTests` 共 133 项通过。中英文浅色、深色各生成一组生产离屏截图，`07-voice-test.png` 均为 PNG、2040 × 1600；逐张查看确认显示“Siri Remote 组件未安装”和“安装组件”，没有“重新授权”，按钮、复制诊断与底部导航未裁切。四张截图的 SHA-256 分别为 `1db4c8c9cfe1b53342b7a3fb67441b771923bc5366af6017dea5dfc79f7621df`（中文浅色）、`fc3eaa6ec75d780c7178bf9bb38424690ca13fc93251997273f152bd88fa839f`（中文深色）、`1be21086673e4ed19e92d1fb7c9e0031c18a8182eb2ea5c0964ca2ab8fca43f7`（英文浅色）、`db13dedbcb49847d7e9b8ae57618fed02f5b53007aacc6ea1e20b20ed8b84b31`（英文深色），原始文件保存在仓库外 `/Users/andy/Develop/Src/AISrc/.screenshot-workdir/onboarding-siri-component-missing-20261118/`。真实管理员授权、SMJobBless 取消/允许、helper 安装完成和两代遥控器语音仍待签名候选包验收。
 
 ## `.sayall` 文件打开与首次 Onboarding
 
@@ -799,7 +955,10 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 - 能力矩阵中的默认快捷键只用于后续配置说明；Onboarding 本次 staged 语音键始终固定为 Fn，不因工具默认值或用户历史配置改变。
 - 工具页选择和重跑 Onboarding 不立即改动正式 `VoiceKeyMode`、Fn 点按开关或 Chromecast 模式；只有下一页同时选定控制来源并确认配对计划后才能进入 staged 状态。
 - 选择“其他语音工具”仍使用 Fn staged 配置，并在语音测试页要求用户确认目标工具的语音快捷键和麦克风；Onboarding 不提供快捷键学习或配置来源选择。
-- 选择任一可见工具后右栏都显示步骤 1/2/3/4，第 3 项始终显示“去除系统 Fn 占用”；Vokie 使用对应浅色/深色截图并显示官方简介与网址。
+- 选择任一可见工具后右栏都显示步骤 1/2/3/4，第 3 项始终显示“去除系统 Fn 占用”，第 4 项同时显示“微信 App”和“飞书 App”的快捷键设置截图；Vokie 使用对应浅色/深色截图并显示官方简介与网址。
+- 豆包和微信第 2 步使用当前设置界面截图：豆包显示语音输入、Fn、SayAll 麦克风和全局唤起；微信显示语音输入、快捷键、麦克风和 SayAll。英文说明必须与新图一致，不得继续写旧设备名 MiRemoteV 2ch。
+- 控制设备页的小米卡片顺序固定为小米蓝牙遥控器 2 Pro、小米蓝牙遥控器 2，随后才是苹果遥控器 Type-C、Lightning；选择哪个小米型号，连接、普通按键、语音、完成门禁和右栏真机图都以该型号为准。
+- 4 张实体卡片、“更多控制方式”和“继续”必须在 `1020 × 772` 首屏可见，型号名称单行，中文最终字号不小于 12pt。
 
 失败判定：未安装的微信或 Typeless 仍显示、已安装后没有显示、未安装 Vokie 被隐藏、卡片相对顺序变化、选择没有保存、卡片因输入源变化跳动、默认值被写成“已检测到当前配置”、工具选择立即覆盖正式语音键、未知 hold 快捷键仍被自动采用、选择 Radio 就弹出系统设置、离开选择页后重复切换输入源、页面裁切，或退回旧的 Fn-only 文案，均视为失败。
 
@@ -971,10 +1130,11 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 8. 明确区分两端配置：本页选择 `MiRemoteV 2ch` 或 `BlackHole 2ch` 只代表 SayAll 把遥控器/手机声音输出到该设备；随后还必须在豆包、微信输入法、Typeless 或其他语音工具自己的设置中，把同一个设备选为麦克风。本页选择成功不得被描述为已经修改第三方工具麦克风。
 9. 对 MiRemoteV 2ch 分别把 input/output scope 主声道设为 `mute=1 / volume=0` 和 `mute=0 / volume=0.19`，再开始测试音或真实语音；确认 SayAll 只对该受支持虚拟设备自动解除静音并把低于 `0.2` 的音量恢复为 `1.0`。重复设置为 `volume=0.20` 和 `0.25`，确认 SayAll 不覆盖阈值及以上音量。若使用测试命令，必须先保存原值并在测试结束后读回确认已恢复。
 10. 对不公开 mute/volume 属性的受支持虚拟设备，确认属性状态记录为 `unknown`，设备不会仅因此被错误拒绝；对普通扬声器、实体麦克风和未知设备，确认 SayAll 不写入其静音或音量属性。
+11. 断开所选实体遥控器的语音连接，但保持普通按键 HID 可用，重新进入音频页。确认页面自动准备已选中的受支持设备，第三项「音频输出正常」自动勾选，不需要点击「重试音频设置」；复制诊断确认 `audio_output_ready=true`、`audio_gate=ready_required`、`failure=none`。离开音频页后确认输出被释放；重新进入时再次自动准备。若自动配置失败，确认原有恢复卡和「重试音频设置」出现，并且点击后真的发起配置，不再空操作。
 
-预期结果：三条路径都要求 MiRemoteV 2ch 或 BlackHole 2ch 存在且被实际选中。明确静音或音量低于 `0.2` 的受支持虚拟设备在配置或语音开始前自动恢复，阈值及以上音量不变；无法恢复时设备不能被标为 Ready。实体遥控器还要求持续音频输出就绪；iPhone/网页版使用按需输出，手机开始语音时才连接所选虚拟设备，并由下一步的真实声音、停止和文字测试确认完整链路。
+预期结果：三条路径都要求 MiRemoteV 2ch 或 BlackHole 2ch 存在且被实际选中。明确静音或音量低于 `0.2` 的受支持虚拟设备在配置或语音开始前自动恢复，阈值及以上音量不变；无法恢复时设备不能被标为 Ready。实体遥控器还要求持续音频输出就绪，但页面进入时必须自动准备所选设备，不能要求用户先点一次重试；iPhone/网页版使用按需输出，手机开始语音时才连接所选虚拟设备，并由下一步的真实声音、停止和文字测试确认完整链路。
 
-失败判定：BlackHole 2ch 无法选择或继续、Beosound/扬声器等普通设备可以通过、受支持设备未选择或已失效仍可继续、实体遥控器输出未就绪仍继续、iPhone/网页版必须先开始一次语音才能离开音频页、静音/低音量修复后仍被报告为 Ready、`volume>=0.2` 被覆盖、普通实体设备的静音/音量被修改，或向导修改/删除用户主设置中的其他音频设备。
+失败判定：BlackHole 2ch 无法选择或继续、Beosound/扬声器等普通设备可以通过、受支持设备未选择或已失效仍可继续、实体遥控器输出未就绪仍继续、音频页进入后不自动准备而要求用户先点重试、点击「重试音频设置」没有产生新的 `AUDIO CONFIGURE`、iPhone/网页版必须先开始一次语音才能离开音频页、静音/低音量修复后仍被报告为 Ready、`volume>=0.2` 被覆盖、普通实体设备的静音/音量被修改，或向导修改/删除用户主设置中的其他音频设备。
 
 ## 用例 6：真实端到端语音文字
 
@@ -1095,7 +1255,7 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 
 | 矩阵维度 | 适用集合 |
 | --- | --- |
-| 来源 | 公开包：xiaomi_remote；完整包另含 siri_remote 的 generation_6 / generation_7、chromecast_remote、apple_companion、web_remote；以实际 Package 能力为准；Siri 另需 Installer 收据 |
+| 来源 | 公开包：xiaomi_remote，并用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL=rc001|rc003` 区分所选型号；完整包另含 siri_remote 的 generation_6 / generation_7、chromecast_remote、apple_companion、web_remote；以实际 Package 能力为准；Siri 另需 Installer 收据 |
 | 语言 | zh-Hans、en |
 | 外观 | light、dark |
 | 工具附加状态 | 五种工具、右栏四步、可观察的安装/运行状态、Fn 占用、Vokie partial/failed；只用生产入口支持的状态注入，不能把不支持的注入写为通过 |
@@ -1110,7 +1270,7 @@ build 314 本机结果：Apple Silicon 用户实测报告无漏字母 `i`、重�
 1. 保持 Mac 锁屏或不依赖当前屏幕读取权限。
 2. 使用生产隐藏入口构建一次 App，并通过 `REMOTE_MIC_ONBOARDING_SCREENSHOT_DIR`、`REMOTE_MIC_ONBOARDING_SCREENSHOT_APPEARANCE=light|dark` 生成截图；第 2 页为 `02-control-source.png`，第 6 页为 `06-voice-tool.png`。
 3. 公开构建设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote`，按生产页面清单生成适用语言和外观集合；需要指定小米型号真机图时设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_REMOTE_MODEL=rc001|rc003`。
-4. 包含 Siri 的截图构建可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_INSTALLED=1|0` 注入收据存在/缺失；可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_TRIAL=1` 渲染非会员临时启用的完成提示；这些值仅用于隔离截图，不写入系统。完整 Package 构建分别设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote|siri_remote|chromecast_remote|apple_companion|web_remote`；Apple 来源再用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_APPLE_REMOTE_GENERATION=generation_6|generation_7` 分开生成。按本次构建实际支持的来源、语言和外观生成完整集合，数量由清单推导。
+4. 包含 Siri 的截图构建可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_INSTALLED=1|0` 注入收据存在/缺失，用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_COMPONENT_INSTALLED=1|0` 注入系统 helper 组件存在/缺失；可用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_TRIAL=1` 渲染非会员临时启用的完成提示；这些值仅用于隔离截图，不写入系统。完整 Package 构建分别设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_CONTROL_SOURCE=xiaomi_remote|siri_remote|chromecast_remote|apple_companion|web_remote`；Apple 来源再用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_APPLE_REMOTE_GENERATION=generation_6|generation_7` 分开生成。按本次构建实际支持的来源、语言和外观生成完整集合，数量由清单推导。
 5. 对输入工具页额外覆盖豆包、微信、Typeless、Vokie、其他工具，以及 available/not-installed/unknown；每个工具用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_STEP=0...3` 覆盖右栏四项步骤，Vokie 必须分别生成浅色/深色步骤截图。语音测试页另覆盖 Vokie/Typeless 未运行与运行中状态。引导图放大层用 `REMOTE_MIC_ONBOARDING_SCREENSHOT_GUIDE_ZOOM=<资源名>` 单独出图，横版与竖版各一组。
 6. 分别覆盖五个输入工具，确认固定排序、单行卡片标题、Fn staged 配置和右栏步骤无裁切。
 7. 对旧正式配置设置 `REMOTE_MIC_ONBOARDING_SCREENSHOT_VOICE_KEY_MODE=left_command|right_command|right_option`，确认重新运行不会在欢迎或工具选择时立即覆盖；旧 Fn-only 迁移提示不得再被当作现行配置规则。

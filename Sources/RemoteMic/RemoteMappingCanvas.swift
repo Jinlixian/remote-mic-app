@@ -130,11 +130,15 @@ struct RemoteMappingCanvas: View {
     var actionDetail: ((RemoteButton, ButtonTrigger) -> String)? = nil
     /// 方案编辑时的动作来源；继承项在窄卡片上用链接图标标记。
     var actionSource: ((RemoteButton, ButtonTrigger) -> RemoteMappingActionSource)? = nil
+    /// 已配置动作的文字使用系统主题色；未配置的“无动作”保持次要文字色。
+    var actionConfigured: ((RemoteButton, ButtonTrigger) -> Bool)? = nil
     let onEdit: (RemoteButton, ButtonTrigger) -> Void
     let onEditHold: (RemoteButton) -> Void
     var onVoiceSettings: () -> Void = {}
     /// 方案作用域只覆盖 10 个普通按键；不在范围内的按键置灰且不可点。
     var reservedButtons: Set<RemoteButton> = []
+    /// 按 APP 作用域不显示语音键设置卡，也不让隐藏按键的连线占用画布。
+    var hidesUnavailableCards = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -150,7 +154,7 @@ struct RemoteMappingCanvas: View {
 
                 connectionLines(metrics: metrics)
 
-                ForEach(RemoteMappingLayout.buttonPlacements) { placement in
+                ForEach(visibleButtonPlacements) { placement in
                     mappingCard(placement.button)
                         .frame(width: metrics.cardWidth, height: metrics.cardHeight)
                         .position(
@@ -159,20 +163,28 @@ struct RemoteMappingCanvas: View {
                         )
                 }
 
-                voiceCard
-                    .frame(width: metrics.cardWidth, height: metrics.cardHeight)
-                    .position(
-                        x: metrics.cardCenterX(for: .right),
-                        y: RemoteMappingLayout.canvasHeight * RemoteMappingLayout.voiceTargetY
-                    )
+                if !hidesUnavailableCards {
+                    voiceCard
+                        .frame(width: metrics.cardWidth, height: metrics.cardHeight)
+                        .position(
+                            x: metrics.cardCenterX(for: .right),
+                            y: RemoteMappingLayout.canvasHeight * RemoteMappingLayout.voiceTargetY
+                        )
+                }
             }
         }
         .frame(height: RemoteMappingLayout.canvasHeight)
     }
 
+    private var visibleButtonPlacements: [RemoteMappingPlacement] {
+        RemoteMappingLayout.buttonPlacements.filter {
+            !reservedButtons.contains($0.button) || !hidesUnavailableCards
+        }
+    }
+
     private func connectionLines(metrics: Metrics) -> some View {
         Canvas { context, _ in
-            for placement in RemoteMappingLayout.buttonPlacements {
+            for placement in visibleButtonPlacements {
                 drawConnection(
                     context: &context,
                     start: metrics.remotePoint(for: placement.anchor),
@@ -182,6 +194,7 @@ struct RemoteMappingCanvas: View {
                     showsAnchor: activeButtons.contains(placement.button)
                 )
             }
+            if hidesUnavailableCards { return }
             drawConnection(
                 context: &context,
                 start: metrics.remotePoint(for: RemoteMappingLayout.voiceAnchor),
@@ -258,32 +271,35 @@ struct RemoteMappingCanvas: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 0)
-                Button {
-                    selectedButton = button
-                    onEditHold(button)
-                } label: {
-                    Text(holdSummary(button))
-                        .font(.system(
-                            size: RemoteMappingCardChrome.HoldChip.fontSize,
-                            weight: RemoteMappingCardChrome.HoldChip.fontWeight
-                        ))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .padding(.horizontal, RemoteMappingCardChrome.HoldChip.horizontalPadding)
-                        .padding(.vertical, RemoteMappingCardChrome.HoldChip.verticalPadding)
-                        .background(
-                            RemoteMappingCardChrome.HoldChip.background,
-                            in: RoundedRectangle(
-                                cornerRadius: RemoteMappingCardChrome.HoldChip.cornerRadius
+                if !hidesUnavailableCards {
+                    Button {
+                        selectedButton = button
+                        onEditHold(button)
+                    } label: {
+                        Text(holdSummary(button))
+                            .font(.system(
+                                size: RemoteMappingCardChrome.HoldChip.fontSize,
+                                weight: RemoteMappingCardChrome.HoldChip.fontWeight
+                            ))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .padding(.horizontal, RemoteMappingCardChrome.HoldChip.horizontalPadding)
+                            .padding(.vertical, RemoteMappingCardChrome.HoldChip.verticalPadding)
+                            .background(
+                                RemoteMappingCardChrome.HoldChip.background,
+                                in: RoundedRectangle(
+                                    cornerRadius: RemoteMappingCardChrome.HoldChip.cornerRadius
+                                )
                             )
-                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(button.displayName(using: localization)) · \(holdSummary(button))")
                 }
-                .buttonStyle(.plain)
-                .help("\(button.displayName(using: localization)) · \(holdSummary(button))")
             }
 
             HStack(spacing: 4) {
                 ForEach(ButtonTrigger.allCases) { trigger in
+                    let source = actionSource?(button, trigger)
                     Button {
                         selectedButton = button
                         onEdit(button, trigger)
@@ -293,12 +309,19 @@ struct RemoteMappingCanvas: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                             HStack(spacing: 2) {
-                                if actionSource?(button, trigger) == .inherited {
+                                if source == .inherited {
                                     Image(systemName: "link")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(.secondary)
                                         .accessibilityLabel(
                                             Text(localization.text("button_mapping.binding.inherited"))
+                                        )
+                                } else if source == .unavailable {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.orange)
+                                        .accessibilityLabel(
+                                            Text(localization.text("button_mapping.binding.unavailable_short"))
                                         )
                                 }
                                 Text(actionSummary(button, trigger))
@@ -306,6 +329,11 @@ struct RemoteMappingCanvas: View {
                                         size: 12,
                                         weight: trigger == .singleClick ? .semibold : .regular
                                     ))
+                                    .foregroundStyle(
+                                        actionConfigured?(button, trigger) == true
+                                            ? Color.accentColor
+                                            : Color.secondary
+                                    )
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                             }

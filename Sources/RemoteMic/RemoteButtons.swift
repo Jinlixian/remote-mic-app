@@ -623,6 +623,107 @@ enum ButtonTrigger: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// A missing entry means "use the current global mapping"; an entry whose action is
+/// `.disabled` is an explicit override and must not inherit the global action.
+struct ApplicationButtonBinding: Codable, Equatable, Identifiable {
+    var button: RemoteButton
+    var trigger: ButtonTrigger
+    var configured: ConfiguredButtonAction
+
+    var id: String { "\(button.rawValue).\(trigger.rawValue)" }
+}
+
+enum ApplicationButtonBindingScope {
+    /// APP 覆盖按物理遥控器实际存在的普通按键定义，不能复用键位方案的 10 键白名单。
+    /// 底部菜单键与 TV 键同样可以按 APP 单独配置；语音键和按住行为仍不在本页。
+    static let buttons: [RemoteButton] = [
+        .power, .up, .down, .left, .right, .ok, .back, .home,
+        .volumeUp, .volumeDown, .menu, .tv,
+    ]
+    static let triggers = ButtonTrigger.allCases
+
+    enum OverrideState: Equatable {
+        case appOverride
+        case globalFallback(reason: String)
+
+        var result: String {
+            switch self {
+            case .appOverride: return "app_override"
+            case .globalFallback: return "global_fallback"
+            }
+        }
+
+        var reason: String {
+            switch self {
+            case .appOverride: return "explicit_override"
+            case let .globalFallback(reason): return reason
+            }
+        }
+    }
+
+    static func contains(button: RemoteButton, trigger: ButtonTrigger) -> Bool {
+        buttons.contains(button) && triggers.contains(trigger)
+    }
+
+    static func overrideState(
+        customMappingEnabled: Bool,
+        supportedButton: Bool,
+        frontmostBundleIdentifier: String?,
+        applicationBindings: [ApplicationButtonBinding]?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> OverrideState {
+        guard customMappingEnabled else { return .globalFallback(reason: "custom_mapping_disabled") }
+        guard supportedButton else { return .globalFallback(reason: "unsupported_button") }
+        guard frontmostBundleIdentifier != nil else { return .globalFallback(reason: "frontmost_unknown") }
+        guard ApplicationButtonBindingResolver.hasOverride(
+            in: applicationBindings,
+            button: button,
+            trigger: trigger
+        ) else { return .globalFallback(reason: "not_configured") }
+        return .appOverride
+    }
+
+    static func sanitize(
+        _ bindings: [ApplicationButtonBinding]?,
+        validateAction: (ConfiguredButtonAction) -> ConfiguredButtonAction?
+    ) -> [ApplicationButtonBinding]? {
+        guard let bindings else { return nil }
+        var seen: Set<String> = []
+        var result: [ApplicationButtonBinding] = []
+        for binding in bindings where contains(button: binding.button, trigger: binding.trigger) {
+            guard let configured = validateAction(binding.configured), seen.insert(binding.id).inserted else { continue }
+            result.append(ApplicationButtonBinding(
+                button: binding.button,
+                trigger: binding.trigger,
+                configured: configured.normalizedForExecution
+            ))
+        }
+        return result.isEmpty ? nil : result
+    }
+}
+
+enum ApplicationButtonBindingResolver {
+    static func override(
+        in bindings: [ApplicationButtonBinding]?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+              let binding = bindings?.first(where: { $0.button == button && $0.trigger == trigger })
+        else { return nil }
+        return binding.configured.normalizedForExecution
+    }
+
+    static func hasOverride(
+        in bindings: [ApplicationButtonBinding]?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        override(in: bindings, button: button, trigger: trigger) != nil
+    }
+}
+
 struct ConfiguredButtonAction: Codable, Equatable {
     var action: ButtonAction
     var shortcut: CustomKeyboardShortcut?
@@ -684,6 +785,53 @@ struct ConfiguredButtonAction: Codable, Equatable {
     }
 }
 
+/// 判断两套 APP 按键配置是否属于同一方案时使用的规范化操作。
+///
+/// 只保留「哪个键/手势 → 执行什么操作」，故意丢弃方案名、方案 ID、APP 档案名、
+/// 绑定顺序、快捷键显示文字等元数据；否则同一套操作会因展示文案或创建时间不同
+/// 被误判成两套方案。
+struct ApplicationSchemeOperation: Equatable {
+    let action: ButtonAction
+    let shortcutKeyCode: UInt16?
+    let shortcutModifierFlagsRawValue: UInt
+    let applicationProfileID: UUID?
+    let macroID: String?
+
+    init(_ configured: ConfiguredButtonAction) {
+        let normalized = configured.normalizedForExecution
+        action = normalized.action
+        shortcutKeyCode = normalized.shortcut?.keyCode
+        shortcutModifierFlagsRawValue = normalized.shortcut?.modifierFlagsRawValue ?? 0
+        applicationProfileID = normalized.action == .openCustomApplication
+            ? normalized.applicationProfileID
+            : nil
+        macroID = normalized.macroID
+    }
+
+    static func table(
+        resolver: (RemoteButton, ButtonTrigger) -> ConfiguredButtonAction
+    ) -> [String: ApplicationSchemeOperation] {
+        var table: [String: ApplicationSchemeOperation] = [:]
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ApplicationButtonBindingScope.triggers {
+                table["\(button.rawValue).\(trigger.rawValue)"] =
+                    ApplicationSchemeOperation(resolver(button, trigger))
+            }
+        }
+        return table
+    }
+}
+
+enum ApplicationSchemeMatcher {
+    /// 在已有方案里找操作完全一致的一套；名称、ID、创建时间与顺序不参与比较。
+    static func matchingSchemeID(
+        target: [String: ApplicationSchemeOperation],
+        candidates: [(id: UUID, operations: [String: ApplicationSchemeOperation])]
+    ) -> UUID? {
+        candidates.first { $0.operations == target }?.id
+    }
+}
+
 /// 可以被「按住执行」一直按住的目标键。
 struct HoldableKey: Equatable {
     let keyCode: CGKeyCode
@@ -736,6 +884,12 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
     /// Separate from `accessibilityTarget` on purpose: the scroll region is not
     /// an input field (decision S17).
     var scrollRegionTarget: ScrollRegionTarget?
+    /// Explicit action overrides for ordinary buttons. Missing entries inherit the
+    /// current global mapping; decoded old profiles leave this nil.
+    var buttonBindings: [ApplicationButtonBinding]?
+    /// APP 级选择的键位方案。nil 表示默认方案（跟随全局解析）。方案内容仍由私有
+    /// 按键方案组件持有，这里只保存引用。
+    var mappingProfileID: UUID?
 
     init(
         id: UUID = UUID(),
@@ -745,7 +899,9 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         focusStrategy: CustomApplicationFocusStrategy = .none,
         focusShortcut: CustomKeyboardShortcut? = nil,
         accessibilityTarget: AccessibilityFocusTarget? = nil,
-        scrollRegionTarget: ScrollRegionTarget? = nil
+        scrollRegionTarget: ScrollRegionTarget? = nil,
+        buttonBindings: [ApplicationButtonBinding]? = nil,
+        mappingProfileID: UUID? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -755,6 +911,8 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         self.focusShortcut = focusShortcut
         self.accessibilityTarget = accessibilityTarget
         self.scrollRegionTarget = scrollRegionTarget
+        self.buttonBindings = buttonBindings
+        self.mappingProfileID = mappingProfileID
     }
 }
 
@@ -958,6 +1116,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case scrollDown
     case pageUp
     case pageDown
+    case pageUpHalf
+    case pageDownHalf
     case scrollToTop
     case scrollToBottom
     case deleteBackward
@@ -1039,6 +1199,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .scrollDown: return localization.text("action.scroll_down")
         case .pageUp: return localization.text("action.page_up")
         case .pageDown: return localization.text("action.page_down")
+        case .pageUpHalf: return localization.text("action.page_up_half")
+        case .pageDownHalf: return localization.text("action.page_down_half")
         case .scrollToTop: return localization.text("action.scroll_to_top")
         case .scrollToBottom: return localization.text("action.scroll_to_bottom")
         case .deleteBackward: return localization.text("action.delete_backspace")
@@ -1232,7 +1394,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
              .commandMinimize, .toggleFullScreen, .commandNewTab, .commandPreviousTab,
              .commandNextTab, .commandNextWindow, .commandHide, .commandNew,
              .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .scrollUp, .scrollDown,
-             .pageUp, .pageDown, .scrollToTop, .scrollToBottom, .deleteBackward:
+             .pageUp, .pageDown, .pageUpHalf, .pageDownHalf,
+             .scrollToTop, .scrollToBottom, .deleteBackward:
             return .basicKeys
         case .showDesktop, .contextMenu, .appSwitcher, .missionControl, .applicationWindows,
              .spaceLeft, .spaceRight, .lockScreen, .screenshot,
@@ -1304,7 +1467,7 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
 
     /// 翻页要靠辅助功能扫描滚动容器，比行滚动贵得多；按住重复时按更长的间隔执行。
     var isPageScroll: Bool {
-        self == .pageUp || self == .pageDown
+        [.pageUp, .pageDown, .pageUpHalf, .pageDownHalf].contains(self)
     }
 
     var isDirectionalOrDeleteBackward: Bool {

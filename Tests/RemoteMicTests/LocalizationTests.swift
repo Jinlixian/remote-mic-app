@@ -14,10 +14,21 @@ struct LocalizationTests {
             ) as? [String: String])
             #expect(copy["onboarding.control_source.siri_remote.detail"]?.contains(language == "en" ? "membership" : "会员") == true)
             #expect(copy["onboarding.complete.siri_membership"]?.isEmpty == false)
-            for key in ["onboarding.voice_tool.guide.screenshot.doubao_settings", "onboarding.voice_tool.guide.screenshot.vokie_step_2"] {
+            for key in [
+                "onboarding.voice_tool.guide.screenshot.doubao_settings",
+                "onboarding.voice_tool.guide.screenshot.weixin_input_settings",
+                "onboarding.voice_tool.guide.screenshot.vokie_step_2",
+            ] {
                 #expect(copy[key]?.contains("SayAll") == true)
-                #expect(copy[key]?.contains("MiRemoteV 2ch") == true)
             }
+            #expect(copy["onboarding.voice_tool.guide.screenshot.vokie_step_2"]?
+                .contains("MiRemoteV 2ch") == true)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.doubao_settings"]?
+                .contains("MiRemoteV 2ch") == false)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.weixin_input_settings"]?
+                .contains(language == "en" ? "microphone" : "麦克风") == true)
+            #expect(copy["onboarding.voice_tool.guide.screenshot.feishu_settings_remove_shortcuts"]?
+                .contains(language == "en" ? "Feishu" : "飞书") == true)
         }
     }
 
@@ -34,6 +45,10 @@ struct LocalizationTests {
         #expect(chinese["remote.card.detail.buttons_failed"] == "设备已连接，但按键功能出现问题。")
         #expect(chinese["remote.card.detail.voice_failed"] == "设备已连接，但已授权的语音功能出现问题。")
         #expect(chinese["remote.card.detail.device_failed"] == "设备已连接，但按键和已授权的语音功能均出现问题。")
+        #expect(chinese["remote.card.recover_voice"] == "恢复语音")
+        #expect(chinese["remote.card.recover_voice.help"] == "重新尝试启动语音输出")
+        #expect(english["remote.card.recover_voice"] == "Restore")
+        #expect(english["remote.card.recover_voice.help"] == "Restore Voice")
         #expect(chinese["remote.card.detail.connected"]?.contains("第三方 App") == false)
         #expect(english["remote.card.detail.connected"] == "Device connected. The button and voice functions that should be available are working normally.")
         #expect(english["remote.card.detail.checking"] == "Device connected. Checking the buttons and entitled voice functions; not yet confirmed normal.")
@@ -142,17 +157,19 @@ struct LocalizationTests {
         #expect(english["shortcut.editor.instructions"]?.contains("recorded alone") == true)
         #expect(english["action.scroll_up"] == "Scroll Up")
         #expect(english["action.scroll_down"] == "Scroll Down")
+        #expect(english["action.page_up_half"] == "Half Page Up")
+        #expect(english["action.page_down_half"] == "Half Page Down")
         #expect(english["keyboard.key.delete"] == "Delete")
         #expect(english["keyboard.key.left"] == "Left")
         #expect(english["keyboard.key.right"] == "Right")
         #expect(english["keyboard.key.up"] == "Up")
         #expect(english["keyboard.key.down"] == "Down")
         #expect(english["about.support.feedback"] == "Feedback")
-        #expect(english["onboarding.remote.first_pairing.wake"] == "Hold the TV button for about 2 seconds until the white light at the bottom starts flashing.")
-        #expect(english["onboarding.remote.first_pairing.pair"] == "Then hold Home + Menu together to enter Bluetooth pairing mode.")
-        #expect(english["onboarding.remote.button_waiting_detail"] == "Press the center OK button or an arrow button. Do not press the microphone/voice button.")
+        #expect(english["onboarding.remote.first_pairing.wake"] == "Hold the TV button for about 2 seconds until the white light at the bottom starts flashing")
+        #expect(english["onboarding.remote.first_pairing.pair"] == "Then hold Home + Menu together to enter Bluetooth pairing mode")
+        #expect(english["onboarding.remote.button_waiting_detail"] == "Press the center OK button or an arrow button. Do not press the microphone/voice button")
         #expect(english["onboarding.remote.voice_button_mistake.title"] == "That was the voice button")
-        #expect(english["onboarding.remote.voice_button_mistake.detail"] == "This step checks button controls. Press the center OK button or an arrow button instead.")
+        #expect(english["onboarding.remote.voice_button_mistake.detail"] == "This step checks button controls. Press the center OK button or an arrow button instead")
         #expect(english["onboarding.voice_tool.doubao.title"] == "Doubao")
         #expect(english["onboarding.voice_tool.weixin.title"] == "WeType")
         #expect(english["onboarding.voice_tool.other.title"] == "Other Voice App")
@@ -198,12 +215,14 @@ struct LocalizationTests {
                 #expect(localized["shortcut.editor.instructions"]?.contains("单独录入") == true)
                 #expect(localized["action.scroll_up"] == "向上滚动")
                 #expect(localized["action.scroll_down"] == "向下滚动")
+                #expect(localized["action.page_up_half"] == "向上翻半页")
+                #expect(localized["action.page_down_half"] == "向下翻半页")
                 #expect(localized["about.support.feedback"] == "问题反馈")
-                #expect(localized["onboarding.remote.first_pairing.wake"] == "长按 TV 键约 2 秒，直到遥控器底部白灯开始闪烁。")
-                #expect(localized["onboarding.remote.first_pairing.pair"] == "同时长按 Home（主页）+ Menu（菜单）键，进入蓝牙配对模式。")
-                #expect(localized["onboarding.remote.button_waiting_detail"] == "请短按圆盘中间的确定键或任意方向键，不要按麦克风/语音键。")
+                #expect(localized["onboarding.remote.first_pairing.wake"] == "长按 TV 键约 2 秒，直到遥控器底部白灯开始闪烁")
+                #expect(localized["onboarding.remote.first_pairing.pair"] == "同时长按 Home（主页）+ Menu（菜单）键，进入蓝牙配对模式")
+                #expect(localized["onboarding.remote.button_waiting_detail"] == "请短按圆盘中间的确定键或任意方向键，不要按麦克风/语音键")
                 #expect(localized["onboarding.remote.voice_button_mistake.title"] == "刚才按的是语音键")
-                #expect(localized["onboarding.remote.voice_button_mistake.detail"] == "这一步检查普通控制键。请改为短按圆盘中间的确定键或任意方向键。")
+                #expect(localized["onboarding.remote.voice_button_mistake.detail"] == "这一步检查普通控制键。请改为短按圆盘中间的确定键或任意方向键")
                 #expect(localized["onboarding.voice_tool.weixin.title"] == "微信输入法")
                 #expect(localized["onboarding.voice_tool.system_fn.conflict"] == "系统仍在使用 Fn")
                 #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器 Type-C")

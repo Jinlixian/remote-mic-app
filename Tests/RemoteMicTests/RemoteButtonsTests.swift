@@ -606,6 +606,23 @@ struct RemoteButtonsTests {
         #expect(scrolled.isEmpty)
     }
 
+    @Test func pageActionsPassFullAndHalfSteps() {
+        var calls: [String] = []
+        let poster: (ScrollPageDirection, ScrollPageStep) -> ScrollPageOutcome = { direction, step in
+            calls.append("\(direction)-\(step.logName)")
+            return .scrolledByPixelWheel
+        }
+
+        for action in [ButtonAction.pageUp, .pageDown, .pageUpHalf, .pageDownHalf] {
+            #expect(KeyboardInjector.send(
+                action,
+                accessibilityTrusted: { true },
+                scrollPagePoster: poster
+            ))
+        }
+        #expect(calls == ["up-full", "down-full", "up-half", "down-half"])
+    }
+
     @Test func scrollEventsAimAtTheFrontmostWindowAndFallBackToTheCursor() {
         let cursor = CGPoint(x: 12, y: 34)
         #expect(KeyboardInjector.scrollTargetLocation(
@@ -821,6 +838,103 @@ struct RemoteButtonsTests {
             action: .arrowUp,
             frontmostBundleIdentifier: otherApp
         ))
+    }
+
+    @Test func mappingResetWhileVolumeKeyIsHeldDoesNotLeaveRepeatRunning() throws {
+        let suiteName = "RemoteButtonsTests.volumeResetRepeat.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setHoldMode(.repeatSingle, for: .volumeUp)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        var performedActions: [ButtonAction] = []
+        let scheduler = RemoteButtonsTestScheduler()
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
+            frontmostBundleIdentifier: { "com.example.other" },
+            diagnosticLogger: { _ in }
+        )
+        // 模拟按下音量键时设备档案切换导致的映射重载。修复前这里会清空
+        // activeUsages，松键不再被识别，repeatSingle 会永久运行。
+        monitor.onButtonPressed = { _, _, _ in
+            monitor.cancelMappingInteractions()
+            return (profileID, true)
+        }
+        #expect(monitor.connectSimulatedDevice(fingerprint: "volume-reset", profileID: profileID))
+        let press = Data([0x80, 0, 0, 0, 0, 0])
+        let release = Data(repeating: 0, count: press.count)
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        scheduler.advance(toMilliseconds: 500)
+        let actionsBeforeRelease = performedActions.count
+        #expect(actionsBeforeRelease >= 2)
+
+        monitor.handleSimulatedReport(reportID: 1, data: release)
+        scheduler.advance(toMilliseconds: 1_500)
+        #expect(performedActions.count == actionsBeforeRelease)
+    }
+
+    @Test func physicalPressWhoseReleaseNeverArrivesIsClearedByDeviceRemoval() throws {
+        // `cancelMappingInteractions` 保留物理边沿，等松键来收尾。松键永远不到达时
+        // （遥控器关机、蓝牙断开、电池拔出），保留的边沿必须由设备移除 / stop 的完整重置
+        // 清掉；否则 activeUsages 永久非空，重复计时器和下一次按下都会被这条陈旧状态影响。
+        let suiteName = "RemoteButtonsTests.noReleaseCleanup.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setHoldMode(.repeatSingle, for: .volumeUp)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        var performedActions: [ButtonAction] = []
+        var activeButtonSnapshots: [Set<RemoteButton>] = []
+        let scheduler = RemoteButtonsTestScheduler()
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
+            frontmostBundleIdentifier: { "com.example.other" },
+            diagnosticLogger: { _ in }
+        )
+        monitor.onActiveButtons = { _, buttons in activeButtonSnapshots.append(buttons) }
+        monitor.onButtonPressed = { _, _, _ in
+            monitor.cancelMappingInteractions()
+            return (profileID, true)
+        }
+        #expect(monitor.connectSimulatedDevice(fingerprint: "no-release", profileID: profileID))
+        let press = Data([0x80, 0, 0, 0, 0, 0])
+
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        scheduler.advance(toMilliseconds: 500)
+        let actionsWhileHeld = performedActions.count
+        #expect(actionsWhileHeld >= 2)
+
+        // 松键没有到达，设备直接消失。
+        monitor.disconnectSimulatedDevice()
+        #expect(activeButtonSnapshots.last == [])
+        let actionsAfterRemoval = performedActions.count
+        scheduler.advance(toMilliseconds: 2_000)
+        #expect(performedActions.count == actionsAfterRemoval)
+
+        // 重新连接后按下仍要生效，证明陈旧边沿没有留下来。
+        #expect(monitor.connectSimulatedDevice(fingerprint: "no-release", profileID: profileID))
+        monitor.handleSimulatedReport(reportID: 1, data: press)
+        scheduler.advance(toMilliseconds: 2_400)
+        #expect(performedActions.count > actionsAfterRemoval)
     }
 
     @Test func stableReleaseDiagnosticsSeparateDeviceBounceFromSwallowedPress() throws {
@@ -1555,6 +1669,74 @@ struct RemoteButtonsTests {
         #expect(posted[11].2.isEmpty)
     }
 
+    @Test func chromecastSwitcherConsumesTriggerNavigationAndOKBeforeTheirBindings() {
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let scheduler = RemoteButtonsTestScheduler()
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { posted.append(($0, $1, $2)); return true },
+            scheduler: { _, event in event(); return nil }
+        )
+        let switcher = ChromecastAppSwitcher(
+            session: session, scheduler: scheduler, logger: { _ in }, observeMouseDismiss: { _ in nil }
+        )
+
+        #expect(switcher.start(button: .input))
+        #expect(switcher.handle(.release, button: .input, isSwitcherBinding: true))
+        #expect(switcher.handle(.press, button: .input, isSwitcherBinding: true))
+        #expect(switcher.handle(.release, button: .input, isSwitcherBinding: true))
+        #expect(posted.map(\.0) == [55, 48, 48, 48, 48])
+        #expect(switcher.handle(.press, button: .left, isSwitcherBinding: false))
+        #expect(switcher.handle(.release, button: .left, isSwitcherBinding: false))
+        #expect(switcher.handle(.press, button: .right, isSwitcherBinding: false))
+        #expect(switcher.handle(.release, button: .right, isSwitcherBinding: false))
+        #expect(posted.count == 9)
+        #expect(posted[5].2.contains(.maskCommand))
+        #expect(posted[7].2.contains(.maskCommand))
+        #expect(switcher.handle(.press, button: .ok, isSwitcherBinding: false))
+        #expect(switcher.handle(.release, button: .ok, isSwitcherBinding: false))
+        #expect(posted.suffix(3).map(\.0) == [58, 55, 58])
+        #expect(!posted[10].1)
+        #expect(!switcher.handle(.press, button: .ok, isSwitcherBinding: false))
+    }
+
+    @Test func chromecastSwitcherTimeoutReleasesCommandAndConsumesLateRelease() {
+        var posted: [(CGKeyCode, Bool)] = []
+        let scheduler = RemoteButtonsTestScheduler()
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, down, _ in posted.append((code, down)); return true }
+        )
+        let switcher = ChromecastAppSwitcher(
+            session: session, scheduler: scheduler, logger: { _ in }, observeMouseDismiss: { _ in nil }
+        )
+
+        #expect(switcher.start(button: .input))
+        #expect(switcher.handle(.press, button: .input, isSwitcherBinding: true))
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.appSwitcherTimeoutMilliseconds)
+        #expect(!session.isActive)
+        #expect(posted.suffix(3).map(\.0) == [53, 53, 55])
+        #expect(posted.last?.1 == false)
+        #expect(switcher.handle(.release, button: .input, isSwitcherBinding: true))
+    }
+
+    @Test func forcingModifierReleaseInvalidatesOldConfirmationTasks() {
+        var posted: [(CGKeyCode, Bool)] = []
+        var scheduled: [() -> Void] = []
+        let session = KeyboardInjector.AppSwitcherSession(
+            keyStatePoster: { code, down, _ in posted.append((code, down)); return true },
+            scheduler: { _, action in scheduled.append(action); return nil }
+        )
+
+        #expect(session.trigger())
+        #expect(session.confirm())
+        #expect(session.forceReleaseModifiersIfNeeded())
+        #expect(session.trigger())
+        let eventCount = posted.count
+        scheduled.first?()
+        #expect(posted.count == eventCount)
+        #expect(session.isActive)
+        #expect(session.cancel())
+    }
+
     /// 切换器里松开 ⌘ 就是确认高亮 App；取消必须先在 ⌘ 仍按住时发 Escape。
     @Test func appSwitcherSessionCancelSendsEscapeBeforeReleasingCommand() {
         var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
@@ -2074,7 +2256,7 @@ struct RemoteButtonsTests {
         #expect(posted.count == countAfterEntry + 3)
     }
 
-    @Test func appSwitcherSwallowsOtherButtonsDuringSession() throws {
+    @Test func appSwitcherSessionEndsOnUnboundButtonsWithoutPerformingThem() throws {
         let suiteName = "RemoteButtonsTests.appSwitcherSwallow.\(UUID().uuidString)"
         let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -2084,14 +2266,20 @@ struct RemoteButtonsTests {
         let profileID = try #require(settings.selectedRemoteProfileID)
         let scheduler = RemoteButtonsTestScheduler()
         var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var performedActions: [ButtonAction] = []
+        var diagnostics: [String] = []
         let monitor = HIDRemoteMonitor(
             settings: settings,
             profileID: profileID,
             ownsEventSuppressor: false,
             scheduler: scheduler,
             runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
             frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
-            diagnosticLogger: { _ in },
+            diagnosticLogger: { diagnostics.append($0) },
             appSwitcherKeyStatePoster: { code, isDown, flags in
                 posted.append((code, isDown, flags))
                 return true
@@ -2117,17 +2305,18 @@ struct RemoteButtonsTests {
         }
 
         press(.menu)
-        press(.down)
         let countAfterEntry = posted.count
-        // 会话期间音量、主页、TV 等按键全部吞掉。
+        // 未绑定「切换 App」的按键结束会话：Esc 后释放 ⌘，自身动作不执行。
         press(.volumeUp)
-        press(.home)
-        press(.tv)
-        press(.volumeDown)
-        #expect(posted.count == countAfterEntry)
-        // 会话仍然存活：返回键还是能退出（Esc）。
-        press(.back)
-        #expect(posted.contains { $0.0 == 53 })
+
+        #expect(posted.count == countAfterEntry + 3)
+        #expect(posted.suffix(3).map { $0.0 } == [
+            53, 53, KeyboardInjector.leftCommandKeyCode,
+        ])
+        #expect(posted.suffix(3).map { $0.1 } == [true, false, false])
+        #expect(performedActions.isEmpty)
+        #expect(diagnostics.contains { $0.contains("ended_by button=volume_up phase=session") })
+        #expect(diagnostics.contains { $0.contains("ended reason=unrelated_button_volume_up") })
     }
 
     @Test func appSwitcherBoundButtonActsAsTabDuringSession() throws {
@@ -2782,6 +2971,221 @@ struct RemoteButtonsTests {
         #expect(!hudVisible.diagnostics.contains { $0.contains("ended reason=hud_dismissed") })
     }
 
+    @Test func appSwitcherSessionUnboundKeyEndsSessionWithoutPerformingItsAction() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherUnboundExit.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .ok)
+        settings.setAction(.escape, for: .tv)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var performedActions: [ButtonAction] = []
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            appSwitcherDismissObserverInstaller: { _ in {} }
+        )
+        monitor.connectSimulatedDevice(fingerprint: UUID().uuidString, profileID: profileID)
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1,
+                data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.ok)
+        // 未绑定「切换 App」的按键只结束会话，不执行 TV 保存的 Escape。
+        press(.tv)
+
+        #expect(performedActions.isEmpty)
+        #expect(posted.map { $0.0 } == [
+            KeyboardInjector.leftCommandKeyCode, 48, 48, 53, 53,
+            KeyboardInjector.leftCommandKeyCode,
+        ])
+        #expect(posted.map { $0.1 } == [true, true, false, true, false, false])
+        #expect(posted[3].2 == .maskCommand)
+        #expect(posted[4].2 == .maskCommand)
+        #expect(posted[5].2.isEmpty)
+        #expect(diagnostics.contains { $0.contains("ended_by button=tv phase=session") })
+        #expect(diagnostics.contains { $0.contains("ended reason=unrelated_button_tv") })
+    }
+
+    @Test func appSwitcherSessionBindingsIgnoreDoubleAndLongTriggers() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherTriggers.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        settings.setAction(.escape, for: .menu, trigger: .doubleClick)
+        settings.setAction(.returnKey, for: .menu, trigger: .longPress)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var performedActions: [ButtonAction] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            appSwitcherDismissObserverInstaller: { _ in {} }
+        )
+        monitor.connectSimulatedDevice(fingerprint: UUID().uuidString, profileID: profileID)
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1,
+                data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.menu)
+        // 配置了双击后，单击动作要等双击窗口结束才提交，会话此时才真正打开。
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.doubleClickMilliseconds)
+        press(.menu)
+
+        #expect(performedActions.isEmpty)
+        #expect(posted.map { $0.0 } == [
+            KeyboardInjector.leftCommandKeyCode, 48, 48, 48, 48,
+        ])
+        #expect(posted.map { $0.1 } == [true, true, false, true, false])
+        #expect(posted.allSatisfy { $0.2.contains(.maskCommand) })
+    }
+
+    @Test func appSwitcherSessionTVAdvancesOnlyWhenBoundToSwitcher() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherTV.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .ok)
+        settings.setAction(.appSwitcher, for: .tv)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, _ in true },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            appSwitcherDismissObserverInstaller: { _ in {} }
+        )
+        monitor.connectSimulatedDevice(fingerprint: UUID().uuidString, profileID: profileID)
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1,
+                data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        press(.ok)
+        press(.tv)
+
+        #expect(posted.map { $0.0 } == [
+            KeyboardInjector.leftCommandKeyCode, 48, 48, 48, 48,
+        ])
+        #expect(posted.map { $0.1 } == [true, true, false, true, false])
+        #expect(posted.allSatisfy { $0.2.contains(.maskCommand) })
+    }
+
+    @Test func appSwitcherSessionEndsOnDelayedActionFromBeforeSession() throws {
+        let suiteName = "RemoteButtonsTests.appSwitcherLateAction.\(UUID().uuidString)"
+        let defaults = try #require(TestUserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.customMappingEnabled = true
+        settings.setAction(.appSwitcher, for: .menu)
+        settings.setAction(.showDesktop, for: .home)
+        settings.setAction(.escape, for: .home, trigger: .doubleClick)
+        let profileID = try #require(settings.selectedRemoteProfileID)
+        let scheduler = RemoteButtonsTestScheduler()
+        var posted: [(CGKeyCode, Bool, CGEventFlags)] = []
+        var performedActions: [ButtonAction] = []
+        var diagnostics: [String] = []
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            ownsEventSuppressor: false,
+            scheduler: scheduler,
+            runtimePermissions: { true },
+            actionPerformer: { _, _, configured in
+                performedActions.append(configured.action)
+                return true
+            },
+            frontmostBundleIdentifier: { PresetApplication.codex.bundleIdentifier },
+            diagnosticLogger: { diagnostics.append($0) },
+            appSwitcherKeyStatePoster: { code, isDown, flags in
+                posted.append((code, isDown, flags))
+                return true
+            },
+            appSwitcherDismissObserverInstaller: { _ in {} }
+        )
+        monitor.connectSimulatedDevice(fingerprint: UUID().uuidString, profileID: profileID)
+
+        func press(_ button: RemoteButton) {
+            monitor.handleSimulatedReport(
+                reportID: 1,
+                data: Data([UInt8(button.hidUsage), 0, 0, 0, 0, 0])
+            )
+            monitor.handleSimulatedReport(reportID: 1, data: Data(repeating: 0, count: 6))
+        }
+
+        // home 配置了双击，单击要等双击窗口结束才提交；在此之前切换器会话已经打开。
+        press(.home)
+        press(.menu)
+        let countAfterEntry = posted.count
+        scheduler.advance(toMilliseconds: HIDRemoteTiming.doubleClickMilliseconds)
+
+        // 迟到动作只结束会话，不执行 home 的 showDesktop。
+        #expect(performedActions.isEmpty)
+        #expect(posted.count == countAfterEntry + 3)
+        #expect(posted.suffix(3).map { $0.0 } == [
+            53, 53, KeyboardInjector.leftCommandKeyCode,
+        ])
+        #expect(diagnostics.contains {
+            $0.contains("ended reason=unrelated_action_\(ButtonAction.showDesktop.rawValue)")
+        })
+    }
+
     @Test func customShortcutPostsRecordedCombinationAndSingleKeyAndRequiresAccessibility() {
         let shortcut = CustomKeyboardShortcut(
             keyCode: 40,
@@ -3163,6 +3567,24 @@ struct RemoteButtonsTests {
         #expect(handled)
         #expect(attemptedApplication == .codex)
         #expect(!focusAttempted)
+    }
+
+    @Test func openingSayAllReopensItsWindowEvenWhenAlreadyFrontmost() {
+        let bundleURL = URL(fileURLWithPath: "/Applications/SayAll.app")
+        var opened: PresetApplication?
+        let handled = KeyboardInjector.send(
+            .openRemoteMic,
+            applicationURL: { _ in bundleURL },
+            applicationOpener: { url, application, completion in
+                #expect(url == bundleURL)
+                opened = application
+                completion(123, nil)
+            },
+            frontmostApplication: { (PresetApplication.remoteMic.bundleIdentifier, 123) }
+        )
+
+        #expect(handled)
+        #expect(opened == .remoteMic)
     }
 
     @Test func alreadyFrontmostPresetApplicationSkipsReactivationAndFocusesRunningInstance() {
@@ -4289,7 +4711,7 @@ struct RemoteButtonsTests {
         ).action == .showDesktop)
     }
 
-    @Test func additionalBluetoothRemoteCopiesCurrentMappingsBeforeIndependentEditing() throws {
+    @Test func additionalBluetoothRemoteStartsWithIndependentMappings() throws {
         let suiteName = "RemoteMicTests.\(UUID().uuidString)"
         let defaults = try #require(TestUserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -4313,12 +4735,17 @@ struct RemoteButtonsTests {
             for: .menu,
             trigger: .singleClick,
             profileID: secondProfileID
-        ).shortcut == shortcut)
+        ).action == AppSettings.defaultBindings[.menu])
+        #expect(settings.configuredAction(
+            for: .menu,
+            trigger: .singleClick,
+            profileID: secondProfileID
+        ).shortcut == nil)
         #expect(settings.configuredAction(
             for: .tv,
             trigger: .doubleClick,
             profileID: secondProfileID
-        ).action == .showDesktop)
+        ).action == .disabled)
 
         settings.selectRemoteProfile(secondProfileID)
         settings.setAction(.openCodex, for: .menu)
@@ -4379,7 +4806,7 @@ struct RemoteButtonsTests {
             for: .menu,
             trigger: .singleClick,
             profileID: secondProfileID
-        ).action == .openCodex)
+        ).action == AppSettings.defaultBindings[.menu])
 
         settings.selectRemoteProfile(secondProfileID)
         settings.setAction(.showDesktop, for: .menu)
@@ -4397,7 +4824,9 @@ struct RemoteButtonsTests {
             encoding: .utf8
         )
         #expect(source.contains("settings.registerHIDRemote(fingerprint: fingerprint)"))
-        #expect(source.contains("!self.macroFeature.isEditorActive && !suppressConfiguredAction"))
+        #expect(source.contains("!self.macroFeature.isEditorActive &&"))
+        #expect(source.contains("!suppressConfiguredAction &&"))
+        #expect(source.contains("!holdConfiguredActionForPendingIdentity"))
         #expect(!source.contains("pendingHIDBindingProfileID"))
     }
 
