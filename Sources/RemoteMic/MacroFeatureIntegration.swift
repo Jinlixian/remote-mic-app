@@ -51,6 +51,12 @@ final class MacroFeatureIntegration: ObservableObject {
     @Published private(set) var shouldShowEnrollment = false
     @Published private(set) var isEditorActive = false
     private var subscriptions = Set<AnyCancellable>()
+    private var hostSchemeProfilesProvider: ((UUID?) -> [ButtonMappingProfile])?
+    private var hostSchemeBindingProvider: ((UUID, UUID?, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
+    private var hostSchemeCreator: ((String, [UnifiedButtonBinding], UUID?) -> UUID?)?
+    private var hostSchemeReloader: (() -> Bool)?
+    private var hostSchemeBindingWriter: ((UUID, ConfiguredButtonAction?, UUID?, RemoteButton, ButtonTrigger) -> Bool)?
+    private var hostSchemeBindingsReplacer: ((UUID, UUID?, [UnifiedButtonBinding]) -> Bool)?
     private var enrollmentRevealRequested = false
     private var isPortableEditorActive = false
     private var isBindingEditorActive = false
@@ -140,6 +146,97 @@ final class MacroFeatureIntegration: ObservableObject {
     }
     #endif
 
+    /// 由宿主注入本地方案存储。私有组件存在时始终走组件，不启用这条路径。
+    func configureHostApplicationSchemes(
+        profiles: @escaping (UUID?) -> [ButtonMappingProfile],
+        binding: @escaping (UUID, UUID?, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?,
+        create: @escaping (String, [UnifiedButtonBinding], UUID?) -> UUID?,
+        reload: @escaping () -> Bool
+    ) {
+        hostSchemeProfilesProvider = profiles
+        hostSchemeBindingProvider = binding
+        hostSchemeCreator = create
+        hostSchemeReloader = reload
+    }
+
+    func configureHostApplicationSchemeWriters(
+        write: @escaping (UUID, ConfiguredButtonAction?, UUID?, RemoteButton, ButtonTrigger) -> Bool,
+        replace: @escaping (UUID, UUID?, [UnifiedButtonBinding]) -> Bool
+    ) {
+        hostSchemeBindingWriter = write
+        hostSchemeBindingsReplacer = replace
+    }
+
+    /// 当前是否在使用宿主自带的方案存储（也就是私有组件不可用）。
+    var usesHostApplicationSchemes: Bool {
+        #if canImport(SayAllButtonProfiles)
+        false
+        #else
+        hostSchemeProfilesProvider != nil
+        #endif
+    }
+
+    /// APP 页使用的方案列表。私有组件可用时与全局方案完全一致；
+    /// 不可用时只返回宿主为 APP 物化出的方案，不污染全局方案页。
+    func applicationSchemeProfiles(device: UUID?) -> [ButtonMappingProfile] {
+        #if canImport(SayAllButtonProfiles)
+        mappingProfiles(device: device)
+        #else
+        hostSchemeProfilesProvider?(device) ?? []
+        #endif
+    }
+
+    /// 写入方案内的单个手势。私有组件和宿主方案共用同一入口。
+    @discardableResult
+    func writeApplicationSchemeBinding(
+        _ configured: ConfiguredButtonAction?,
+        schemeID: UUID,
+        device: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        #if canImport(SayAllButtonProfiles)
+        return writeProfileBinding(
+            configured,
+            profile: schemeID,
+            button: button,
+            trigger: trigger,
+            displayName: nil
+        )
+        #else
+        return hostSchemeBindingWriter?(schemeID, configured, device, button, trigger) ?? false
+        #endif
+    }
+
+    /// 用完整操作表替换方案内容。用于非 owner 修改时复制当前最终效果。
+    @discardableResult
+    func replaceApplicationSchemeBindings(
+        schemeID: UUID,
+        device: UUID?,
+        bindings: [UnifiedButtonBinding]
+    ) -> Bool {
+        #if canImport(SayAllButtonProfiles)
+        var didWrite = true
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ButtonTrigger.allCases {
+                let configured = bindings.first {
+                    $0.button == button && $0.trigger == trigger
+                }?.configured
+                didWrite = writeProfileBinding(
+                    configured,
+                    profile: schemeID,
+                    button: button,
+                    trigger: trigger,
+                    displayName: nil
+                ) && didWrite
+            }
+        }
+        return didWrite
+        #else
+        return hostSchemeBindingsReplacer?(schemeID, device, bindings) ?? false
+        #endif
+    }
+
     var hasPendingPortableImport: Bool {
         #if canImport(SayAllMacroRemoteMic)
         return feature.portableTransfer.hasPendingImport
@@ -191,7 +288,7 @@ final class MacroFeatureIntegration: ObservableObject {
 
     /// 当前遥控器是否可以使用这套方案。用于 APP 详情的选择与运行期回退。
     func isMappingProfileApplicable(_ mappingProfileID: UUID, device: UUID?) -> Bool {
-        mappingProfiles(device: device).contains { $0.id == mappingProfileID }
+        applicationSchemeProfiles(device: device).contains { $0.id == mappingProfileID }
     }
 
     /// 读取指定方案里某个手势的动作。方案未覆盖或不可用时返回 nil，
@@ -203,6 +300,7 @@ final class MacroFeatureIntegration: ObservableObject {
         trigger: ButtonTrigger
     ) -> ConfiguredButtonAction? {
         guard isMappingProfileApplicable(mappingProfileID, device: device) else { return nil }
+        #if canImport(SayAllButtonProfiles)
         switch displayProfileBinding(device: device, profile: mappingProfileID,
             button: button, trigger: trigger) {
         case let .explicit(value):
@@ -210,6 +308,9 @@ final class MacroFeatureIntegration: ObservableObject {
         case .inherited, .unavailable:
             return nil
         }
+        #else
+        return hostSchemeBindingProvider?(mappingProfileID, device, button, trigger)
+        #endif
     }
 
     func reloadMappingProfiles() -> Bool {
@@ -218,7 +319,8 @@ final class MacroFeatureIntegration: ObservableObject {
         objectWillChange.send()
         return result
         #else
-        false
+        objectWillChange.send()
+        return hostSchemeReloader?() ?? false
         #endif
     }
 
@@ -403,7 +505,8 @@ final class MacroFeatureIntegration: ObservableObject {
         return createLegacyMappingProfile(named: name, copying: source,
             bindings: bindings, holdModes: holdModes, displayNames: displayNames)
         #else
-        return nil
+        guard source == nil else { return nil }
+        return hostSchemeCreator?(name, bindings, nil)
         #endif
     }
 
@@ -561,7 +664,7 @@ final class MacroFeatureIntegration: ObservableObject {
         #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
         buttonProfilesFeature.createProfile(named: name)
         #else
-        nil
+        hostSchemeCreator?(name, [], nil)
         #endif
     }
 

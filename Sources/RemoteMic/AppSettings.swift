@@ -323,6 +323,8 @@ final class AppSettings: ObservableObject {
         static let buttonGestureTimingsByModel = "buttonGestureTimingsByModel"
         static let buttonGestureLearningsByModel = "buttonGestureLearningsByModel"
         static let customApplicationProfiles = "customApplicationProfiles"
+        static let hostApplicationSchemes = "hostApplicationSchemes"
+        static let applicationSchemeOwners = "applicationSchemeOwners"
         static let peripheralIdentifier = "peripheralIdentifier"
         static let remoteDeviceProfiles = "remoteDeviceProfiles"
         static let selectedRemoteProfileID = "selectedRemoteProfileID"
@@ -694,6 +696,19 @@ final class AppSettings: ObservableObject {
             ScrollRegionTargetStore.shared.replace(with: customApplicationProfiles)
         }
     }
+
+    /// 私有按键方案组件缺失时，宿主自己保存的方案。
+    @Published private(set) var hostApplicationSchemes: [HostApplicationScheme] = [] {
+        didSet { saveHostApplicationSchemes() }
+    }
+
+    /// 方案归属：scheme ID → 当前拥有它的 APP 档案 ID。
+    @Published private(set) var applicationSchemeOwners: [String: String] = [:] {
+        didSet { defaults.set(applicationSchemeOwners, forKey: Keys.applicationSchemeOwners) }
+    }
+
+    /// APP 按键写入拦截器。命中时不再写 APP 逐项覆盖，而由方案复制/写入链路处理。
+    var applicationButtonWriteHandler: ((ConfiguredButtonAction?, UUID, RemoteButton, ButtonTrigger) -> ApplicationButtonOverrideWriteResult?)?
 
     @Published private(set) var remoteDeviceProfiles: [RemoteDeviceProfile] {
         didSet { saveRemoteDeviceProfiles() }
@@ -1150,6 +1165,16 @@ final class AppSettings: ObservableObject {
         ) ?? []
         customApplicationProfiles = restoredApplicationProfiles
         ScrollRegionTargetStore.shared.replace(with: restoredApplicationProfiles)
+        hostApplicationSchemes = Self.decodeSetting(
+            [HostApplicationScheme].self,
+            forKey: Keys.hostApplicationSchemes,
+            from: defaults,
+            corrupted: &corruptedKeys
+        ) ?? []
+
+        applicationSchemeOwners = defaults.dictionary(
+            forKey: Keys.applicationSchemeOwners
+        ) as? [String: String] ?? [:]
 
         applicationLanguage = AppLanguage(
             rawValue: defaults.string(forKey: Keys.applicationLanguage) ?? ""
@@ -1845,6 +1870,15 @@ final class AppSettings: ObservableObject {
         let operationID = UUID().uuidString
         let action = configured == nil ? "clear_override" : "write"
         AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=\(action) button=\(button.rawValue) trigger=\(trigger.rawValue) phase=requested result=requested")
+        if let applicationButtonWriteHandler,
+           let handled = applicationButtonWriteHandler(
+               configured,
+               applicationProfileID,
+               button,
+               trigger
+           ) {
+            return handled
+        }
         guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
               let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID })
         else {
@@ -1855,9 +1889,7 @@ final class AppSettings: ObservableObject {
         var bindings = profile.buttonBindings ?? []
         bindings.removeAll { $0.button == button && $0.trigger == trigger }
         if let configured {
-            guard let validated = Self.validatedConfiguredAction(configured),
-                  validated.applicationProfileID.map({ customApplicationProfile(id: $0) != nil }) ?? true
-            else {
+            guard let validated = validatedApplicationConfiguredAction(configured) else {
                 AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_action")
                 return .invalidAction
             }
@@ -1872,6 +1904,15 @@ final class AppSettings: ObservableObject {
         let outcome: ApplicationButtonOverrideWriteResult = configured == nil ? .cleared : .wrote
         AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=\(outcome == .cleared ? "cleared" : "saved") reason=storage_confirmed")
         return outcome
+    }
+
+    func validatedApplicationConfiguredAction(
+        _ configured: ConfiguredButtonAction
+    ) -> ConfiguredButtonAction? {
+        guard let validated = Self.validatedConfiguredAction(configured),
+              validated.applicationProfileID.map({ customApplicationProfile(id: $0) != nil }) ?? true
+        else { return nil }
+        return validated.normalizedForExecution
     }
 
     @discardableResult
@@ -1907,6 +1948,12 @@ final class AppSettings: ObservableObject {
     func removeCustomApplicationProfile(id: UUID) {
         guard customApplicationProfiles.contains(where: { $0.id == id }) else { return }
         customApplicationProfiles.removeAll { $0.id == id }
+        let ownedSchemeKeys = applicationSchemeOwners.compactMap { key, owner in
+            owner == id.uuidString ? key : nil
+        }
+        for key in ownedSchemeKeys {
+            applicationSchemeOwners[key] = nil
+        }
         if portablePendingApplications.contains(id.uuidString) {
             var pending = portablePendingApplications
             pending.remove(id.uuidString)
@@ -2175,6 +2222,130 @@ final class AppSettings: ObservableObject {
         return customApplicationProfiles.first {
             $0.bundleIdentifier == bundleIdentifier
         }?.mappingProfileID
+    }
+
+    /// 私有组件不可用时使用的应用方案列表。只向 APP 页暴露，不混入全局方案页。
+    func hostApplicationSchemeProfiles(device: UUID?) -> [ButtonMappingProfile] {
+        hostApplicationSchemes
+            .filter { scheme in
+                guard let wanted = device, let stored = scheme.deviceProfileID else { return true }
+                return stored == wanted
+            }
+            .map { ButtonMappingProfile(id: $0.id, name: $0.name) }
+    }
+
+    /// 旧宿主方案没有归属记录。只在引用 APP 的默认方案名与方案名匹配时补归属；
+    /// 共享方案优先登记给名字匹配的 APP，避免把别人的方案误判给最后使用者。
+    func reconcileHostApplicationSchemeOwners(
+        defaultName: (CustomApplicationProfile) -> String
+    ) {
+        for scheme in hostApplicationSchemes where applicationSchemeOwner(scheme.id) == nil {
+            let matching = customApplicationProfiles.first {
+                $0.mappingProfileID == scheme.id && scheme.name == defaultName($0)
+            }
+            guard let matching else { continue }
+            setApplicationSchemeOwner(scheme.id, applicationProfileID: matching.id)
+        }
+    }
+
+    func hostApplicationSchemeBinding(
+        mappingProfileID: UUID,
+        device: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        guard let scheme = hostApplicationSchemes.first(where: {
+            $0.id == mappingProfileID &&
+                ($0.deviceProfileID == nil || device == nil || $0.deviceProfileID == device)
+        }) else { return nil }
+        return scheme.bindings.first {
+            $0.button == button && $0.trigger == trigger
+        }?.configured.normalizedForExecution
+    }
+
+    @discardableResult
+    func createHostApplicationScheme(
+        name: String,
+        bindings: [UnifiedButtonBinding],
+        deviceProfileID: UUID?
+    ) -> UUID? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let scheme = HostApplicationScheme(
+            id: UUID(),
+            name: trimmed,
+            bindings: bindings,
+            deviceProfileID: deviceProfileID,
+            createdAt: Date()
+        )
+        hostApplicationSchemes.append(scheme)
+        AppLogger.shared.write(
+            "APP PROFILE FALLBACK action=create profile=host bindings=\(bindings.count) " +
+                "result=success reason=storage_confirmed"
+        )
+        return scheme.id
+    }
+
+    func applicationSchemeOwner(_ schemeID: UUID) -> UUID? {
+        applicationSchemeOwners[schemeID.uuidString].flatMap(UUID.init(uuidString:))
+    }
+
+    func applicationSchemesOwned(by applicationProfileID: UUID) -> [UUID] {
+        applicationSchemeOwners.compactMap { key, value in
+            value == applicationProfileID.uuidString ? UUID(uuidString: key) : nil
+        }
+    }
+
+    func applicationSchemeOwned(by applicationProfileID: UUID) -> UUID? {
+        applicationSchemesOwned(by: applicationProfileID).first
+    }
+
+    func setApplicationSchemeOwner(_ schemeID: UUID, applicationProfileID: UUID?) {
+        applicationSchemeOwners[schemeID.uuidString] = applicationProfileID?.uuidString
+    }
+
+    @discardableResult
+    func writeHostApplicationSchemeBinding(
+        schemeID: UUID,
+        configured: ConfiguredButtonAction?,
+        device: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        guard let index = hostApplicationSchemes.firstIndex(where: {
+            $0.id == schemeID &&
+                ($0.deviceProfileID == nil || device == nil || $0.deviceProfileID == device)
+        }) else { return false }
+        var bindings = hostApplicationSchemes[index].bindings
+        bindings.removeAll { $0.button == button && $0.trigger == trigger }
+        if let configured {
+            bindings.append(UnifiedButtonBinding(
+                remoteProfileID: device,
+                button: button,
+                trigger: trigger,
+                configured: configured.normalizedForExecution
+            ))
+        }
+        hostApplicationSchemes[index].bindings = bindings
+        return true
+    }
+
+    @discardableResult
+    func replaceHostApplicationSchemeBindings(
+        schemeID: UUID,
+        device: UUID?,
+        bindings: [UnifiedButtonBinding]
+    ) -> Bool {
+        guard let index = hostApplicationSchemes.firstIndex(where: {
+            $0.id == schemeID &&
+                ($0.deviceProfileID == nil || device == nil || $0.deviceProfileID == device)
+        }) else { return false }
+        hostApplicationSchemes[index].bindings = bindings.map { binding in
+            var value = binding
+            value.remoteProfileID = device
+            return value
+        }
+        return true
     }
 
     func applicationProfilesSharingMappingProfile(_ mappingProfileID: UUID) -> Int {
@@ -4530,6 +4701,11 @@ final class AppSettings: ObservableObject {
     private func saveCustomApplicationProfiles() {
         guard let data = try? JSONEncoder().encode(customApplicationProfiles) else { return }
         defaults.set(data, forKey: Keys.customApplicationProfiles)
+    }
+
+    private func saveHostApplicationSchemes() {
+        guard let data = try? JSONEncoder().encode(hostApplicationSchemes) else { return }
+        defaults.set(data, forKey: Keys.hostApplicationSchemes)
     }
 
     /// 第一次合并前快照用于追溯原始状态；每次合并前的最新快照用于恢复最近一次操作。
