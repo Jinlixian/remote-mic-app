@@ -5775,8 +5775,6 @@ struct SettingsView: View {
                     applicationSectionCard { applicationBindingSection(profile) }
 
                     applicationSectionCard { applicationButtonSettingsEntry(profile) }
-
-                    applicationSectionCard { applicationSchemeSection(profile) }
                 }
             }
         } else {
@@ -5812,17 +5810,6 @@ struct SettingsView: View {
                 .compatibilityButtonStyle(.prominent)
             }
         }
-    }
-
-    private func applicationSchemeHeaderLabel(_ profile: CustomApplicationProfile) -> String {
-        guard let mappingProfileID = profile.mappingProfileID else {
-            return localization.text("application_profile.page.default")
-        }
-        let schemes = macroFeature.mappingProfiles(device: settings.selectedRemoteProfileID)
-        guard let scheme = schemes.first(where: { $0.id == mappingProfileID }) else {
-            return localization.text("application_profile.page.unavailable")
-        }
-        return String(format: localization.text("application_profile.page.current"), scheme.name)
     }
 
     private func applicationSchemeSection(_ profile: CustomApplicationProfile) -> some View {
@@ -6133,23 +6120,7 @@ struct SettingsView: View {
                     .font(.system(size: 24, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(applicationSchemeHeaderLabel(profile))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
                 Spacer(minLength: 0)
-                Button("application_profile.save_as_new") {
-                    applicationSchemeCreationTargetProfileID = profile.id
-                    applicationSchemeName = String(
-                        format: localization.text("application_profile.create.default_name"),
-                        profile.displayName
-                    )
-                    applicationSchemeFeedback = nil
-                    isApplicationSchemeCreationPresented = true
-                }
-                .compatibilityButtonStyle(.standard)
-                .disabled(macroFeature.mappingProfiles(device: settings.selectedRemoteProfileID).isEmpty)
             }
         } content: {
             VStack(alignment: .leading, spacing: 14) {
@@ -6157,6 +6128,8 @@ struct SettingsView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                applicationSectionCard { applicationSchemeSection(profile) }
 
                 HStack(spacing: 10) {
                     Text(String(format: localization.text("application_buttons.page.count"),
