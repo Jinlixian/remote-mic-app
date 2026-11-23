@@ -1659,14 +1659,8 @@
 "application_profile.shared" = "%d other apps use it too";
 "application_profile.unavailable" = "This profile is not available for the current remote; the default profile is used.";
 "application_profile.component_unavailable" = "The button profile component is required to choose a profile.";
-"application_profile.choose" = "Choose Profile";
 "application_profile.save_as_new" = "Save as New Profile";
 "application_profile.assign_failed" = "Could not select the profile. Try again.";
-"application_profile.picker.title" = "Choose a Button Profile";
-"application_profile.picker.subtitle" = "The selected profile applies while this app is in the foreground.";
-"application_profile.picker.default_subtitle" = "Follow the global Keys page";
-"application_profile.picker.cancel" = "Cancel";
-"application_profile.option.shared" = "%d apps use it";
 "application_profile.create.title" = "Save as New Profile";
 "application_profile.create.hint" = "Saves the app's current button result as a new profile. The original profile stays unchanged.";
 "application_profile.create.name" = "Profile Name";
