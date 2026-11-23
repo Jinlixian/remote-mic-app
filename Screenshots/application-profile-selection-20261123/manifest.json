@@ -4,7 +4,7 @@
   "purpose": "APP 按键设置页顶部「按键方案」选择框：首次显示默认方案，已设置过则显示之前选中的方案；选择框替代按钮和弹窗。",
   "storage": "external-persistent-directory-and-doubao-links",
   "storage_path": "/Users/jinlixian/Pictures/SayAll-Evidence/application-profile-selection-20261123/",
-  "sourceCommit": "0454990316da85515f72c8f9fa8e106699f520cc",
+  "sourceCommit": "eb3e9225",
   "generation": "生产 SettingsView 的 REMOTE_MIC_SETTINGS_SCREENSHOT_DIR 离屏入口，SAYALL_PRIVATE_PLATFORM_MODE=public；REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATIONS_FIXTURE=1 生成备忘录/Safari/Finder 三个 APP 档案，REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTONS=1 打开 Finder 的按键设置页，并带一条确定键覆盖夹具。",
   "contentSize": {
     "width": 1067,
