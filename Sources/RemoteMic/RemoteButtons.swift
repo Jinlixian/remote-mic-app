@@ -812,7 +812,7 @@ struct ApplicationSchemeOperation: Equatable {
         resolver: (RemoteButton, ButtonTrigger) -> ConfiguredButtonAction
     ) -> [String: ApplicationSchemeOperation] {
         var table: [String: ApplicationSchemeOperation] = [:]
-        for button in ApplicationButtonBindingScope.buttons {
+        for button in RemoteButton.profileScopeDisplayOrder {
             for trigger in ApplicationButtonBindingScope.triggers {
                 table["\(button.rawValue).\(trigger.rawValue)"] =
                     ApplicationSchemeOperation(resolver(button, trigger))

@@ -174,6 +174,40 @@ struct ApplicationButtonBindingTests {
         #expect(sanitized == [valid])
     }
 
+    @Test func schemeOperationTableKeepsSchemeScopeSeparate() {
+        let table = ApplicationSchemeOperation.table { _, _ in
+            .init(action: .commandCopy, shortcut: nil)
+        }
+        let schemeButtons = RemoteButton.profileScopeDisplayOrder
+        #expect(table.count == schemeButtons.count * ButtonTrigger.allCases.count)
+        #expect(table["menu.singleClick"] == nil)
+        #expect(table["tv.longPress"] == nil)
+        #expect(table["volume_up.doubleClick"] != nil)
+    }
+
+    @Test func scopedClearKeepsMenuAndTVOverrides() {
+        let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.target" })
+        defer { defaults.removePersistentDomain(forName: name) }
+        let appID = settings.addCustomApplicationProfile(CustomApplicationProfile(
+            displayName: "Target", bundleIdentifier: "com.example.target", applicationPath: ""
+        ))
+        for button in [RemoteButton.ok, .menu, .tv] {
+            #expect(settings.setApplicationButtonOverride(
+                .init(action: .commandCopy, shortcut: nil),
+                applicationProfileID: appID,
+                button: button,
+                trigger: .singleClick
+            ) == .wrote)
+        }
+        #expect(settings.clearApplicationButtonOverrides(
+            applicationProfileID: appID,
+            buttons: Set(RemoteButton.profileScopeDisplayOrder)
+        ) == .cleared)
+        #expect(settings.applicationButtonOverrideExists(for: .ok, trigger: .singleClick) == false)
+        #expect(settings.applicationButtonOverrideExists(for: .menu, trigger: .singleClick))
+        #expect(settings.applicationButtonOverrideExists(for: .tv, trigger: .singleClick))
+    }
+
     @Test func clearOverridesRestoresGlobalImmediately() {
         let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.target" })
         defer { defaults.removePersistentDomain(forName: name) }

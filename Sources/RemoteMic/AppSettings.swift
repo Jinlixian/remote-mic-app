@@ -1876,16 +1876,29 @@ final class AppSettings: ObservableObject {
 
     @discardableResult
     func clearApplicationButtonOverrides(applicationProfileID: UUID) -> ApplicationButtonOverrideWriteResult {
+        clearApplicationButtonOverrides(
+            applicationProfileID: applicationProfileID,
+            buttons: Set(RemoteButton.allCases)
+        )
+    }
+
+    /// 只清除指定按键的覆盖；用于「另存为新方案」时保留无法进入方案的菜单键/TV 键覆盖。
+    func clearApplicationButtonOverrides(
+        applicationProfileID: UUID,
+        buttons: Set<RemoteButton>
+    ) -> ApplicationButtonOverrideWriteResult {
         let operationID = UUID().uuidString
-        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=clear_all phase=requested result=requested")
+        let action = buttons == Set(RemoteButton.allCases) ? "clear_all" : "clear_scope"
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=\(action) phase=requested result=requested")
         guard let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID }) else {
-            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=clear_all phase=completed result=failed reason=invalid_target")
+            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_target")
             return .invalidTarget
         }
         var profile = customApplicationProfiles[index]
-        profile.buttonBindings = nil
+        let remaining = (profile.buttonBindings ?? []).filter { !buttons.contains($0.button) }
+        profile.buttonBindings = remaining.isEmpty ? nil : remaining
         customApplicationProfiles[index] = profile
-        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=clear_all phase=completed result=cleared reason=storage_confirmed")
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=cleared reason=storage_confirmed")
         return .cleared
     }
 

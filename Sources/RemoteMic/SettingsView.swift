@@ -5976,7 +5976,10 @@ struct SettingsView: View {
             candidates: candidates
         ) {
             _ = settings.setApplicationMappingProfileID(existingID, applicationProfileID: target.id)
-            _ = settings.clearApplicationButtonOverrides(applicationProfileID: target.id)
+            _ = settings.clearApplicationButtonOverrides(
+                applicationProfileID: target.id,
+                buttons: Set(RemoteButton.profileScopeDisplayOrder)
+            )
             AppLogger.shared.write(
                 "APP PROFILE ASSIGNMENT action=reuse_existing scope=app result=success"
             )
@@ -5985,7 +5988,7 @@ struct SettingsView: View {
             return
         }
         var bindings: [UnifiedButtonBinding] = []
-        for button in ApplicationButtonBindingScope.buttons {
+        for button in RemoteButton.profileScopeDisplayOrder {
             for trigger in ButtonTrigger.allCases {
                 let configured = settings.configuredAction(
                     for: button,
@@ -6012,7 +6015,11 @@ struct SettingsView: View {
             return
         }
         _ = settings.setApplicationMappingProfileID(created, applicationProfileID: target.id)
-        _ = settings.clearApplicationButtonOverrides(applicationProfileID: target.id)
+        // 菜单键与 TV 键不在键位方案的作用域内，只能保留为 APP 逐项覆盖。
+        _ = settings.clearApplicationButtonOverrides(
+            applicationProfileID: target.id,
+            buttons: Set(RemoteButton.profileScopeDisplayOrder)
+        )
         _ = macroFeature.reloadMappingProfiles()
         AppLogger.shared.write(
             "APP PROFILE ASSIGNMENT action=save_as_new scope=app result=success"
