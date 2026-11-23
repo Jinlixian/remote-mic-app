@@ -1,0 +1,88 @@
+{
+  "batch": "application-profile-selection-20261123",
+  "date": "2026-11-23",
+  "purpose": "按 APP 选择按键方案的详情卡片与按键页入口截图；公开构建下验证默认方案、组件缺失降级和按键页方案标签。",
+  "storage": "external-persistent-directory-and-doubao-links",
+  "storage_path": "/Users/jinlixian/Pictures/SayAll-Evidence/application-profile-selection-20261123/",
+  "sourceCommit": "a47f5b2d5a60379180872353fd13d2a8318c8441",
+  "generation": "生产 SettingsView 的 REMOTE_MIC_SETTINGS_SCREENSHOT_DIR 离屏入口，SAYALL_PRIVATE_PLATFORM_MODE=public；REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATIONS_FIXTURE=1 生成备忘录/Safari/Finder 三个 APP 档案，按键页使用 Finder 的单键覆盖夹具。",
+  "contentSize": {
+    "detail_width": 1067,
+    "detail_height": 1300,
+    "keys_width": 1067,
+    "keys_height": 760
+  },
+  "notes": [
+    "APP 详情使用 1067 宽、1300 高的整页内容截图以完整展示卡片；按键页使用生产最小窗口 1067 × 760。",
+    "公开构建没有私有按键方案组件，因此截图只能证明「默认方案」卡片、组件缺失说明和按键页方案标签；选择方案、方案列表、另存为新方案的完整交互需要私有组件构建，当前未取证。",
+    "图片由离屏渲染器生成，不是真实窗口运行截图；真实遥控器、第三方 APP 前台切换与私有组件验收仍为 pending。",
+    "图片字节不入库，本文件只做文本索引；外部链接为持久上传地址，下载后应核对 SHA-256。",
+    "中文内容宽度下字号不小于 12pt，浅色和深色分别检查；未发现裁切或横向滚动。"
+  ],
+  "files": [
+    {
+      "file": "app-detail-zh-light.png",
+      "format": "png",
+      "width": 2134,
+      "height": 2600,
+      "sha256": "f4d890b3f7f1fc0451da18ec4ce203b7126c0dcdacbd77e1af2bebc3cd1349e7",
+      "url": "https://aka.doubaocdn.com/s/U0dZZ5UH6L"
+    },
+    {
+      "file": "app-detail-zh-dark.png",
+      "format": "png",
+      "width": 2134,
+      "height": 2600,
+      "sha256": "5808fcfaa2749fdeead60ae58459a0523a05aaebc9f856e5f476e28589726fbf",
+      "url": "https://aka.doubaocdn.com/s/LCL0uWj9YN"
+    },
+    {
+      "file": "app-detail-en-light.png",
+      "format": "png",
+      "width": 2134,
+      "height": 2600,
+      "sha256": "16959bbf2e80876b5339e1a27fb8343624e7f5ce95f83842ffc1ecb30afe4779",
+      "url": "https://aka.doubaocdn.com/s/dBWFeovTrP"
+    },
+    {
+      "file": "app-detail-en-dark.png",
+      "format": "png",
+      "width": 2134,
+      "height": 2600,
+      "sha256": "d2a70c44c3b850db195873e4152d8252fe2a4f05f4279b778bebcb7ac26b401d",
+      "url": "https://aka.doubaocdn.com/s/WR5QcCHJvD"
+    },
+    {
+      "file": "app-keys-zh-light.png",
+      "format": "png",
+      "width": 2134,
+      "height": 1520,
+      "sha256": "060ed9f22a5fe7de22de9cf6f4aa2369e9bb9c3a95a9a2bc667801b7917913f2",
+      "url": "https://aka.doubaocdn.com/s/AyYvVhq16y"
+    },
+    {
+      "file": "app-keys-zh-dark.png",
+      "format": "png",
+      "width": 2134,
+      "height": 1520,
+      "sha256": "f8cd8a68797377cff14aca1cc6b438e94192cba184044160d61d3caccfcd8e79",
+      "url": "https://aka.doubaocdn.com/s/N1yroiIGy3"
+    },
+    {
+      "file": "app-keys-en-light.png",
+      "format": "png",
+      "width": 2134,
+      "height": 1520,
+      "sha256": "59fbb384c7ec4b03dc58518e8a658915598c04133798d54d4e5616c4773b3efd",
+      "url": "https://aka.doubaocdn.com/s/46qUl6z6Ox"
+    },
+    {
+      "file": "app-keys-en-dark.png",
+      "format": "png",
+      "width": 2134,
+      "height": 1520,
+      "sha256": "f6f1cc81ced5a06ea643472485a15bafe285e0f69c19cab4190b284143dec7ab",
+      "url": "https://aka.doubaocdn.com/s/ZnUJnXbW6U"
+    }
+  ]
+}
