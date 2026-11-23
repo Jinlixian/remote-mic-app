@@ -9173,9 +9173,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         trigger: ButtonTrigger,
         source: String = "host_action"
     ) -> Bool {
-        // APP 指定了可用方案时，全局「当前生效方案」必须让位；这里返回 false，
-        // 由调用方走 configuredAction，再由它按「逐项覆盖 → APP 方案 → 全局」解析。
-        guard settings.activeAssignedMappingProfileID() == nil else { return false }
+        // APP 指定方案只覆盖它有显式动作的手势；未覆盖的手势继续继承全局
+        // 「当前生效方案」，包括旧组件里的组合动作绑定。
+        guard !settings.applicationAssignedProfileHasBinding(for: button, trigger: trigger)
+        else { return false }
         let hasBinding = macroFeature.hasActiveBinding(
             profileID: profileID,
             button: button,
