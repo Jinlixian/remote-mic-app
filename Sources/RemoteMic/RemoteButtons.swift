@@ -835,6 +835,9 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
     /// Explicit action overrides for ordinary buttons. Missing entries inherit the
     /// current global mapping; decoded old profiles leave this nil.
     var buttonBindings: [ApplicationButtonBinding]?
+    /// APP 级选择的键位方案。nil 表示默认方案（跟随全局解析）。方案内容仍由私有
+    /// 按键方案组件持有，这里只保存引用。
+    var mappingProfileID: UUID?
 
     init(
         id: UUID = UUID(),
@@ -845,7 +848,8 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         focusShortcut: CustomKeyboardShortcut? = nil,
         accessibilityTarget: AccessibilityFocusTarget? = nil,
         scrollRegionTarget: ScrollRegionTarget? = nil,
-        buttonBindings: [ApplicationButtonBinding]? = nil
+        buttonBindings: [ApplicationButtonBinding]? = nil,
+        mappingProfileID: UUID? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -856,6 +860,7 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         self.accessibilityTarget = accessibilityTarget
         self.scrollRegionTarget = scrollRegionTarget
         self.buttonBindings = buttonBindings
+        self.mappingProfileID = mappingProfileID
     }
 }
 

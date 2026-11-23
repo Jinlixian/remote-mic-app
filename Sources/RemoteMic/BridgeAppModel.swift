@@ -1282,6 +1282,29 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         settings.frontmostApplicationBundleIdentifier = {
             NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         }
+        settings.assignedMappingProfileApplicable = { [weak self] mappingProfileID in
+            guard let self else { return false }
+            return self.macroFeature.isMappingProfileApplicable(
+                mappingProfileID,
+                device: self.settings.selectedRemoteProfileID
+            )
+        }
+        settings.assignedMappingProfileAction = { [weak self] mappingProfileID, button, trigger in
+            guard let self else { return nil }
+            return self.macroFeature.assignedApplicationBinding(
+                mappingProfileID: mappingProfileID,
+                device: self.settings.selectedRemoteProfileID,
+                button: button,
+                trigger: trigger
+            )
+        }
+        // 方案被删除后清掉悬空引用；组件不可用时列表为空，不能据此清空用户引用。
+        let knownMappingProfiles = macroFeature.mappingProfiles(device: nil)
+        if !knownMappingProfiles.isEmpty {
+            settings.clearUnavailableApplicationMappingProfileReferences(
+                valid: Set(knownMappingProfiles.map(\.id))
+            )
+        }
         siriRemoteCursorFeedback.setVisualFeedbackEnabled(
             settings.siriRemoteCursorFeedbackVisible
         )
@@ -9150,6 +9173,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         trigger: ButtonTrigger,
         source: String = "host_action"
     ) -> Bool {
+        // APP 指定了可用方案时，全局「当前生效方案」必须让位；这里返回 false，
+        // 由调用方走 configuredAction，再由它按「逐项覆盖 → APP 方案 → 全局」解析。
+        guard settings.activeAssignedMappingProfileID() == nil else { return false }
         let hasBinding = macroFeature.hasActiveBinding(
             profileID: profileID,
             button: button,

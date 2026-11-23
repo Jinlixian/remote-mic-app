@@ -1649,3 +1649,31 @@
 "connection.siri_remote_component.retry_detail" = "上次安装未完成。可以重试；取消后不会自动重复弹窗。";
 
 "connection.siri_remote_component.installing" = "正在等待管理员授权…";
+
+/* 按 APP 选择键位方案 */
+"application_profile.section.title" = "按键方案";
+"application_profile.default" = "默认方案";
+"application_profile.default.detail" = "与全局按键页当前生效的方案一致";
+"application_profile.assigned.detail" = "这个 APP 在前台时使用这套方案";
+"application_profile.shared" = "另有 %d 个 APP 也在使用";
+"application_profile.unavailable" = "这套方案在当前遥控器上不可用，已回退默认方案";
+"application_profile.component_unavailable" = "需要按键方案组件才能选择方案";
+"application_profile.choose" = "选择方案";
+"application_profile.save_as_new" = "另存为新方案";
+"application_profile.assign_failed" = "选择失败，请重试";
+"application_profile.picker.title" = "选择按键方案";
+"application_profile.picker.subtitle" = "选中的方案会在该 APP 前台时生效。";
+"application_profile.picker.default_subtitle" = "跟随全局按键页";
+"application_profile.picker.cancel" = "取消";
+"application_profile.option.shared" = "被 %d 个 APP 使用";
+"application_profile.create.title" = "另存为新方案";
+"application_profile.create.hint" = "会把当前 APP 的最终按键效果保存成新方案，原方案不变。";
+"application_profile.create.name" = "方案名称";
+"application_profile.create.default_name" = "%@ 方案";
+"application_profile.create.invalid_name" = "请输入方案名称";
+"application_profile.create.failed" = "创建方案失败，请确认按键方案组件可用";
+"application_profile.create.cancel" = "取消";
+"application_profile.create.save" = "保存";
+"application_profile.page.default" = "当前方案：默认方案";
+"application_profile.page.current" = "当前方案：%@";
+"application_profile.page.unavailable" = "当前方案：不可用";
