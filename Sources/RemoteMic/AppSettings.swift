@@ -462,6 +462,10 @@ final class AppSettings: ObservableObject {
 
     var configuredActionOverride: ((UUID?, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
     var frontmostApplicationBundleIdentifier: (() -> String?)?
+    /// APP 指定方案的可用性判定，由宿主注入（方案列表属于私有按键方案组件）。
+    var assignedMappingProfileApplicable: ((UUID) -> Bool)?
+    /// 读取 APP 指定方案里某个手势的动作；未覆盖时返回 nil，由调用方继承基础映射。
+    var assignedMappingProfileAction: ((UUID, RemoteButton, ButtonTrigger) -> ConfiguredButtonAction?)?
     private let applicationButtonResolutionLock = NSLock()
     private var lastApplicationButtonResolution: (
         key: String,
@@ -1872,16 +1876,29 @@ final class AppSettings: ObservableObject {
 
     @discardableResult
     func clearApplicationButtonOverrides(applicationProfileID: UUID) -> ApplicationButtonOverrideWriteResult {
+        clearApplicationButtonOverrides(
+            applicationProfileID: applicationProfileID,
+            buttons: Set(RemoteButton.allCases)
+        )
+    }
+
+    /// 只清除指定按键的覆盖；用于「另存为新方案」时保留无法进入方案的菜单键/TV 键覆盖。
+    func clearApplicationButtonOverrides(
+        applicationProfileID: UUID,
+        buttons: Set<RemoteButton>
+    ) -> ApplicationButtonOverrideWriteResult {
         let operationID = UUID().uuidString
-        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=clear_all phase=requested result=requested")
+        let action = buttons == Set(RemoteButton.allCases) ? "clear_all" : "clear_scope"
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) scope=application_overrides action=\(action) phase=requested result=requested")
         guard let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID }) else {
-            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=clear_all phase=completed result=failed reason=invalid_target")
+            AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=failed reason=invalid_target")
             return .invalidTarget
         }
         var profile = customApplicationProfiles[index]
-        profile.buttonBindings = nil
+        let remaining = (profile.buttonBindings ?? []).filter { !buttons.contains($0.button) }
+        profile.buttonBindings = remaining.isEmpty ? nil : remaining
         customApplicationProfiles[index] = profile
-        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=clear_all phase=completed result=cleared reason=storage_confirmed")
+        AppLogger.shared.write("APP BUTTON CONFIGURATION operation_id=\(operationID) action=\(action) phase=completed result=cleared reason=storage_confirmed")
         return .cleared
     }
 
@@ -1957,15 +1974,122 @@ final class AppSettings: ObservableObject {
 
     func configuredAction(for button: RemoteButton, trigger: ButtonTrigger,
                           profileID: UUID?) -> ConfiguredButtonAction {
-        let applicationOverride = applicationButtonOverride(for: button, trigger: trigger)
-        return applicationOverride ?? configuredGlobalAction(for: button, trigger: trigger, profileID: profileID)
+        configuredAction(
+            for: button,
+            trigger: trigger,
+            profileID: profileID,
+            applicationBundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    /// 按指定 APP 的档案解析动作，不依赖当前前台是谁。APP 详情与「另存为新方案」
+    /// 必须使用这个入口，否则设置窗口在前台时会把其它 APP 的配置存成方案。
+    func configuredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?,
+        applicationBundleIdentifier: String?
+    ) -> ConfiguredButtonAction {
+        if let applicationOverride = applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
+            return applicationOverride
+        }
+        if let assigned = applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
+            return assigned
+        }
+        return configuredGlobalAction(for: button, trigger: trigger, profileID: profileID)
+    }
+
+    /// 当前前台 APP 是否指定了一套可用的键位方案。命中时全局「当前生效方案」
+    /// 必须让位给 APP 指定方案，即使该手势在方案里是「继承」。
+    func activeAssignedMappingProfileID() -> UUID? {
+        activeAssignedMappingProfileID(
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    func activeAssignedMappingProfileID(bundleIdentifier: String?) -> UUID? {
+        guard customMappingEnabled,
+              let bundleIdentifier,
+              let profile = customApplicationProfiles.first(where: {
+                  $0.bundleIdentifier == bundleIdentifier
+              }),
+              let mappingProfileID = profile.mappingProfileID,
+              assignedMappingProfileApplicable?(mappingProfileID) == true
+        else { return nil }
+        return mappingProfileID
+    }
+
+    private func applicationAssignedProfileAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationAssignedProfileAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
+        // 键位方案自身仍只覆盖 10 个普通按键；菜单键与 TV 键只能通过 APP 逐项覆盖，
+        // 不能被 APP 指定的方案隐式接管。
+        guard RemoteButton.profileScopeDisplayOrder.contains(button),
+              ApplicationButtonBindingScope.triggers.contains(trigger),
+              let mappingProfileID = activeAssignedMappingProfileID(
+                  bundleIdentifier: bundleIdentifier
+              )
+        else { return nil }
+        return assignedMappingProfileAction?(mappingProfileID, button, trigger)
+    }
+
+    /// 所选方案在该手势上有显式动作（包括显式「不执行」）。
+    func applicationAssignedProfileHasBinding(
+        for button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> Bool {
+        applicationAssignedProfileAction(for: button, trigger: trigger) != nil
+    }
+
+    func applicationAssignedProfileHasBinding(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> Bool {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: bundleIdentifier
+        ) != nil
     }
 
     private func applicationButtonOverride(
         for button: RemoteButton,
         trigger: ButtonTrigger
     ) -> ConfiguredButtonAction? {
-        let bundleIdentifier = frontmostApplicationBundleIdentifier?()
+        applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationButtonOverride(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
         let state = ApplicationButtonBindingScope.overrideState(
             customMappingEnabled: customMappingEnabled,
             supportedButton: ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
@@ -2044,6 +2168,68 @@ final class AppSettings: ObservableObject {
             button: button,
             trigger: trigger
         )
+    }
+
+    func applicationMappingProfileID(for bundleIdentifier: String?) -> UUID? {
+        guard let bundleIdentifier else { return nil }
+        return customApplicationProfiles.first {
+            $0.bundleIdentifier == bundleIdentifier
+        }?.mappingProfileID
+    }
+
+    func applicationProfilesSharingMappingProfile(_ mappingProfileID: UUID) -> Int {
+        customApplicationProfiles.filter { $0.mappingProfileID == mappingProfileID }.count
+    }
+
+    @discardableResult
+    func setApplicationMappingProfileID(
+        _ mappingProfileID: UUID?,
+        applicationProfileID: UUID
+    ) -> Bool {
+        let operationID = UUID().uuidString
+        let action = mappingProfileID == nil ? "clear" : "assign"
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT operation_id=\(operationID) scope=app " +
+                "action=\(action) phase=requested result=requested"
+        )
+        guard let index = customApplicationProfiles.firstIndex(where: { $0.id == applicationProfileID })
+        else {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT operation_id=\(operationID) action=\(action) " +
+                    "phase=completed result=failed reason=invalid_target"
+            )
+            return false
+        }
+        var profile = customApplicationProfiles[index]
+        profile.mappingProfileID = mappingProfileID
+        customApplicationProfiles[index] = profile
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT operation_id=\(operationID) action=\(action) " +
+                "phase=completed result=saved reason=storage_confirmed"
+        )
+        return true
+    }
+
+    /// 方案被删除或不再可用时，清掉指向它的 APP 引用。返回清理数量。
+    @discardableResult
+    func clearUnavailableApplicationMappingProfileReferences(
+        valid: Set<UUID>
+    ) -> Int {
+        var cleared = 0
+        for index in customApplicationProfiles.indices {
+            guard let mappingProfileID = customApplicationProfiles[index].mappingProfileID,
+                  !valid.contains(mappingProfileID)
+            else { continue }
+            customApplicationProfiles[index].mappingProfileID = nil
+            cleared += 1
+        }
+        if cleared > 0 {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=clear_invalid scope=app count=\(cleared) " +
+                    "result=cleared reason=profile_unavailable"
+            )
+        }
+        return cleared
     }
 
     var selectedRemoteProfile: RemoteDeviceProfile? {

@@ -106,6 +106,35 @@ struct ApplicationButtonBindingTests {
         #expect(state == .globalFallback(reason: "custom_mapping_disabled"))
     }
 
+    @Test func scopeCoversEveryPhysicalXiaomiButton() {
+        #expect(ApplicationButtonBindingScope.buttons.first == .power)
+        #expect(Set(ApplicationButtonBindingScope.buttons) == Set(RemoteButton.xiaomiCases))
+        #expect(ApplicationButtonBindingScope.contains(button: .menu, trigger: .singleClick))
+        #expect(ApplicationButtonBindingScope.contains(button: .tv, trigger: .longPress))
+    }
+
+    @Test func menuAndTVOverridesTakeEffect() {
+        let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.target" })
+        defer { defaults.removePersistentDomain(forName: name) }
+        let appID = settings.addCustomApplicationProfile(CustomApplicationProfile(
+            displayName: "Target", bundleIdentifier: "com.example.target", applicationPath: ""
+        ))
+        #expect(settings.setApplicationButtonOverride(
+            .init(action: .commandCopy, shortcut: nil),
+            applicationProfileID: appID,
+            button: .menu,
+            trigger: .singleClick
+        ) == .wrote)
+        #expect(settings.setApplicationButtonOverride(
+            .init(action: .commandPaste, shortcut: nil),
+            applicationProfileID: appID,
+            button: .tv,
+            trigger: .longPress
+        ) == .wrote)
+        #expect(settings.configuredAction(for: .menu, trigger: .singleClick, profileID: nil).action == .commandCopy)
+        #expect(settings.configuredAction(for: .tv, trigger: .longPress, profileID: nil).action == .commandPaste)
+    }
+
     @Test func unsupportedButtonsNeverUseApplicationOverrides() {
         let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.target" })
         defer { defaults.removePersistentDomain(forName: name) }
@@ -115,11 +144,11 @@ struct ApplicationButtonBindingTests {
         let writeResult = settings.setApplicationButtonOverride(
             .disabled,
             applicationProfileID: appID,
-            button: .tv,
+            button: .playPause,
             trigger: .singleClick
         )
         #expect(writeResult == .invalidTarget)
-        #expect(settings.applicationButtonOverrideExists(for: .tv, trigger: .singleClick) == false)
+        #expect(settings.applicationButtonOverrideExists(for: .playPause, trigger: .singleClick) == false)
     }
 
     @Test func sanitizeDropsInvalidAndDuplicateBindings() {
@@ -134,7 +163,7 @@ struct ApplicationButtonBindingTests {
             configured: .init(action: .commandPaste, shortcut: nil)
         )
         let unsupported = ApplicationButtonBinding(
-            button: .tv,
+            button: .mute,
             trigger: .singleClick,
             configured: .disabled
         )
@@ -143,6 +172,40 @@ struct ApplicationButtonBindingTests {
             validateAction: { $0 }
         )
         #expect(sanitized == [valid])
+    }
+
+    @Test func schemeOperationTableKeepsSchemeScopeSeparate() {
+        let table = ApplicationSchemeOperation.table { _, _ in
+            .init(action: .commandCopy, shortcut: nil)
+        }
+        let schemeButtons = RemoteButton.profileScopeDisplayOrder
+        #expect(table.count == schemeButtons.count * ButtonTrigger.allCases.count)
+        #expect(table["menu.singleClick"] == nil)
+        #expect(table["tv.longPress"] == nil)
+        #expect(table["volume_up.doubleClick"] != nil)
+    }
+
+    @Test func scopedClearKeepsMenuAndTVOverrides() {
+        let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.target" })
+        defer { defaults.removePersistentDomain(forName: name) }
+        let appID = settings.addCustomApplicationProfile(CustomApplicationProfile(
+            displayName: "Target", bundleIdentifier: "com.example.target", applicationPath: ""
+        ))
+        for button in [RemoteButton.ok, .menu, .tv] {
+            #expect(settings.setApplicationButtonOverride(
+                .init(action: .commandCopy, shortcut: nil),
+                applicationProfileID: appID,
+                button: button,
+                trigger: .singleClick
+            ) == .wrote)
+        }
+        #expect(settings.clearApplicationButtonOverrides(
+            applicationProfileID: appID,
+            buttons: Set(RemoteButton.profileScopeDisplayOrder)
+        ) == .cleared)
+        #expect(settings.applicationButtonOverrideExists(for: .ok, trigger: .singleClick) == false)
+        #expect(settings.applicationButtonOverrideExists(for: .menu, trigger: .singleClick))
+        #expect(settings.applicationButtonOverrideExists(for: .tv, trigger: .singleClick))
     }
 
     @Test func clearOverridesRestoresGlobalImmediately() {

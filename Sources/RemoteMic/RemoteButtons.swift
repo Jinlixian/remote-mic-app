@@ -634,7 +634,12 @@ struct ApplicationButtonBinding: Codable, Equatable, Identifiable {
 }
 
 enum ApplicationButtonBindingScope {
-    static let buttons = RemoteButton.profileScopeDisplayOrder
+    /// APP 覆盖按物理遥控器实际存在的普通按键定义，不能复用键位方案的 10 键白名单。
+    /// 底部菜单键与 TV 键同样可以按 APP 单独配置；语音键和按住行为仍不在本页。
+    static let buttons: [RemoteButton] = [
+        .power, .up, .down, .left, .right, .ok, .back, .home,
+        .volumeUp, .volumeDown, .menu, .tv,
+    ]
     static let triggers = ButtonTrigger.allCases
 
     enum OverrideState: Equatable {
@@ -780,6 +785,53 @@ struct ConfiguredButtonAction: Codable, Equatable {
     }
 }
 
+/// 判断两套 APP 按键配置是否属于同一方案时使用的规范化操作。
+///
+/// 只保留「哪个键/手势 → 执行什么操作」，故意丢弃方案名、方案 ID、APP 档案名、
+/// 绑定顺序、快捷键显示文字等元数据；否则同一套操作会因展示文案或创建时间不同
+/// 被误判成两套方案。
+struct ApplicationSchemeOperation: Equatable {
+    let action: ButtonAction
+    let shortcutKeyCode: UInt16?
+    let shortcutModifierFlagsRawValue: UInt
+    let applicationProfileID: UUID?
+    let macroID: String?
+
+    init(_ configured: ConfiguredButtonAction) {
+        let normalized = configured.normalizedForExecution
+        action = normalized.action
+        shortcutKeyCode = normalized.shortcut?.keyCode
+        shortcutModifierFlagsRawValue = normalized.shortcut?.modifierFlagsRawValue ?? 0
+        applicationProfileID = normalized.action == .openCustomApplication
+            ? normalized.applicationProfileID
+            : nil
+        macroID = normalized.macroID
+    }
+
+    static func table(
+        resolver: (RemoteButton, ButtonTrigger) -> ConfiguredButtonAction
+    ) -> [String: ApplicationSchemeOperation] {
+        var table: [String: ApplicationSchemeOperation] = [:]
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ApplicationButtonBindingScope.triggers {
+                table["\(button.rawValue).\(trigger.rawValue)"] =
+                    ApplicationSchemeOperation(resolver(button, trigger))
+            }
+        }
+        return table
+    }
+}
+
+enum ApplicationSchemeMatcher {
+    /// 在已有方案里找操作完全一致的一套；名称、ID、创建时间与顺序不参与比较。
+    static func matchingSchemeID(
+        target: [String: ApplicationSchemeOperation],
+        candidates: [(id: UUID, operations: [String: ApplicationSchemeOperation])]
+    ) -> UUID? {
+        candidates.first { $0.operations == target }?.id
+    }
+}
+
 /// 可以被「按住执行」一直按住的目标键。
 struct HoldableKey: Equatable {
     let keyCode: CGKeyCode
@@ -835,6 +887,9 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
     /// Explicit action overrides for ordinary buttons. Missing entries inherit the
     /// current global mapping; decoded old profiles leave this nil.
     var buttonBindings: [ApplicationButtonBinding]?
+    /// APP 级选择的键位方案。nil 表示默认方案（跟随全局解析）。方案内容仍由私有
+    /// 按键方案组件持有，这里只保存引用。
+    var mappingProfileID: UUID?
 
     init(
         id: UUID = UUID(),
@@ -845,7 +900,8 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         focusShortcut: CustomKeyboardShortcut? = nil,
         accessibilityTarget: AccessibilityFocusTarget? = nil,
         scrollRegionTarget: ScrollRegionTarget? = nil,
-        buttonBindings: [ApplicationButtonBinding]? = nil
+        buttonBindings: [ApplicationButtonBinding]? = nil,
+        mappingProfileID: UUID? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -856,6 +912,7 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
         self.accessibilityTarget = accessibilityTarget
         self.scrollRegionTarget = scrollRegionTarget
         self.buttonBindings = buttonBindings
+        self.mappingProfileID = mappingProfileID
     }
 }
 

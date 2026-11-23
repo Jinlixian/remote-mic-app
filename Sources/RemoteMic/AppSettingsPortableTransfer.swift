@@ -218,6 +218,18 @@ extension AppSettings {
                 }
             )
         }
+        // 方案 ID 属于本机私有按键方案组件，跨机导入会悬空；一律回退默认方案。
+        var clearedMappingProfiles = 0
+        for index in profiles.indices where profiles[index].mappingProfileID != nil {
+            profiles[index].mappingProfileID = nil
+            clearedMappingProfiles += 1
+        }
+        if clearedMappingProfiles > 0 {
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=clear_import scope=app count=\(clearedMappingProfiles) " +
+                    "result=cleared reason=portable_transfer"
+            )
+        }
         p = PortableTransferGraph.remapping(p, macros: [:],shortcuts: [:],focuses: [:],applications: map)
         p.applications = Dictionary(grouping: p.applications,by: \.id).values.compactMap(\.first).sorted { $0.id < $1.id }
         p.roots = p.roots.reduce(into: []) { if !$0.contains($1) { $0.append($1) } }

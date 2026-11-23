@@ -677,6 +677,10 @@ struct SettingsView: View {
     @State private var applicationButtonActionFilter: MappingActionFilter = .all
     @State private var applicationButtonEditingScrollRequest = 0
     @State private var isApplicationButtonClearConfirmationPresented = false
+    @State private var isApplicationSchemeCreationPresented = false
+    @State private var applicationSchemeCreationTargetProfileID: UUID?
+    @State private var applicationSchemeName = ""
+    @State private var applicationSchemeFeedback: String?
     /// 正在确认移除的 APP 档案；非空时弹确认框。
     @State private var applicationPendingRemoval: CustomApplicationProfile?
     @State private var shortcutCaptureFeedback: ShortcutCaptureFeedback?
@@ -5541,6 +5545,13 @@ struct SettingsView: View {
     }
 
     private var applicationsPage: some View {
+        applicationsPageContent
+            .sheet(isPresented: $isApplicationSchemeCreationPresented) {
+                applicationSchemeCreationSheet()
+            }
+    }
+
+    private var applicationsPageContent: some View {
         if let profileID = applicationButtonSettingsProfileID,
            let profile = settings.customApplicationProfile(id: profileID) {
             return AnyView(applicationButtonSettingsPage(profile))
@@ -5796,6 +5807,227 @@ struct SettingsView: View {
         }
     }
 
+    private func applicationSchemeSection(_ profile: CustomApplicationProfile) -> some View {
+        let profiles = macroFeature.mappingProfiles(device: settings.selectedRemoteProfileID)
+            .filter { !$0.isDefault }
+        let componentAvailable = !macroFeature.mappingProfiles(
+            device: settings.selectedRemoteProfileID
+        ).isEmpty
+        let current = profile.mappingProfileID.flatMap { id in
+            profiles.first { $0.id == id }
+        }
+        let assignedButUnavailable = profile.mappingProfileID != nil && current == nil
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("application_profile.section.title")
+                .font(.system(size: 14, weight: .semibold))
+            HStack(spacing: 12) {
+                Picker(selection: Binding(
+                    get: { profile.mappingProfileID },
+                    set: { selected in
+                        guard componentAvailable, selected != profile.mappingProfileID
+                        else { return }
+                        guard settings.setApplicationMappingProfileID(
+                            selected,
+                            applicationProfileID: profile.id
+                        ) else {
+                            applicationSchemeFeedback = localization.text(
+                                "application_profile.assign_failed"
+                            )
+                            return
+                        }
+                        applicationSchemeFeedback = nil
+                    }
+                )) {
+                    Text("application_profile.default").tag(nil as UUID?)
+                    if assignedButUnavailable, let mappingProfileID = profile.mappingProfileID {
+                        Text("application_profile.page.unavailable")
+                            .tag(Optional(mappingProfileID))
+                    }
+                    ForEach(profiles) { scheme in
+                        Text(scheme.name).tag(Optional(scheme.id))
+                    }
+                } label: {
+                    EmptyView()
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 180, maxWidth: 280, alignment: .leading)
+                .disabled(!componentAvailable)
+
+                Spacer(minLength: 0)
+
+                Button("application_profile.save_as_new") {
+                    applicationSchemeCreationTargetProfileID = profile.id
+                    applicationSchemeName = String(
+                        format: localization.text("application_profile.create.default_name"),
+                        profile.displayName
+                    )
+                    applicationSchemeFeedback = nil
+                    isApplicationSchemeCreationPresented = true
+                }
+                .compatibilityButtonStyle(.prominent)
+                .disabled(!componentAvailable)
+            }
+            Text(assignedButUnavailable
+                ? localization.text("application_profile.unavailable")
+                : current == nil
+                    ? localization.text("application_profile.default.detail")
+                    : localization.text("application_profile.assigned.detail"))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let current, profile.mappingProfileID != nil {
+                let shared = max(settings.applicationProfilesSharingMappingProfile(current.id) - 1, 0)
+                if shared > 0 {
+                    Text(String(format: localization.text("application_profile.shared"), shared))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !componentAvailable {
+                Text("application_profile.component_unavailable")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let feedback = applicationSchemeFeedback {
+                Text(feedback)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func applicationSchemeCreationSheet() -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("application_profile.create.title")
+                .font(.system(size: 16, weight: .semibold))
+            Text("application_profile.create.hint")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("application_profile.create.name", text: $applicationSchemeName)
+                .textFieldStyle(.roundedBorder)
+            if let feedback = applicationSchemeFeedback {
+                Text(feedback)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer(minLength: 0)
+                Button("application_profile.create.cancel") {
+                    isApplicationSchemeCreationPresented = false
+                    applicationSchemeFeedback = nil
+                }
+                .compatibilityButtonStyle(.standard)
+                Button("application_profile.create.save") {
+                    saveApplicationSchemeAsNew()
+                }
+                .compatibilityButtonStyle(.prominent)
+            }
+        }
+        .padding(18)
+        .frame(width: 420)
+    }
+
+    private func saveApplicationSchemeAsNew() {
+        let trimmed = applicationSchemeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            applicationSchemeFeedback = localization.text("application_profile.create.invalid_name")
+            return
+        }
+        guard let targetID = applicationSchemeCreationTargetProfileID,
+              let target = settings.customApplicationProfile(id: targetID)
+        else {
+            applicationSchemeFeedback = localization.text("application_profile.create.failed")
+            return
+        }
+        let deviceID = settings.selectedRemoteProfileID
+        let targetOperations = ApplicationSchemeOperation.table { button, trigger in
+            settings.configuredAction(
+                for: button,
+                trigger: trigger,
+                profileID: deviceID,
+                applicationBundleIdentifier: target.bundleIdentifier
+            )
+        }
+        let candidates = macroFeature.mappingProfiles(device: deviceID)
+            .filter { !$0.isDefault }
+            .map { scheme in
+                (id: scheme.id, operations: ApplicationSchemeOperation.table { button, trigger in
+                    macroFeature.assignedApplicationBinding(
+                        mappingProfileID: scheme.id,
+                        device: deviceID,
+                        button: button,
+                        trigger: trigger
+                    ) ?? settings.configuredGlobalAction(
+                        for: button,
+                        trigger: trigger,
+                        profileID: deviceID
+                    )
+                })
+            }
+        // 只比较「按键 → 操作」。名称、方案 ID、APP 档案、绑定顺序和快捷键展示
+        // 文字都不参与，否则同一套配置会被重复保存成多个方案。
+        if let existingID = ApplicationSchemeMatcher.matchingSchemeID(
+            target: targetOperations,
+            candidates: candidates
+        ) {
+            _ = settings.setApplicationMappingProfileID(existingID, applicationProfileID: target.id)
+            _ = settings.clearApplicationButtonOverrides(
+                applicationProfileID: target.id,
+                buttons: Set(RemoteButton.profileScopeDisplayOrder)
+            )
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=reuse_existing scope=app result=success"
+            )
+            applicationSchemeFeedback = nil
+            isApplicationSchemeCreationPresented = false
+            return
+        }
+        var bindings: [UnifiedButtonBinding] = []
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ButtonTrigger.allCases {
+                let configured = settings.configuredAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: deviceID,
+                    applicationBundleIdentifier: target.bundleIdentifier
+                )
+                guard configured.action != .disabled else { continue }
+                bindings.append(UnifiedButtonBinding(
+                    remoteProfileID: nil,
+                    button: button,
+                    trigger: trigger,
+                    configured: configured
+                ))
+            }
+        }
+        guard let created = macroFeature.createMappingProfile(
+            named: trimmed,
+            copying: nil,
+            bindings: bindings,
+            holdModes: [:]
+        ) else {
+            applicationSchemeFeedback = localization.text("application_profile.create.failed")
+            return
+        }
+        _ = settings.setApplicationMappingProfileID(created, applicationProfileID: target.id)
+        // 菜单键与 TV 键不在键位方案的作用域内，只能保留为 APP 逐项覆盖。
+        _ = settings.clearApplicationButtonOverrides(
+            applicationProfileID: target.id,
+            buttons: Set(RemoteButton.profileScopeDisplayOrder)
+        )
+        _ = macroFeature.reloadMappingProfiles()
+        AppLogger.shared.write(
+            "APP PROFILE ASSIGNMENT action=save_as_new scope=app result=success"
+        )
+        applicationSchemeFeedback = nil
+        isApplicationSchemeCreationPresented = false
+    }
+
     private func applicationButtonSettingsPage(_ profile: CustomApplicationProfile) -> some View {
         let reserved = Set(RemoteButton.allCases.filter {
             !ApplicationButtonBindingScope.buttons.contains($0)
@@ -5825,6 +6057,8 @@ struct SettingsView: View {
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                applicationSectionCard { applicationSchemeSection(profile) }
 
                 HStack(spacing: 10) {
                     Text(String(format: localization.text("application_buttons.page.count"),
@@ -5917,14 +6151,19 @@ struct SettingsView: View {
                 : actionSummary(configured)
             return "\(localization.text("application_buttons.short.app")) · \(action)"
         }
-        return "\(status) · \(applicationButtonGlobalSummary(button: button, trigger: trigger))"
+        return "\(status) · \(applicationButtonGlobalSummary(profile, button: button, trigger: trigger))"
     }
 
-    private func applicationButtonGlobalSummary(button: RemoteButton, trigger: ButtonTrigger) -> String {
-        let configured = settings.configuredGlobalAction(
+    private func applicationButtonGlobalSummary(
+        _ profile: CustomApplicationProfile,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> String {
+        let configured = settings.configuredAction(
             for: button,
             trigger: trigger,
-            profileID: settings.selectedRemoteProfileID
+            profileID: settings.selectedRemoteProfileID,
+            applicationBundleIdentifier: profile.bundleIdentifier
         )
         guard configured.action != .disabled else {
             let explicit = settings.hasExplicitBaseBinding(
@@ -5936,6 +6175,11 @@ struct SettingsView: View {
                 button,
                 trigger
             ) != nil
+                || settings.applicationAssignedProfileHasBinding(
+                    for: button,
+                    trigger: trigger,
+                    bundleIdentifier: profile.bundleIdentifier
+                )
             return localization.text(explicit
                 ? "button_mapping.action.no_action"
                 : "button_mapping.action.not_set")
@@ -5959,7 +6203,7 @@ struct SettingsView: View {
             return "\(localization.text("application_buttons.editor.overridden")) · \(action)"
         }
         return "\(localization.text("application_buttons.editor.inherited")) · " +
-            applicationButtonGlobalSummary(button: button, trigger: trigger)
+            applicationButtonGlobalSummary(profile, button: button, trigger: trigger)
     }
 
     private func applicationButtonSettingsEditor(
@@ -5970,7 +6214,7 @@ struct SettingsView: View {
             in: profile.buttonBindings,
             button: target.button,
             trigger: target.trigger
-        ) ?? settings.configuredGlobalAction(
+        ) ?? settings.configuredAction(
             for: target.button,
             trigger: target.trigger,
             profileID: settings.selectedRemoteProfileID

@@ -189,6 +189,29 @@ final class MacroFeatureIntegration: ObservableObject {
         #endif
     }
 
+    /// 当前遥控器是否可以使用这套方案。用于 APP 详情的选择与运行期回退。
+    func isMappingProfileApplicable(_ mappingProfileID: UUID, device: UUID?) -> Bool {
+        mappingProfiles(device: device).contains { $0.id == mappingProfileID }
+    }
+
+    /// 读取指定方案里某个手势的动作。方案未覆盖或不可用时返回 nil，
+    /// 由调用方继承基础映射，不在这里拼装执行链。
+    func assignedApplicationBinding(
+        mappingProfileID: UUID,
+        device: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> ConfiguredButtonAction? {
+        guard isMappingProfileApplicable(mappingProfileID, device: device) else { return nil }
+        switch displayProfileBinding(device: device, profile: mappingProfileID,
+            button: button, trigger: trigger) {
+        case let .explicit(value):
+            return value.configured
+        case .inherited, .unavailable:
+            return nil
+        }
+    }
+
     func reloadMappingProfiles() -> Bool {
         #if canImport(SayAllButtonProfiles) && SAYALL_BUTTON_PROFILE_AUTOSAVE
         let result = buttonProfilesFeature.reloadMappingProfiles().success
