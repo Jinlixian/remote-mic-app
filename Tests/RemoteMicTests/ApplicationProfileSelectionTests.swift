@@ -126,6 +126,49 @@ struct ApplicationProfileSelectionTests {
         #expect(settings.configuredAction(for: .menu, trigger: .singleClick, profileID: nil).action == .commandPaste)
     }
 
+    @Test func schemeMatcherIgnoresDisplayMetadataAndOrder() {
+        let shortcutA = CustomKeyboardShortcut(
+            keyCode: 0, modifierFlags: [.command], keyLabel: "Cmd+A"
+        )
+        let shortcutB = CustomKeyboardShortcut(
+            keyCode: 0, modifierFlags: [.command], keyLabel: "⌘A"
+        )
+        var target = ApplicationSchemeOperation.table { button, trigger in
+            button == .ok && trigger == .singleClick
+                ? ConfiguredButtonAction(action: .customShortcut, shortcut: shortcutA)
+                : .disabled
+        }
+        var candidate = ApplicationSchemeOperation.table { button, trigger in
+            button == .back && trigger == .longPress
+                ? .disabled
+                : button == .ok && trigger == .singleClick
+                    ? ConfiguredButtonAction(action: .customShortcut, shortcut: shortcutB)
+                    : .disabled
+        }
+        let schemeID = UUID()
+        #expect(ApplicationSchemeMatcher.matchingSchemeID(
+            target: target,
+            candidates: [(id: schemeID, operations: candidate)]
+        ) == schemeID)
+
+        candidate["ok.singleClick"] = ApplicationSchemeOperation(
+            ConfiguredButtonAction(action: .arrowLeft, shortcut: nil)
+        )
+        #expect(ApplicationSchemeMatcher.matchingSchemeID(
+            target: target,
+            candidates: [(id: schemeID, operations: candidate)]
+        ) == nil)
+
+        target["ok.singleClick"] = ApplicationSchemeOperation(
+            ConfiguredButtonAction(action: .openCustomApplication, shortcut: nil,
+                applicationProfileID: UUID())
+        )
+        #expect(ApplicationSchemeMatcher.matchingSchemeID(
+            target: target,
+            candidates: [(id: schemeID, operations: candidate)]
+        ) == nil)
+    }
+
     @Test func unavailableReferencesAreClearedAndOverridesKept() {
         let (settings, defaults, name) = makeSettings()
         defer { defaults.removePersistentDomain(forName: name) }

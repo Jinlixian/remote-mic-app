@@ -6035,6 +6035,45 @@ struct SettingsView: View {
             applicationSchemeFeedback = localization.text("application_profile.create.failed")
             return
         }
+        let deviceID = settings.selectedRemoteProfileID
+        let targetOperations = ApplicationSchemeOperation.table { button, trigger in
+            settings.configuredAction(
+                for: button,
+                trigger: trigger,
+                profileID: deviceID
+            )
+        }
+        let candidates = macroFeature.mappingProfiles(device: deviceID)
+            .filter { !$0.isDefault }
+            .map { scheme in
+                (id: scheme.id, operations: ApplicationSchemeOperation.table { button, trigger in
+                    macroFeature.assignedApplicationBinding(
+                        mappingProfileID: scheme.id,
+                        device: deviceID,
+                        button: button,
+                        trigger: trigger
+                    ) ?? settings.configuredGlobalAction(
+                        for: button,
+                        trigger: trigger,
+                        profileID: deviceID
+                    )
+                })
+            }
+        // 只比较「按键 → 操作」。名称、方案 ID、APP 档案、绑定顺序和快捷键展示
+        // 文字都不参与，否则同一套配置会被重复保存成多个方案。
+        if let existingID = ApplicationSchemeMatcher.matchingSchemeID(
+            target: targetOperations,
+            candidates: candidates
+        ) {
+            _ = settings.setApplicationMappingProfileID(existingID, applicationProfileID: target.id)
+            _ = settings.clearApplicationButtonOverrides(applicationProfileID: target.id)
+            AppLogger.shared.write(
+                "APP PROFILE ASSIGNMENT action=reuse_existing scope=app result=success"
+            )
+            applicationSchemeFeedback = nil
+            isApplicationSchemeCreationPresented = false
+            return
+        }
         var bindings: [UnifiedButtonBinding] = []
         for button in ApplicationButtonBindingScope.buttons {
             for trigger in ButtonTrigger.allCases {
