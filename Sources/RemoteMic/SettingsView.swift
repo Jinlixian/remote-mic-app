@@ -5804,9 +5804,10 @@ struct SettingsView: View {
     }
 
     private func applicationSchemeSection(_ profile: CustomApplicationProfile) -> some View {
-        let profiles = macroFeature.mappingProfiles(device: settings.selectedRemoteProfileID)
-            .filter { !$0.isDefault }
-        let componentAvailable = !macroFeature.mappingProfiles(
+        let profiles = macroFeature.applicationSchemeProfiles(
+            device: settings.selectedRemoteProfileID
+        ).filter { !$0.isDefault }
+        let componentAvailable = !macroFeature.applicationSchemeProfiles(
             device: settings.selectedRemoteProfileID
         ).isEmpty
         let current = profile.mappingProfileID.flatMap { id in
@@ -5873,6 +5874,15 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let current, profile.mappingProfileID != nil {
+                if let ownerID = settings.applicationSchemeOwner(current.id),
+                   let owner = settings.customApplicationProfile(id: ownerID) {
+                    Text(String(
+                        format: localization.text("application_profile.owner"),
+                        owner.displayName
+                    ))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                }
                 let shared = max(settings.applicationProfilesSharingMappingProfile(current.id) - 1, 0)
                 if shared > 0 {
                     Text(String(format: localization.text("application_profile.shared"), shared))
@@ -5949,7 +5959,7 @@ struct SettingsView: View {
                 applicationBundleIdentifier: target.bundleIdentifier
             )
         }
-        let candidates = macroFeature.mappingProfiles(device: deviceID)
+        let candidates = macroFeature.applicationSchemeProfiles(device: deviceID)
             .filter { !$0.isDefault }
             .map { scheme in
                 (id: scheme.id, operations: ApplicationSchemeOperation.table { button, trigger in
@@ -5972,10 +5982,12 @@ struct SettingsView: View {
             candidates: candidates
         ) {
             _ = settings.setApplicationMappingProfileID(existingID, applicationProfileID: target.id)
-            _ = settings.clearApplicationButtonOverrides(
-                applicationProfileID: target.id,
-                buttons: Set(RemoteButton.profileScopeDisplayOrder)
-            )
+            if !macroFeature.usesHostApplicationSchemes {
+                _ = settings.clearApplicationButtonOverrides(
+                    applicationProfileID: target.id,
+                    buttons: Set(RemoteButton.profileScopeDisplayOrder)
+                )
+            }
             AppLogger.shared.write(
                 "APP PROFILE ASSIGNMENT action=reuse_existing scope=app result=success"
             )
@@ -6011,7 +6023,9 @@ struct SettingsView: View {
             return
         }
         _ = settings.setApplicationMappingProfileID(created, applicationProfileID: target.id)
-        // 菜单键与 TV 键不在键位方案的作用域内，只能保留为 APP 逐项覆盖。
+        settings.setApplicationSchemeOwner(created, applicationProfileID: target.id)
+        // 菜单键与 TV 键不在键位方案的作用域内，只能保留为 APP 逐项覆盖；
+        // 方案作用域旧覆盖已被本次显式复制冻结进新方案，统一清空。
         _ = settings.clearApplicationButtonOverrides(
             applicationProfileID: target.id,
             buttons: Set(RemoteButton.profileScopeDisplayOrder)

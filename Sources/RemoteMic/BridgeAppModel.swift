@@ -1288,6 +1288,46 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         settings.frontmostApplicationBundleIdentifier = {
             NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         }
+        macroFeature.configureHostApplicationSchemes(
+            profiles: { [weak settings] device in
+                settings?.hostApplicationSchemeProfiles(device: device) ?? []
+            },
+            binding: { [weak settings] mappingProfileID, device, button, trigger in
+                settings?.hostApplicationSchemeBinding(
+                    mappingProfileID: mappingProfileID,
+                    device: device,
+                    button: button,
+                    trigger: trigger
+                )
+            },
+            create: { [weak settings] name, bindings, _ in
+                settings?.createHostApplicationScheme(
+                    name: name,
+                    bindings: bindings,
+                    deviceProfileID: settings?.selectedRemoteProfileID
+                )
+            },
+            reload: { true }
+        )
+        macroFeature.configureHostApplicationSchemeWriters(
+            write: { [weak settings] schemeID, configured, device, button, trigger in
+                settings?.writeHostApplicationSchemeBinding(
+                    schemeID: schemeID,
+                    configured: configured,
+                    device: device,
+                    button: button,
+                    trigger: trigger
+                ) ?? false
+            },
+            replace: { [weak settings] schemeID, device, bindings in
+                settings?.replaceHostApplicationSchemeBindings(
+                    schemeID: schemeID,
+                    device: device,
+                    bindings: bindings
+                ) ?? false
+            }
+        )
+        installApplicationButtonWriteHandler()
         settings.assignedMappingProfileApplicable = { [weak self] mappingProfileID in
             guard let self else { return false }
             return self.macroFeature.isMappingProfileApplicable(
@@ -1305,12 +1345,22 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
         }
         // 方案被删除后清掉悬空引用；组件不可用时列表为空，不能据此清空用户引用。
-        let knownMappingProfiles = macroFeature.mappingProfiles(device: nil)
+        let knownMappingProfiles = macroFeature.applicationSchemeProfiles(device: nil)
         if !knownMappingProfiles.isEmpty {
             settings.clearUnavailableApplicationMappingProfileReferences(
                 valid: Set(knownMappingProfiles.map(\.id))
             )
         }
+        let applicationSchemeLocalization = LocalizationStore(settings: settings)
+        settings.reconcileHostApplicationSchemeOwners { application in
+            String(
+                format: applicationSchemeLocalization.text(
+                    "application_profile.create.default_name"
+                ),
+                application.displayName
+            )
+        }
+        materializeLegacyApplicationSchemes(knownProfiles: knownMappingProfiles)
         siriRemoteCursorFeedback.setVisualFeedbackEnabled(
             settings.siriRemoteCursorFeedbackVisible
         )
@@ -9237,6 +9287,329 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 "binding=\(bindingResult) result=\(executionResult) source=\(sourceKind)"
         )
         return handled
+    }
+
+    /// 旧 APP 档案的按键覆盖没有方案引用。组件可用时把它们物化为方案：
+    /// 相同操作表复用同一方案，不同操作表各建一套；菜单键/TV 键继续留在 APP 覆盖。
+    private func materializeLegacyApplicationSchemes(knownProfiles: [ButtonMappingProfile]) {
+        let deviceID = settings.selectedRemoteProfileID
+        let candidates = settings.customApplicationProfiles.compactMap { profile -> ApplicationSchemeMigrationCandidate? in
+            guard profile.mappingProfileID == nil,
+                  let bindings = profile.buttonBindings,
+                  bindings.contains(where: { RemoteButton.profileScopeDisplayOrder.contains($0.button) })
+            else { return nil }
+            let snapshot = applicationSchemeSnapshot(for: profile, deviceID: deviceID)
+            return ApplicationSchemeMigrationCandidate(
+                applicationProfileID: profile.id,
+                displayName: profile.displayName,
+                operations: snapshot.operations,
+                bindings: snapshot.bindings
+            )
+        }
+        guard !candidates.isEmpty else { return }
+        guard !knownProfiles.isEmpty || macroFeature.usesHostApplicationSchemes else {
+            AppLogger.shared.write(
+                "APP PROFILE MIGRATION action=materialize scope=application_profiles " +
+                    "candidates=\(candidates.count) result=skipped reason=component_unavailable"
+            )
+            return
+        }
+
+        var known: [(id: UUID, operations: [String: ApplicationSchemeOperation])] =
+            knownProfiles.filter {
+                !$0.isDefault &&
+                    macroFeature.isMappingProfileApplicable($0.id, device: deviceID)
+            }.map { profile in
+                (profile.id, applicationSchemeOperations(profileID: profile.id, deviceID: deviceID))
+            }
+        let groups = ApplicationSchemeMigrationPlanner.groups(from: candidates)
+        let localization = LocalizationStore(settings: settings)
+        var migratedApplications = 0
+        var createdProfiles = 0
+        var reusedProfiles = 0
+
+        for group in groups {
+            let profileID: UUID
+            if let existing = ApplicationSchemeMatcher.matchingSchemeID(
+                target: group.operations,
+                candidates: known
+            ) {
+                profileID = existing
+                reusedProfiles += 1
+            } else {
+                let name = String(
+                    format: localization.text("application_profile.create.default_name"),
+                    group.primaryDisplayName
+                )
+                guard let created = macroFeature.createMappingProfile(
+                    named: name,
+                    copying: nil,
+                    bindings: group.bindings,
+                    holdModes: [:]
+                ) else {
+                    AppLogger.shared.write(
+                        "APP PROFILE MIGRATION action=create result=failed " +
+                            "reason=profile_creation_unavailable"
+                    )
+                    continue
+                }
+                profileID = created
+                createdProfiles += 1
+                known.append((created, group.operations))
+            }
+
+            if settings.applicationSchemeOwner(profileID) == nil,
+               let ownerApplicationID = group.applicationProfileIDs.first {
+                settings.setApplicationSchemeOwner(
+                    profileID,
+                    applicationProfileID: ownerApplicationID
+                )
+            }
+            for applicationProfileID in group.applicationProfileIDs {
+                guard settings.setApplicationMappingProfileID(
+                    profileID,
+                    applicationProfileID: applicationProfileID
+                ) else { continue }
+                _ = settings.clearApplicationButtonOverrides(
+                    applicationProfileID: applicationProfileID,
+                    buttons: Set(RemoteButton.profileScopeDisplayOrder)
+                )
+                migratedApplications += 1
+            }
+        }
+
+        guard migratedApplications > 0 else { return }
+        _ = macroFeature.reloadMappingProfiles()
+        AppLogger.shared.write(
+            "APP PROFILE MIGRATION action=materialize scope=application_profiles " +
+                "applications=\(migratedApplications) groups=\(groups.count) " +
+                "created=\(createdProfiles) reused=\(reusedProfiles) " +
+                "result=success reason=application_reference_confirmed"
+        )
+    }
+
+    /// APP 按键修改统一入口：方案作用域按键写入修改者自己的方案，菜单键/TV 键保持 APP 覆盖。
+    private func installApplicationButtonWriteHandler() {
+        settings.applicationButtonWriteHandler = { [weak self] configured, applicationID, button, trigger in
+            guard let self else { return nil }
+            return self.writeApplicationButtonWithSchemeOwnership(
+                configured,
+                applicationID: applicationID,
+                button: button,
+                trigger: trigger
+            )
+        }
+    }
+
+    private func writeApplicationButtonWithSchemeOwnership(
+        _ configured: ConfiguredButtonAction?,
+        applicationID: UUID,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> AppSettings.ApplicationButtonOverrideWriteResult? {
+        guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+              RemoteButton.profileScopeDisplayOrder.contains(button)
+        else { return nil }
+        let scopeButtons = Set(RemoteButton.profileScopeDisplayOrder)
+        guard let profile = settings.customApplicationProfile(id: applicationID) else {
+            return .invalidTarget
+        }
+        let deviceID = settings.selectedRemoteProfileID
+        let currentSchemeID = profile.mappingProfileID
+        let currentOwner = currentSchemeID.flatMap(settings.applicationSchemeOwner)
+        let ownsCurrent = currentSchemeID.map {
+            currentOwner == applicationID &&
+                macroFeature.isMappingProfileApplicable($0, device: deviceID)
+        } ?? false
+
+        if configured == nil {
+            if ownsCurrent, let currentSchemeID {
+                guard macroFeature.writeApplicationSchemeBinding(
+                    nil,
+                    schemeID: currentSchemeID,
+                    device: deviceID,
+                    button: button,
+                    trigger: trigger
+                ) else {
+                    AppLogger.shared.write(
+                        "APP SCHEME OWNERSHIP action=clear owner=self result=failed " +
+                            "reason=scheme_write_unavailable"
+                    )
+                    return nil
+                }
+                _ = settings.clearApplicationButtonOverrides(
+                    applicationProfileID: applicationID,
+                    buttons: scopeButtons
+                )
+                return .cleared
+            }
+            _ = settings.clearApplicationButtonOverrides(
+                applicationProfileID: applicationID,
+                buttons: [button]
+            )
+            return .cleared
+        }
+
+        guard let configured else { return .cleared }
+        guard let validated = settings.validatedApplicationConfiguredAction(configured) else {
+            return .invalidAction
+        }
+        let hasLegacyScopeOverrides = (profile.buttonBindings ?? []).contains {
+            scopeButtons.contains($0.button)
+        }
+
+        if ownsCurrent, let currentSchemeID, !hasLegacyScopeOverrides {
+            guard macroFeature.writeApplicationSchemeBinding(
+                validated,
+                schemeID: currentSchemeID,
+                device: deviceID,
+                button: button,
+                trigger: trigger
+            ) else {
+                AppLogger.shared.write(
+                    "APP SCHEME OWNERSHIP action=write owner=self result=failed " +
+                        "reason=scheme_write_unavailable"
+                )
+                return nil
+            }
+            _ = settings.clearApplicationButtonOverrides(
+                applicationProfileID: applicationID,
+                buttons: scopeButtons
+            )
+            AppLogger.shared.write(
+                "APP SCHEME OWNERSHIP action=write owner=self result=success " +
+                    "reason=scheme_storage_confirmed"
+            )
+            return .wrote
+        }
+
+        var snapshot = applicationSchemeSnapshot(for: profile, deviceID: deviceID).bindings
+        snapshot.removeAll { $0.button == button && $0.trigger == trigger }
+        snapshot.append(UnifiedButtonBinding(
+            remoteProfileID: nil,
+            button: button,
+            trigger: trigger,
+            configured: validated
+        ))
+
+        let targetSchemeID: UUID
+        if ownsCurrent, let currentSchemeID {
+            guard macroFeature.replaceApplicationSchemeBindings(
+                schemeID: currentSchemeID,
+                device: deviceID,
+                bindings: snapshot
+            ) else {
+                AppLogger.shared.write(
+                    "APP SCHEME OWNERSHIP action=write owner=self result=failed " +
+                        "reason=scheme_copy_unavailable"
+                )
+                return nil
+            }
+            targetSchemeID = currentSchemeID
+        } else if let owned = settings.applicationSchemesOwned(by: applicationID).first(where: {
+            macroFeature.isMappingProfileApplicable($0, device: deviceID)
+        }) {
+            guard macroFeature.replaceApplicationSchemeBindings(
+                schemeID: owned,
+                device: deviceID,
+                bindings: snapshot
+            ) else {
+                AppLogger.shared.write(
+                    "APP SCHEME OWNERSHIP action=write owner=other result=failed " +
+                        "reason=scheme_copy_unavailable"
+                )
+                return nil
+            }
+            targetSchemeID = owned
+        } else {
+            let localization = LocalizationStore(settings: settings)
+            let name = String(
+                format: localization.text("application_profile.create.default_name"),
+                profile.displayName
+            )
+            guard let created = macroFeature.createMappingProfile(
+                named: name,
+                copying: nil,
+                bindings: snapshot,
+                holdModes: [:]
+            ) else {
+                AppLogger.shared.write(
+                    "APP SCHEME OWNERSHIP action=write owner=other result=failed " +
+                        "reason=scheme_create_unavailable"
+                )
+                return nil
+            }
+            targetSchemeID = created
+        }
+
+        guard settings.setApplicationMappingProfileID(
+            targetSchemeID,
+            applicationProfileID: applicationID
+        ) else {
+            AppLogger.shared.write(
+                "APP SCHEME OWNERSHIP action=write result=failed " +
+                    "reason=application_reference_write_failed"
+            )
+            return nil
+        }
+        settings.setApplicationSchemeOwner(
+            targetSchemeID,
+            applicationProfileID: applicationID
+        )
+        _ = settings.clearApplicationButtonOverrides(
+            applicationProfileID: applicationID,
+            buttons: scopeButtons
+        )
+        AppLogger.shared.write(
+            "APP SCHEME OWNERSHIP action=write owner=other result=success " +
+                "reason=owned_scheme_confirmed"
+        )
+        return .wrote
+    }
+
+    private func applicationSchemeSnapshot(
+        for profile: CustomApplicationProfile,
+        deviceID: UUID?
+    ) -> (operations: [String: ApplicationSchemeOperation], bindings: [UnifiedButtonBinding]) {
+        var operations: [String: ApplicationSchemeOperation] = [:]
+        var bindings: [UnifiedButtonBinding] = []
+        for button in RemoteButton.profileScopeDisplayOrder {
+            for trigger in ButtonTrigger.allCases {
+                let configured = settings.configuredAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: deviceID,
+                    applicationBundleIdentifier: profile.bundleIdentifier
+                )
+                operations["\(button.rawValue).\(trigger.rawValue)"] =
+                    ApplicationSchemeOperation(configured)
+                bindings.append(UnifiedButtonBinding(
+                    remoteProfileID: nil,
+                    button: button,
+                    trigger: trigger,
+                    configured: configured
+                ))
+            }
+        }
+        return (operations, bindings)
+    }
+
+    private func applicationSchemeOperations(
+        profileID: UUID,
+        deviceID: UUID?
+    ) -> [String: ApplicationSchemeOperation] {
+        ApplicationSchemeOperation.table { button, trigger in
+            macroFeature.assignedApplicationBinding(
+                mappingProfileID: profileID,
+                device: deviceID,
+                button: button,
+                trigger: trigger
+            ) ?? settings.configuredGlobalAction(
+                for: button,
+                trigger: trigger,
+                profileID: deviceID
+            )
+        }
     }
 
     private func performButtonProfileHostAction(_ payload: Data, source: String) -> Bool {
