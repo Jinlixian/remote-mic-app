@@ -1,10 +1,10 @@
 {
   "batch": "application-profile-selection-20261123",
   "date": "2026-11-23",
-  "purpose": "APP 按键设置页顶部「按键方案」选择框：首次显示默认方案，已设置过则显示之前选中的方案；选择框替代按钮和弹窗。",
+  "purpose": "APP 按键设置页顶部「按键方案」选择框，以及覆盖 12 个物理普通按键（含底部菜单键与 TV 键）的按键画布；首次显示默认方案，已设置过则显示原方案。",
   "storage": "external-persistent-directory-and-doubao-links",
   "storage_path": "/Users/jinlixian/Pictures/SayAll-Evidence/application-profile-selection-20261123/",
-  "sourceCommit": "eb3e9225",
+  "sourceCommit": "cfd426879e89be0134c674a64f843af6902b02f6",
   "generation": "生产 SettingsView 的 REMOTE_MIC_SETTINGS_SCREENSHOT_DIR 离屏入口，SAYALL_PRIVATE_PLATFORM_MODE=public；REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATIONS_FIXTURE=1 生成备忘录/Safari/Finder 三个 APP 档案，REMOTE_MIC_SETTINGS_SCREENSHOT_APPLICATION_BUTTONS=1 打开 Finder 的按键设置页，并带一条确定键覆盖夹具。",
   "contentSize": {
     "width": 1067,
@@ -12,6 +12,7 @@
   },
   "notes": [
     "截图使用 1067 宽整页内容高度，完整展示按键设置页顶部的方案选择框、说明与下方按键画布；生产窗口最小尺寸仍为 1067 × 760。",
+    "按键画布包含物理遥控器全部 12 个普通按键，底部菜单键与 TV 键已显示；语音键仍不纳入本页。菜单/TV 的真实 HID 事件与目标 APP 前台执行仍需真机验收。",
     "公开构建没有私有按键方案组件，选择框与「另存为新方案」呈禁用态，只证明「默认方案」显示与降级说明；选择方案、方案列表与另存为新方案的实际交互需要私有组件构建，当前未取证。",
     "APP 详情没有独立方案卡片；方案入口只出现在「设置这个 APP 的按键」页面内。",
     "图片由离屏渲染器生成，不是真实窗口运行截图；真实遥控器、第三方 APP 前台切换与私有组件验收仍为 pending。",
@@ -23,32 +24,32 @@
       "format": "png",
       "width": 2134,
       "height": 2600,
-      "sha256": "eaf5925124294b0aaec8ed52d2abab7c9029a1bbb64fc4648e377a0884dd1cb9",
-      "url": "https://aka.doubaocdn.com/s/UNZNoQ5Uxl"
+      "sha256": "0149faa5daa88029b894e419ff194ad589459e753efb9296202caf587470bb70",
+      "url": "https://aka.doubaocdn.com/s/IwbJ2VUgTR"
     },
     {
       "file": "app-keys-zh-dark.png",
       "format": "png",
       "width": 2134,
       "height": 2600,
-      "sha256": "d128a80144e4457f1a909dca3cf81bdbd3f053d9a130c49aaf13e8563099bd13",
-      "url": "https://aka.doubaocdn.com/s/i5PVGbTa6l"
+      "sha256": "4de8879ec602ff675befa50ae5b4d6df5c5d5f6a7aef915004267f4fbc9f9b21",
+      "url": "https://aka.doubaocdn.com/s/mKD3TuSUGA"
     },
     {
       "file": "app-keys-en-light.png",
       "format": "png",
       "width": 2134,
       "height": 2600,
-      "sha256": "a68888ea4731b9ec854872db688199993477def109924e6a1a9849d838122b80",
-      "url": "https://aka.doubaocdn.com/s/OjHb57T6Ro"
+      "sha256": "de37e5b733cc18ab11d87427c633952118657d92a2e9d4793735f5c7850f2f51",
+      "url": "https://aka.doubaocdn.com/s/ORhSyhNvB4"
     },
     {
       "file": "app-keys-en-dark.png",
       "format": "png",
       "width": 2134,
       "height": 2600,
-      "sha256": "b6b7d8dfe75fbba7766e0e96ded5dd7753b8597af05cce2d284d8d1f64e78cd2",
-      "url": "https://aka.doubaocdn.com/s/VDwy2Fxknq"
+      "sha256": "65e7754fd4d35dc6366d2350b9a15e475faf58199349c00e7f7137a09817e660",
+      "url": "https://aka.doubaocdn.com/s/ZLZoFic2Vq"
     }
   ]
 }
