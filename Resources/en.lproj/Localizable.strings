@@ -1662,7 +1662,7 @@
 "application_profile.save_as_new" = "Save as New Profile";
 "application_profile.assign_failed" = "Could not select the profile. Try again.";
 "application_profile.create.title" = "Save as New Profile";
-"application_profile.create.hint" = "Saves the app's current button result as a new profile. The original profile stays unchanged.";
+"application_profile.create.hint" = "Saves the app’s current button result as a new profile. The original profile stays unchanged.";
 "application_profile.create.name" = "Profile Name";
 "application_profile.create.default_name" = "%@ Profile";
 "application_profile.create.invalid_name" = "Enter a profile name.";
