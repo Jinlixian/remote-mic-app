@@ -4,7 +4,7 @@
 
 - 适用版本：`design/app-button-profile-selection-20261123` 合并后的待验证 Commit
 - 功能状态：候选实现，等待真实遥控器与私有按键方案组件验收
-- 测试目标：验证一个 APP 可以只保存一个「按键方案」引用；选中已有方案立即生效；在 APP 按键页继续编辑后另存为一套新方案，原方案保持不变；全局方案始终作为「默认方案」兜底。
+- 测试目标：验证一个 APP 可以只保存一个「按键方案」引用；按键画布覆盖 12 个物理普通按键（含底部菜单键与 TV 键）；选中已有方案立即生效；在 APP 按键页继续编辑后另存为一套新方案，原方案保持不变；全局方案始终作为「默认方案」兜底。
 - 相关规范：[`feature/app-button-profile-selection/PRODUCT_SPEC.md`](../feature/app-button-profile-selection/PRODUCT_SPEC.md)
 - 本手册不把单元测试、公开构建或截图等同于私有组件、真实遥控器和第三方 APP 验收。
 

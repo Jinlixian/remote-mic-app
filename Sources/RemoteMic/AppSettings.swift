@@ -2030,7 +2030,10 @@ final class AppSettings: ObservableObject {
         trigger: ButtonTrigger,
         bundleIdentifier: String?
     ) -> ConfiguredButtonAction? {
-        guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
+        // 键位方案自身仍只覆盖 10 个普通按键；菜单键与 TV 键只能通过 APP 逐项覆盖，
+        // 不能被 APP 指定的方案隐式接管。
+        guard RemoteButton.profileScopeDisplayOrder.contains(button),
+              ApplicationButtonBindingScope.triggers.contains(trigger),
               let mappingProfileID = activeAssignedMappingProfileID(
                   bundleIdentifier: bundleIdentifier
               )

@@ -634,7 +634,12 @@ struct ApplicationButtonBinding: Codable, Equatable, Identifiable {
 }
 
 enum ApplicationButtonBindingScope {
-    static let buttons = RemoteButton.profileScopeDisplayOrder
+    /// APP 覆盖按物理遥控器实际存在的普通按键定义，不能复用键位方案的 10 键白名单。
+    /// 底部菜单键与 TV 键同样可以按 APP 单独配置；语音键和按住行为仍不在本页。
+    static let buttons: [RemoteButton] = [
+        .power, .up, .down, .left, .right, .ok, .back, .home,
+        .volumeUp, .volumeDown, .menu, .tv,
+    ]
     static let triggers = ButtonTrigger.allCases
 
     enum OverrideState: Equatable {

@@ -14,7 +14,7 @@
 
 1. APP 档案详情页底部显示「按 APP 设置按键」区域，列出已单独配置的项目数，并提供进入按钮。
 2. 点击后在同一设置窗口打开「<App 名> 的按键」二级页。顶部固定显示「返回」和页面标题；返回后仍选中原 APP。
-3. 二级页只显示 10 个普通按键的单击、双击、长按动作：`power / up / down / left / right / ok / back / home / volumeUp / volumeDown`。名单以 `RemoteButton.profileScopeDisplayOrder` 为唯一来源。
+3. 二级页显示遥控器实际存在的 12 个普通按键的单击、双击、长按动作：`power / up / down / left / right / ok / back / home / volumeUp / volumeDown / menu / tv`。名单以 `ApplicationButtonBindingScope.buttons` 为唯一来源，包含底部菜单键和 TV 键；语音键、播放暂停和静音键不在本页。
 4. 每个项目持续显示两种状态之一：
    - **使用全局**：显示当前生效全局动作的只读摘要；
    - **已为这个 APP 设置**：显示该 APP 覆盖动作的摘要，可逐项恢复全局。
