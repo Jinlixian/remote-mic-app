@@ -6040,7 +6040,8 @@ struct SettingsView: View {
             settings.configuredAction(
                 for: button,
                 trigger: trigger,
-                profileID: deviceID
+                profileID: deviceID,
+                applicationBundleIdentifier: target.bundleIdentifier
             )
         }
         let candidates = macroFeature.mappingProfiles(device: deviceID)
@@ -6080,7 +6081,8 @@ struct SettingsView: View {
                 let configured = settings.configuredAction(
                     for: button,
                     trigger: trigger,
-                    profileID: settings.selectedRemoteProfileID
+                    profileID: deviceID,
+                    applicationBundleIdentifier: target.bundleIdentifier
                 )
                 guard configured.action != .disabled else { continue }
                 bindings.append(UnifiedButtonBinding(
@@ -6247,14 +6249,19 @@ struct SettingsView: View {
                 : actionSummary(configured)
             return "\(localization.text("application_buttons.short.app")) · \(action)"
         }
-        return "\(status) · \(applicationButtonGlobalSummary(button: button, trigger: trigger))"
+        return "\(status) · \(applicationButtonGlobalSummary(profile, button: button, trigger: trigger))"
     }
 
-    private func applicationButtonGlobalSummary(button: RemoteButton, trigger: ButtonTrigger) -> String {
+    private func applicationButtonGlobalSummary(
+        _ profile: CustomApplicationProfile,
+        button: RemoteButton,
+        trigger: ButtonTrigger
+    ) -> String {
         let configured = settings.configuredAction(
             for: button,
             trigger: trigger,
-            profileID: settings.selectedRemoteProfileID
+            profileID: settings.selectedRemoteProfileID,
+            applicationBundleIdentifier: profile.bundleIdentifier
         )
         guard configured.action != .disabled else {
             let explicit = settings.hasExplicitBaseBinding(
@@ -6266,7 +6273,11 @@ struct SettingsView: View {
                 button,
                 trigger
             ) != nil
-                || settings.applicationAssignedProfileHasBinding(for: button, trigger: trigger)
+                || settings.applicationAssignedProfileHasBinding(
+                    for: button,
+                    trigger: trigger,
+                    bundleIdentifier: profile.bundleIdentifier
+                )
             return localization.text(explicit
                 ? "button_mapping.action.no_action"
                 : "button_mapping.action.not_set")
@@ -6290,7 +6301,7 @@ struct SettingsView: View {
             return "\(localization.text("application_buttons.editor.overridden")) · \(action)"
         }
         return "\(localization.text("application_buttons.editor.inherited")) · " +
-            applicationButtonGlobalSummary(button: button, trigger: trigger)
+            applicationButtonGlobalSummary(profile, button: button, trigger: trigger)
     }
 
     private func applicationButtonSettingsEditor(

@@ -1961,10 +1961,34 @@ final class AppSettings: ObservableObject {
 
     func configuredAction(for button: RemoteButton, trigger: ButtonTrigger,
                           profileID: UUID?) -> ConfiguredButtonAction {
-        if let applicationOverride = applicationButtonOverride(for: button, trigger: trigger) {
+        configuredAction(
+            for: button,
+            trigger: trigger,
+            profileID: profileID,
+            applicationBundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    /// 按指定 APP 的档案解析动作，不依赖当前前台是谁。APP 详情与「另存为新方案」
+    /// 必须使用这个入口，否则设置窗口在前台时会把其它 APP 的配置存成方案。
+    func configuredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?,
+        applicationBundleIdentifier: String?
+    ) -> ConfiguredButtonAction {
+        if let applicationOverride = applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
             return applicationOverride
         }
-        if let assigned = applicationAssignedProfileAction(for: button, trigger: trigger) {
+        if let assigned = applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: applicationBundleIdentifier
+        ) {
             return assigned
         }
         return configuredGlobalAction(for: button, trigger: trigger, profileID: profileID)
@@ -1973,8 +1997,14 @@ final class AppSettings: ObservableObject {
     /// 当前前台 APP 是否指定了一套可用的键位方案。命中时全局「当前生效方案」
     /// 必须让位给 APP 指定方案，即使该手势在方案里是「继承」。
     func activeAssignedMappingProfileID() -> UUID? {
+        activeAssignedMappingProfileID(
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    func activeAssignedMappingProfileID(bundleIdentifier: String?) -> UUID? {
         guard customMappingEnabled,
-              let bundleIdentifier = frontmostApplicationBundleIdentifier?(),
+              let bundleIdentifier,
               let profile = customApplicationProfiles.first(where: {
                   $0.bundleIdentifier == bundleIdentifier
               }),
@@ -1988,8 +2018,22 @@ final class AppSettings: ObservableObject {
         for button: RemoteButton,
         trigger: ButtonTrigger
     ) -> ConfiguredButtonAction? {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationAssignedProfileAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
         guard ApplicationButtonBindingScope.contains(button: button, trigger: trigger),
-              let mappingProfileID = activeAssignedMappingProfileID()
+              let mappingProfileID = activeAssignedMappingProfileID(
+                  bundleIdentifier: bundleIdentifier
+              )
         else { return nil }
         return assignedMappingProfileAction?(mappingProfileID, button, trigger)
     }
@@ -2002,11 +2046,34 @@ final class AppSettings: ObservableObject {
         applicationAssignedProfileAction(for: button, trigger: trigger) != nil
     }
 
+    func applicationAssignedProfileHasBinding(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> Bool {
+        applicationAssignedProfileAction(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: bundleIdentifier
+        ) != nil
+    }
+
     private func applicationButtonOverride(
         for button: RemoteButton,
         trigger: ButtonTrigger
     ) -> ConfiguredButtonAction? {
-        let bundleIdentifier = frontmostApplicationBundleIdentifier?()
+        applicationButtonOverride(
+            for: button,
+            trigger: trigger,
+            bundleIdentifier: frontmostApplicationBundleIdentifier?()
+        )
+    }
+
+    private func applicationButtonOverride(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        bundleIdentifier: String?
+    ) -> ConfiguredButtonAction? {
         let state = ApplicationButtonBindingScope.overrideState(
             customMappingEnabled: customMappingEnabled,
             supportedButton: ApplicationButtonBindingScope.contains(button: button, trigger: trigger),

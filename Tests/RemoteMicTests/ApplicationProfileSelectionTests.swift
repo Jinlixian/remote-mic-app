@@ -169,6 +169,34 @@ struct ApplicationProfileSelectionTests {
         ) == nil)
     }
 
+    @Test func explicitBundleResolutionIgnoresCurrentFrontmostApp() {
+        let (settings, defaults, name) = makeSettings(frontmostBundleIdentifier: { "com.example.settings" })
+        defer { defaults.removePersistentDomain(forName: name) }
+        let appID = settings.addCustomApplicationProfile(CustomApplicationProfile(
+            displayName: "Target", bundleIdentifier: "com.example.target", applicationPath: ""
+        ))
+        let schemeID = UUID()
+        settings.assignedMappingProfileApplicable = { $0 == schemeID }
+        settings.assignedMappingProfileAction = { _, button, trigger in
+            button == .ok && trigger == .singleClick
+                ? .init(action: .arrowLeft, shortcut: nil)
+                : nil
+        }
+        settings.configuredActionOverride = { _, _, _ in
+            .init(action: .commandPaste, shortcut: nil)
+        }
+        _ = settings.setApplicationMappingProfileID(schemeID, applicationProfileID: appID)
+
+        #expect(settings.configuredAction(
+            for: .ok, trigger: .singleClick, profileID: nil,
+            applicationBundleIdentifier: "com.example.target"
+        ).action == .arrowLeft)
+        #expect(settings.configuredAction(
+            for: .ok, trigger: .singleClick, profileID: nil,
+            applicationBundleIdentifier: "com.example.settings"
+        ).action == .commandPaste)
+    }
+
     @Test func unavailableReferencesAreClearedAndOverridesKept() {
         let (settings, defaults, name) = makeSettings()
         defer { defaults.removePersistentDomain(forName: name) }
