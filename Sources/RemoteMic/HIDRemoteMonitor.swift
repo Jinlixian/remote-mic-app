@@ -446,6 +446,9 @@ final class HIDRemoteMonitor {
     var onNativeMappingVerificationFailed: (() -> Void)?
     var onInputReset: ((UUID?) -> Void)?
     var onInternalAction: ((UUID?, ButtonAction) -> Void)?
+    /// A voice-key down edge while the selected remote's audio link may be down.
+    /// The callback only observes intent; the HID event itself is never consumed.
+    var onVoiceUsageDown: ((UUID?) -> Void)?
 
     init(
         settings: AppSettings,
@@ -1637,6 +1640,9 @@ final class HIDRemoteMonitor {
                 )
             }
         }
+        if pressed.contains(UInt16(0x3E)) || pressed.contains(UInt16(0x0C)) {
+            onVoiceUsageDown?(profileID)
+        }
         activeUsages = usages
         onActiveButtons?(profileID, RemoteButton.buttons(for: usages))
 
@@ -1711,18 +1717,6 @@ final class HIDRemoteMonitor {
                 if !activeDeviceIsSeized, usesNativePassthrough { eventSuppressor.arm(button: button, edge: .down) }
                 continue
             }
-            let recognizesDoubleClick = settings.configuredAction(
-                for: button,
-                trigger: .doubleClick,
-                profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .doubleClick) ||
-                settings.applicationButtonOverrideExists(for: button, trigger: .doubleClick)
-            let recognizesLongPress = settings.configuredAction(
-                for: button,
-                trigger: .longPress,
-                profileID: profileID
-            ).action != .disabled || hasOverrideBinding(profileID, button, .longPress) ||
-                settings.applicationButtonOverrideExists(for: button, trigger: .longPress)
             let action = settings.action(for: button, profileID: profileID)
             if button == .back, handlePendingLayerCloseBack() {
                 continue
@@ -1730,28 +1724,19 @@ final class HIDRemoteMonitor {
             if button == .up || button == .down, handlePendingLayerCloseArrow(button: button) {
                 continue
             }
-            // 会话中，绑定了切换器动作的按键等价于菜单键（Tab）；其余吞掉。
-            let sessionTabAllowed = action == .appSwitcher
-                && !recognizesDoubleClick && !recognizesLongPress
+            // 会话期间按键语义完全由切换器会话接管：绑定「切换 App」的按键等价于
+            // Tab，方向键/OK/返回按会话规则处理，其余按键结束会话并释放 Command。
+            // 映射层配置的双击/长按不参与会话判定，否则已绑定的单击会被静默吞掉。
+            let isSwitcherBinding = action == .appSwitcher
             if appSwitcherSession.isActive,
                handleAppSwitcherControlPress(
                    button,
                    usage: usage,
-                   swallowsOthers: !sessionTabAllowed
+                   isSwitcherBinding: isSwitcherBinding
                ) {
                 continue
             }
-            if appSwitcherSession.isActive, button == .tv {
-                diagnosticLogger(
-                    "HID GESTURE button=tv trigger=singleClick path=app_switcher"
-                )
-                guard performAppSwitcherAction(for: button, trigger: .singleClick) else {
-                    return
-                }
-                continue
-            }
-            if appSwitcherSession.isActive, action == .appSwitcher,
-               !recognizesDoubleClick, !recognizesLongPress {
+            if appSwitcherSession.isActive, isSwitcherBinding {
                 diagnosticLogger(
                     "HID GESTURE button=\(button.rawValue) trigger=singleClick " +
                         "path=app_switcher"
@@ -1760,12 +1745,6 @@ final class HIDRemoteMonitor {
                     return
                 }
                 continue
-            }
-            if appSwitcherSession.isActive, action != .appSwitcher {
-                finishAppSwitcherLifecycle(
-                    reason: "unrelated_button_\(button.rawValue)",
-                    confirmed: false
-                )
             }
             if usesNativePassthrough {
                 nativePassthroughUsages.insert(usage)
@@ -1851,7 +1830,12 @@ final class HIDRemoteMonitor {
         guard pressed.contains(RemoteButton.back.hidUsage) else { return }
         let configured = ConfiguredButtonAction(action: .deleteBackward, shortcut: nil)
         guard actionPerformer(.back, .singleClick, configured) else {
-            releaseForRevokedPermissions()
+            logActionFailure(
+                button: .back,
+                trigger: .singleClick,
+                action: .deleteBackward,
+                path: "back_only"
+            )
             return
         }
         AppLogger.shared.write(
@@ -2183,7 +2167,13 @@ final class HIDRemoteMonitor {
                 self.lastPageRepeatAt[usage] = now
             }
             if !self.actionPerformer(button, .singleClick, current) {
-                self.releaseForRevokedPermissions()
+                self.repeatTimers.removeValue(forKey: usage)?.cancel()
+                self.logActionFailure(
+                    button: button,
+                    trigger: .singleClick,
+                    action: current.action,
+                    path: "repeat"
+                )
             }
         }
         repeatTimers[usage] = timer
@@ -2265,6 +2255,21 @@ final class HIDRemoteMonitor {
         return snapshot
     }
 
+    /// A button action is a single-press request, not a monitor lifecycle event.
+    /// Keep the device monitor alive so one failed action cannot disable every
+    /// other button. Device removal and revoked permissions have their own paths.
+    private func logActionFailure(
+        button: RemoteButton,
+        trigger: ButtonTrigger,
+        action: ButtonAction,
+        path: String
+    ) {
+        diagnosticLogger(
+            "HID ACTION failed button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "action=\(action.rawValue) path=\(path) monitor_retained=true"
+        )
+    }
+
     private func performConfiguredAction(
         for button: RemoteButton,
         trigger: ButtonTrigger,
@@ -2285,17 +2290,16 @@ final class HIDRemoteMonitor {
             trigger: trigger,
             profileID: profileID
         )
-        if appSwitcherSession.isActive, button == .tv {
-            return performAppSwitcherAction(for: button, trigger: trigger)
-        }
         if configured.action == .appSwitcher {
             return performAppSwitcherAction(for: button, trigger: trigger)
         }
         if appSwitcherSession.isActive {
+            // 会话期间到达的迟到动作同样只结束会话，不再执行该键的旧动作。
             finishAppSwitcherLifecycle(
                 reason: "unrelated_action_\(configured.action.rawValue)",
                 confirmed: false
             )
+            return true
         }
         if configured.action.isAppInternal {
             onInternalAction?(profileID, configured.action)
@@ -2305,15 +2309,15 @@ final class HIDRemoteMonitor {
             return true
         }
         guard actionPerformer(button, trigger, configured) else {
-            diagnosticLogger(
-                "HID ACTION failed button=\(button.rawValue) trigger=\(trigger.rawValue) " +
-                    "action=\(configured.action.rawValue)"
-            )
             // A library rejection is not evidence of revoked Accessibility permission.
             // Preserve the held edge so duplicate reports cannot restart the action.
-            if configured.action == .combinationAction { return false }
-            stop()
-            updateStatus(LocalizedMessage("button_mapping.permission.accessibility_expired"))
+            // The monitor remains alive; only this button's interaction is cancelled.
+            logActionFailure(
+                button: button,
+                trigger: trigger,
+                action: configured.action,
+                path: "button"
+            )
             return false
         }
         AppLogger.shared.write(
@@ -2356,7 +2360,7 @@ final class HIDRemoteMonitor {
     private func handleAppSwitcherControlPress(
         _ button: RemoteButton,
         usage: UInt16,
-        swallowsOthers: Bool
+        isSwitcherBinding: Bool
     ) -> Bool {
         switch button {
         case .ok:
@@ -2457,11 +2461,15 @@ final class HIDRemoteMonitor {
             }
             return true
         default:
-            // 会话期间吞掉未绑定切换器的按键（音量、主页等），避免误触。
-            // 绑定了切换器动作的按键（菜单/TV/音量）已在上层放行，等价于 Tab。
-            if !swallowsOthers { return false }
+            // 会话期间未绑定「切换 App」的按键结束会话：先 Escape 再释放 Command，
+            // 同时吞掉该键自身动作，保证任何按键都有可预期的反应，而不是没有响应。
+            if isSwitcherBinding { return false }
             diagnosticLogger(
-                "HID APP SWITCHER swallowed button=\(button.rawValue) phase=session"
+                "HID APP SWITCHER ended_by button=\(button.rawValue) phase=session"
+            )
+            finishAppSwitcherLifecycle(
+                reason: "unrelated_button_\(button.rawValue)",
+                confirmed: false
             )
             return true
         }
@@ -2940,8 +2948,14 @@ final class HIDRemoteMonitor {
 
     func cancelMappingInteractions() {
         // 按住执行把键真正按下去了，取消映射时必须先走一遍交互取消把键抬起来。
+        // 但物理按键仍在用户手里：保留按下/释放边沿，否则松键会被丢掉，
+        // “按住重复单击”的计时器会一直运行。
         buttonInteractions.cancelAll(reason: "mapping_cancelled")
-        resetInputState()
+        diagnosticLogger(
+            "HID INPUT_RESET reason=mapping_changed " +
+                "active_usages=\(activeUsages.count) physical_edges_preserved=true"
+        )
+        resetInputState(preservingPhysicalEdges: true)
     }
 
     func cancelConfiguredInteractions(reason: String) { buttonInteractions.cancelAll(reason: reason) }
@@ -2957,7 +2971,7 @@ final class HIDRemoteMonitor {
         if appSwitcherSession.isActive { finishAppSwitcherLifecycle(reason: "common_phrases_opened", confirmed: false) }
     }
 
-    private func resetInputState() {
+    private func resetInputState(preservingPhysicalEdges: Bool = false) {
         onInputReset?(profileID)
         if appSwitcherSession.isActive {
             _ = appSwitcherSession.cancel()
@@ -2988,22 +3002,30 @@ final class HIDRemoteMonitor {
         appSwitcherTargetApplication = nil
         appSwitcherPendingLayerClose = nil
         appSwitcherOriginBundleIdentifier = nil
-        for usage in activeUsages.subtracting(nativePassthroughUsages) {
-            if let button = RemoteButton.usageMap[usage], shouldArmNativeEvent(for: button) {
-                eventSuppressor.arm(button: button, edge: .up)
+        if !preservingPhysicalEdges {
+            for usage in activeUsages.subtracting(nativePassthroughUsages) {
+                if let button = RemoteButton.usageMap[usage], shouldArmNativeEvent(for: button) {
+                    eventSuppressor.arm(button: button, edge: .up)
+                }
             }
         }
         repeatTimers.values.forEach { $0.cancel() }
         repeatTimers.removeAll()
-        nativePassthroughUsages.removeAll()
+        if !preservingPhysicalEdges {
+            nativePassthroughUsages.removeAll()
+        }
         nonRepeatableReleaseTimers.values.forEach { $0.cancel() }
         nonRepeatableReleaseTimers.removeAll()
         nonRepeatablePressedButtons.removeAll()
-        physicalPressStartedAt.removeAll()
-        lastPhysicalReleaseAt.removeAll()
+        if !preservingPhysicalEdges {
+            physicalPressStartedAt.removeAll()
+            lastPhysicalReleaseAt.removeAll()
+        }
         resetGestureRecognition()
-        activeUsages.removeAll()
-        onActiveButtons?(profileID, [])
+        if !preservingPhysicalEdges {
+            activeUsages.removeAll()
+            onActiveButtons?(profileID, [])
+        }
     }
 
     private func runtimePermissionsAreValid() -> Bool {

@@ -142,6 +142,20 @@ enum HIDMappingRecoveryPolicy {
         else { return nil }
         return retryDelays[attempt]
     }
+
+    /// 服务已经枚举出来、但写入后回读不一致时的重试间隔。
+    ///
+    /// 这一类的失败不能用 `hasMatchingServices` 当门槛：失败恰恰发生在服务存在、
+    /// 系统瞬时多枚举出一份重复服务的时刻，重复服务几秒内就会消失。2026-11-23
+    /// 的 RC003 现场只有一次 `reason=mapping_not_verified`，之后再不重试，整场
+    /// 按键都不被接管。
+    static func verificationFailedRetryDelay(
+        forAttempt attempt: Int,
+        started: Bool
+    ) -> TimeInterval? {
+        guard started, retryDelays.indices.contains(attempt) else { return nil }
+        return retryDelays[attempt]
+    }
 }
 
 enum MobileVoiceStopDisposition: Equatable {
@@ -399,6 +413,55 @@ struct CommandVoiceActivationAudioBuffer {
     }
 }
 
+/// PCM from later physical presses belongs to its own ATVV operation while
+/// the preceding press is waiting for the virtual microphone.
+struct BluetoothVoiceStartupQueue {
+    struct Entry {
+        let diagnostic: ATVVAudioDiagnostics
+        var samples: [Int16] = []
+        var stopReason: BluetoothVoiceStopReason?
+    }
+
+    private(set) var entries: [Entry] = []
+    private let maximumSamples: Int
+
+    init(maximumSamples: Int = AudioConfigurationRetryPolicy.bluetoothStartupBufferSampleCount) {
+        self.maximumSamples = maximumSamples
+    }
+
+    mutating func begin(_ diagnostic: ATVVAudioDiagnostics) -> Bool {
+        guard entries.count < 8, entries.last?.diagnostic !== diagnostic else { return false }
+        entries.append(Entry(diagnostic: diagnostic))
+        return true
+    }
+
+    /// A nil result means this packet belongs to another operation.
+    mutating func append(_ samples: [Int16], to diagnostic: ATVVAudioDiagnostics?) -> Bool? {
+        guard let index = entries.indices.last, entries[index].diagnostic === diagnostic,
+              entries[index].stopReason == nil else { return nil }
+        let sampleCount = entries.reduce(0) { $0 + $1.samples.count }
+        guard samples.count <= maximumSamples - sampleCount else { return false }
+        entries[index].samples.append(contentsOf: samples)
+        return true
+    }
+
+    mutating func stop(_ diagnostic: ATVVAudioDiagnostics?, reason: BluetoothVoiceStopReason) -> Bool {
+        guard let index = entries.indices.last, entries[index].diagnostic === diagnostic else { return false }
+        entries[index].stopReason = reason
+        return true
+    }
+
+    mutating func takeFirst() -> Entry? {
+        guard !entries.isEmpty else { return nil }
+        return entries.removeFirst()
+    }
+
+    mutating func cancelLast(_ diagnostic: ATVVAudioDiagnostics?) -> Entry? {
+        guard entries.last?.diagnostic === diagnostic, !entries.isEmpty else { return nil }
+        return entries.removeLast()
+    }
+}
+
 enum VoiceSamplePresentationPolicy {
     static func shouldPublishReceipt(
         hasReceivedSamples: Bool,
@@ -590,6 +653,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     @Published private(set) var connectionStatus = LocalizedMessage("bluetooth.status.initializing")
     @Published private(set) var hidStatus = LocalizedMessage("button_mapping.status.disabled")
     @Published private(set) var audioStatus = LocalizedMessage("audio.output.none_selected")
+    @Published private(set) var isRemoteVoiceRecoveryInFlight = false
     @Published private(set) var isStreaming = false
     @Published private(set) var voiceSessionWarningLevel: VoiceSessionWarningLevel = .none
     @Published private(set) var isConnected = false
@@ -601,12 +665,24 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     /// Chromecast 画布的活动按键（控制 ID）。与苹果遥控器链路完全隔离，互不清除。
     @Published private(set) var activeChromecastControlIDs = Set<String>()
     @Published private(set) var lastRemoteButtonPress: RemoteButton?
+    /// 与 `lastRemoteButtonPress` 同时更新，供 Onboarding 判断按键来自哪只小米遥控器。
+    @Published private(set) var lastRemoteButtonPressProfileID: UUID?
     @Published private(set) var connectedRemoteProfileIDs = Set<UUID>()
     @Published private(set) var remoteBatteryLevels: [UUID: Int] = [:]
     @Published private(set) var remotePowerStates: [UUID: RemotePowerState] = [:]
     private var pendingRemoteBatteryLevels: [UUID: Int] = [:]
     private var pendingRemotePowerStates: [UUID: RemotePowerState] = [:]
     private var pendingRemoteModels: [UUID: XiaomiRemoteModel] = [:]
+    @Published private(set) var remoteButtonReadiness: [UUID: RemoteFunctionReadiness] = [:]
+    private var chromecastHIDIsPresent: Bool?
+    private var lastLoggedCardStatuses: [UUID: RemoteDeviceCardStatus] = [:]
+    private var lastLoggedCardReadiness: [UUID: RemoteCardReadinessSnapshot] = [:]
+    private var cardStatusOperation: UInt64 = 0
+    private var screenshotCardStatuses: [UUID: RemoteDeviceCardStatus] = [:]
+    private var screenshotCardStatusDisplayOverrides: [UUID: RemoteDeviceCardStatusDisplay] = [:]
+    private var screenshotSiriActivationNeeded: Bool?
+    private var screenshotSiriComponentInstalled: Bool?
+    private var lastLoggedSiriRemoteComponentState: String?
     @Published private(set) var remoteSystemDeviceNames: [UUID: String] = [:]
     @Published private(set) var audioDevices: [AudioDeviceInfo] = []
     @Published private(set) var macMicrophoneDevices: [AudioDeviceInfo] = []
@@ -685,11 +761,29 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     )
     private let audioOutput = VirtualAudioOutput()
     private let diagnosticLogUploader: DiagnosticLogUploader
+    private let externalActionSender: (
+        ButtonAction,
+        CustomKeyboardShortcut?,
+        CustomApplicationProfile?,
+        Bool
+    ) -> Bool
+    private let customApplicationURLResolver: (String) -> URL?
     private var recordingPlayback: AVAudioPlayer?
 
     func isOnboardingControlSourceConnected(_ source: OnboardingControlSource) -> Bool {
+        isOnboardingControlSourceConnected(source, xiaomiModel: nil)
+    }
+
+    func isOnboardingControlSourceConnected(
+        _ source: OnboardingControlSource,
+        xiaomiModel: OnboardingXiaomiRemoteModel?
+    ) -> Bool {
         switch source {
         case .xiaomiRemote:
+            if let xiaomiModel {
+                guard let profileID = profileID(forXiaomiModel: xiaomiModel) else { return false }
+                return connectedRemoteProfileIDs.contains(profileID)
+            }
             return connectedRemoteProfileIDs.contains { profileID in
                 guard let model = settings.remoteDeviceProfiles.first(where: {
                     $0.id == profileID
@@ -710,11 +804,77 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
     }
 
+    var connectedOnboardingXiaomiModels: Set<OnboardingXiaomiRemoteModel> {
+        Set(settings.remoteDeviceProfiles.compactMap { profile in
+            guard connectedRemoteProfileIDs.contains(profile.id) else { return nil }
+            switch profile.model {
+            case .rc001: return .rc001
+            case .rc003: return .rc003
+            default: return nil
+            }
+        })
+    }
+
+    /// 选择型号时要操作的档案：已连接优先，其次当前选中，最后第一个匹配档案。
+    func profileID(forXiaomiModel model: OnboardingXiaomiRemoteModel) -> UUID? {
+        let matches = settings.remoteDeviceProfiles.filter { $0.model == model.model }
+        if let connected = matches.first(where: { connectedRemoteProfileIDs.contains($0.id) }) {
+            return connected.id
+        }
+        if let selected = matches.first(where: { $0.id == settings.selectedRemoteProfileID }) {
+            return selected.id
+        }
+        return matches.first?.id
+    }
+
+    /// 当前蓝牙语音会话对应的档案；没有活跃会话时为 nil。
+    var activePhysicalVoiceProfileID: UUID? {
+        guard bluetoothVoiceActive,
+              let identifier = activeBluetoothVoiceDeviceIdentifier
+        else { return nil }
+        return settings.profileID(forBluetoothIdentifier: identifier)
+    }
+
     var activePhysicalVoiceControlSource: OnboardingControlSource? {
         if bluetoothVoiceActive { return .xiaomiRemote }
         if !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping { return .siriRemote }
         if chromecastVoiceActive || chromecastVoiceStopping { return .chromecastRemote }
         return nil
+    }
+
+    /// Onboarding 已选定小米型号时，HID/语音路由必须锁定在该型号。
+    /// 完成后或未选择型号时不改变现有运行时行为。
+    private var isOnboardingXiaomiSelectionLocked: Bool {
+        settings.onboardingCompletedVersion == 0 &&
+            settings.onboardingControlSource == .xiaomiRemote &&
+            settings.onboardingXiaomiRemoteModel != nil
+    }
+
+    private func onboardingXiaomiDisposition(
+        for profileID: UUID,
+        selectedModel: OnboardingXiaomiRemoteModel
+    ) -> OnboardingXiaomiEventDisposition {
+        let profileModel = settings.remoteDeviceProfiles.first { $0.id == profileID }?.model
+        return OnboardingXiaomiEventPolicy.disposition(
+            profileModel: profileModel,
+            selectedModel: selectedModel,
+            controlSource: settings.onboardingControlSource
+        )
+    }
+
+    private func shouldAdoptOnboardingXiaomiProfile(
+        _ candidateProfileID: UUID,
+        selectedModel: OnboardingXiaomiRemoteModel
+    ) -> Bool {
+        let profileModel = settings.remoteDeviceProfiles.first {
+            $0.id == candidateProfileID
+        }?.model
+        return OnboardingXiaomiEventPolicy.shouldAdoptSelection(
+            profileModel: profileModel,
+            selectedModel: selectedModel,
+            selectedModelProfileExists: profileID(forXiaomiModel: selectedModel) != nil,
+            controlSource: settings.onboardingControlSource
+        )
     }
     private let phoneRemoteServer = PhoneRemoteServer(logger: { message in
         AppLogger.shared.write(message)
@@ -883,14 +1043,21 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var bluetoothBridges: [UUID: XiaomiBluetoothBridge] = [:]
     private var bluetoothBridgeStates: [ObjectIdentifier: BluetoothBridgeState] = [:]
     private var discoveryBluetoothBridge: XiaomiBluetoothBridge?
+    private var hasBusyBluetoothTarget: Bool {
+        bluetoothBridges.values.contains { $0.isConnectionBusy }
+    }
+    private var remoteRecoveryBudgets: [UUID: RemoteConnectionRecovery] = [:]
+    @Published private(set) var remoteRecoveryStates: [UUID: RemoteConnectionRecoveryStatus] = [:]
+    private var screenshotBluetoothConnectionBlock: LocalizedMessage?
     private var pendingBluetoothVoiceStartIdentifier: UUID?
-    // Keep up to two seconds while the audio engine opens. This protects the
-    // first word without allowing an unbounded pre-configuration buffer.
     private var pendingBluetoothVoiceAudio = CommandVoiceActivationAudioBuffer(
-        maximumSampleCount: 32_000
+        maximumSampleCount: AudioConfigurationRetryPolicy.bluetoothStartupBufferSampleCount
     )
     private var pendingBluetoothVoiceAudioDiagnostic: ATVVAudioDiagnostics?
-    private var pendingBluetoothVoiceStopRequested = false
+    private var pendingBluetoothVoiceStopReason: BluetoothVoiceStopReason?
+    private var bluetoothVoiceStartupQueue = BluetoothVoiceStartupQueue()
+    private var bluetoothVoiceStartupQueueOwner: UUID?
+    private var activeBluetoothVoiceDiagnostic: ATVVAudioDiagnostics?
     private var activeBluetoothVoiceDeviceIdentifier: UUID?
     private var bluetoothVoiceTraceCounter: UInt64 = 0
     private var activeBluetoothVoiceTraceID: UInt64?
@@ -1028,6 +1195,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var connectedChromecastProfileIDs = Set<UUID>()
     /// 当前按下的 Chromecast 按键（画布控制 ID）。
     private var chromecastPressedControls = Set<String>()
+    private let chromecastAppSwitcher = ChromecastAppSwitcher()
     private var chromecastButtonGestureRecognizer = RemoteButtonGestureRecognizer()
     private var chromecastDoubleClickTimers: [RemoteButton: DispatchSourceTimer] = [:]
     private var chromecastLongPressTimers: [RemoteButton: DispatchSourceTimer] = [:]
@@ -1044,6 +1212,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var completedUpdateHIDRecoveryWorkItem: DispatchWorkItem?
     private var hidMappingRecoveryWorkItem: DispatchWorkItem?
     private var hidMappingRecoveryAttempt = 0
+    /// 服务已在、但写入回读不一致导致的重试计数；与「服务还枚举不出来」的预算分开，
+    /// 由一次成功接管清零，避免两条恢复路径互相重置。
+    private var hidVerificationRecoveryAttempt = 0
+    private var hidMappingRecoveryVerificationPending = false
     private var hidMappingRecoveryGeneration: UInt64 = 0
     private let audioPreparationQueue = DispatchQueue(label: "RemoteMic.audioPreparation", qos: .userInitiated)
     private var audioConfigurationGeneration: UInt64 = 0
@@ -1078,7 +1250,23 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         loginItemService: LoginItemService = LoginItemService(),
         transcriptArchiveStore: TranscriptArchiveStore = TranscriptArchiveStore(),
         recordingAssetStore: RecordingAssetStore = RecordingAssetStore(),
-        diagnosticLogUploader: DiagnosticLogUploader = .shared
+        diagnosticLogUploader: DiagnosticLogUploader = .shared,
+        externalActionSender: @escaping (
+            ButtonAction,
+            CustomKeyboardShortcut?,
+            CustomApplicationProfile?,
+            Bool
+        ) -> Bool = {
+            KeyboardInjector.send(
+                $0,
+                shortcut: $1,
+                applicationProfile: $2,
+                focusCustomApplication: $3
+            )
+        },
+        customApplicationURLResolver: @escaping (String) -> URL? = {
+            NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+        }
     ) {
         self.settings = settings
         self.privateFeature = privateFeature
@@ -1088,13 +1276,21 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         self.transcriptArchiveStore = transcriptArchiveStore
         self.recordingAssetStore = recordingAssetStore
         self.diagnosticLogUploader = diagnosticLogUploader
+        self.externalActionSender = externalActionSender
+        self.customApplicationURLResolver = customApplicationURLResolver
         super.init()
         settings.frontmostApplicationBundleIdentifier = {
             NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         }
+        siriRemoteCursorFeedback.setVisualFeedbackEnabled(
+            settings.siriRemoteCursorFeedbackVisible
+        )
         if settings.siriRemoteEnabled, settings.siriRemoteNeedsUserAction {
             siriRemoteAudioStatus = "unavailable:authorization_user_action_required"
         }
+        #if SAYALL_SIRI_REMOTE_ENABLED
+        logSiriRemoteComponentState(trigger: "startup")
+        #endif
         membershipFeature.configureConfigurationBackup(settings: settings)
         macroFeature.configurePortableTransfer(settings: settings) { [weak self] snapshot in
             guard let self else { throw AppConfigurationError.invalidValues }
@@ -1165,11 +1361,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             if self.siriNativeKeyMapper.prepare(additionalSources: sources) { return true }
             // 苹果遥控器只上报消费类/厂商用途，没有键盘页，系统不接受
             // `HIDKeyboardModifierMappingPairs` 写入，键位中和映射因此永远校验失败。
-            // 这种遥控器随后由适配器以独占方式打开，原生按键不会漏到系统，
-            // 所以不能因为映射未就绪就把整台设备拒掉——那样遥控器连设备卡片都不会出现。
+            // 仍接收设备控制。部分接口独占后仍有原生媒体事件，由宿主按物理边沿配对拦截。
             AppLogger.shared.write(
                 "APPLE REMOTE NATIVE_INPUT phase=fallback reason=mapping_unavailable " +
-                    "isolation=exclusive_open"
+                    "isolation=event_filter native_delivery=unverified"
             )
             return true
         }
@@ -1205,9 +1400,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 )
             }
             self.siriRemoteAudioStatus = status
+            self.logSiriRemoteComponentState(trigger: "status")
+            self.logRemoteCardStatusChanges()
         }
         siriRemoteFeature.onTouchFeedback = { [weak self] feedback in
             guard let self else { return }
+            siriRemoteCursorFeedback.setVisualFeedbackEnabled(
+                settings.siriRemoteCursorFeedbackVisible
+            )
             if case .clicked = feedback {
                 _ = siriRemoteCursorFeedback.activateHoveredElementIfAvailable()
             }
@@ -1274,6 +1474,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             self?.handleChromecastControlEvent(event)
         }
         chromecastFeature.onHIDPresenceChange = { [weak self] isPresent in
+            self?.objectWillChange.send()
+            self?.chromecastHIDIsPresent = isPresent
+            if !isPresent { self?.resetChromecastButtonState(reason: "hid_unavailable") }
+            self?.logRemoteCardStatusChanges()
             AppLogger.shared.write("CHROMECAST HID DEVICE present=\(isPresent)")
         }
         chromecastFeature.onLog = { message in
@@ -1588,11 +1792,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                              NSWorkspace.sessionDidResignActiveNotification] {
             buttonLifecycleObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
                 forName: notification, object: nil, queue: .main
-            ) { [weak self] _ in
+            ) { [weak self] event in
                 guard let self else { return }
                 self.cancelConfiguredButtonInteractions(reason: "environment_changed")
                 self.hidMonitors.values.forEach { $0.cancelConfiguredInteractions(reason: "environment_changed") }
                 self.discoveryHIDMonitor?.cancelConfiguredInteractions(reason: "environment_changed")
+                if event.name != NSWorkspace.didActivateApplicationNotification {
+                    self.chromecastAppSwitcher.cancel(reason: "environment_changed")
+                }
             })
         }
         terminationObserver = NotificationCenter.default.addObserver(
@@ -1635,6 +1842,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         stopRecordingPlayback()
         guard started else { return }
         started = false
+        onboardingAudioPreparationActive = false
         cancelHIDMappingRecovery(reason: "app_stop")
         completedUpdateHIDRecoveryWorkItem?.cancel()
         completedUpdateHIDRecoveryWorkItem = nil
@@ -1689,7 +1897,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         discoveryBluetoothBridge = nil
         pendingBluetoothVoiceStartIdentifier = nil
         cancelPendingBluetoothVoiceAudio(reason: "app_stop")
-        pendingBluetoothVoiceStopRequested = false
+        cancelQueuedBluetoothVoice(reason: "app_stop")
+        activeBluetoothVoiceDiagnostic = nil
+        pendingBluetoothVoiceStopReason = nil
         activeBluetoothVoiceDeviceIdentifier = nil
         webRemoteClient.stop()
         isPhoneRemoteConnectionEnabled = false
@@ -2145,13 +2355,71 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             startBluetoothConnections()
             return
         }
-        if let selectedBluetoothBridge {
-            selectedBluetoothBridge.reconnectNow()
+        if let profile = settings.selectedRemoteProfile, !isRemoteConnected(profile.id),
+           profile.bluetoothIdentifier != nil {
+            connectRemoteProfile(profile.id)
         } else {
-            bluetoothBridges.values.forEach { $0.reconnectNow() }
-            discoveryBluetoothBridge?.reconnectNow()
+            refreshRemoteDiscovery()
         }
     }
+
+    var remoteDiscoveryIsActive: Bool { discoveryBluetoothBridge?.isDiscoveringDevices == true }
+
+    var bluetoothConnectionBlock: LocalizedMessage? {
+        if let screenshotBluetoothConnectionBlock { return screenshotBluetoothConnectionBlock }
+        guard let state = discoveryBluetoothBridge?.state,
+              case .bluetoothUnavailable(let message) = state
+        else { return nil }
+        return message
+    }
+
+    func openBluetoothPrivacySettings() {
+        if bluetoothConnectionBlock?.key == "bluetooth.status.off",
+           let url = URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings") {
+            NSWorkspace.shared.open(url)
+        } else {
+            openPrivacyPane("Privacy_Bluetooth")
+        }
+    }
+
+    func findRemoteDevices() {
+        guard started else { return }
+        if discoveryBluetoothBridge == nil { startBluetoothDiscoveryIfNeeded(manual: true) }
+        else { discoveryBluetoothBridge?.refreshDiscovery(manual: true) }
+    }
+
+    func connectRemoteProfile(_ profileID: UUID) {
+        guard started, !isRemoteConnected(profileID),
+              let profile = settings.remoteDeviceProfiles.first(where: { $0.id == profileID }) else { return }
+        if profile.model.isAppleSiriRemote {
+            if siriRemoteActivationNeeded { activateSiriRemoteFromCard() }
+            else { openRemoteBluetoothSettings() }
+            return
+        }
+        if profile.model.isChromecastRemote {
+            openRemoteBluetoothSettings()
+            return
+        }
+        guard bluetoothConnectionBlock == nil, let identifier = profile.bluetoothIdentifier else { return }
+        connectBluetoothIdentifier(identifier, manual: true)
+    }
+
+    func cancelRemoteConnection(_ profileID: UUID) {
+        guard let profile = settings.remoteDeviceProfiles.first(where: { $0.id == profileID }),
+              let identifier = profile.bluetoothIdentifier else { return }
+        bluetoothBridges[identifier]?.cancelRecovery()
+    }
+
+    func canConnectRemoteProfile(_ profileID: UUID) -> Bool {
+        if settings.remoteDeviceProfiles.first(where: { $0.id == profileID })?.model.usesPrivateAdapter == true { return true }
+        guard bluetoothConnectionBlock == nil else { return false }
+        guard let identifier = settings.remoteDeviceProfiles.first(where: { $0.id == profileID })?.bluetoothIdentifier,
+              let availableAt = bluetoothBridges[identifier]?.manualRecoveryAvailableAt
+        else { return true }
+        return ProcessInfo.processInfo.systemUptime >= availableAt
+    }
+
+    func cancelRemoteDiscovery() { discoveryBluetoothBridge?.cancelDiscovery() }
 
     func recheckRemoteInput() {
         guard started, !isStreaming else { return }
@@ -2182,15 +2450,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         )
     }
 
-    private func recoverBluetoothVoiceLink(reason: String) {
-        let targets: [XiaomiBluetoothBridge]
-        if let selectedBluetoothBridge {
-            targets = [selectedBluetoothBridge]
-        } else {
-            targets = Array(bluetoothBridges.values)
-        }
+    private func recoverBluetoothVoiceLink(
+        reason: String,
+        trigger: RemoteConnectionRecoveryTrigger = .automatic
+    ) {
+        let targets = Array(bluetoothBridges.values)
         AppLogger.shared.write(
-            "BLE RECOVERY phase=begin trigger=\(reason) target_bridges=\(targets.count) " +
+            "BLE RECOVERY phase=begin trigger=\(reason) recovery_trigger=\(trigger.rawValue) " +
+                "target_bridges=\(targets.count) " +
                 "configured_bridges=\(bluetoothBridges.count) " +
                 "discovery=\(discoveryBluetoothBridge != nil) " +
                 "ready_bridges=\(readyBluetoothBridgeCount)"
@@ -2202,8 +2469,42 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return
         }
-        targets.forEach { $0.recoverVoiceLink(reason: reason) }
-        discoveryBluetoothBridge?.recoverVoiceLink(reason: reason)
+        targets.forEach { $0.recoverVoiceLink(reason: reason, trigger: trigger) }
+        if trigger != .systemWake {
+            discoveryBluetoothBridge?.recoverVoiceLink(reason: reason, trigger: trigger)
+        }
+    }
+
+    /// A voice-key press is explicit user intent. When the selected remote's
+    /// voice link is down, spend one assisted attempt instead of silently
+    /// ignoring the key. The HID event itself is never consumed here.
+    private func handleHIDVoiceUsageDown(profileID: UUID?) {
+        guard started,
+              let profileID,
+              profileID == settings.selectedRemoteProfileID
+        else { return }
+        guard !bluetoothVoiceActive, !isStreaming, !isPlayingTestTone else { return }
+        guard !isRemoteConnected(profileID) else { return }
+        guard let bridge = selectedBluetoothBridge else {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=no_bluetooth_link source=hid_voice_usage"
+            )
+            return
+        }
+        if bridge.isConnectionBusy {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=already_recovering source=hid_voice_usage"
+            )
+            return
+        }
+        AppLogger.shared.write(
+            "VOICE KEY reconnect_requested reason=voice_link_down source=hid_voice_usage"
+        )
+        if !bridge.reconnectNow(trigger: .voiceKey) {
+            AppLogger.shared.write(
+                "VOICE KEY reconnect_skipped reason=recovery_rejected source=hid_voice_usage"
+            )
+        }
     }
 
     private func setBluetoothSystemSuspended(_ suspended: Bool, reason: String) {
@@ -2222,12 +2523,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 
     func refreshRemoteDiscovery() {
         guard started else { return }
+        if hasBusyBluetoothTarget {
+            discoveryBluetoothBridge?.cancelAutomaticDiscovery()
+            return
+        }
         if discoveryBluetoothBridge == nil {
             startBluetoothDiscoveryIfNeeded()
         } else {
-            discoveryBluetoothBridge?.reconnectNow()
+            discoveryBluetoothBridge?.refreshDiscovery()
         }
-        AppLogger.shared.write("BLE DISCOVERY refreshed_from_foreground")
     }
 
     func enablePhoneRemoteConnection() {
@@ -2812,8 +3116,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         audioPreparationQueue.async { [weak self] in
             let inputs = CoreAudioDeviceCatalog.inputDevices().filter { device in
                 let transport = CoreAudioDeviceCatalog.transportType(for: device.id)
-                return transport != kAudioDeviceTransportTypeVirtual &&
-                    transport != kAudioDeviceTransportTypeAggregate &&
+                return MacMicrophoneInputEligibilityPolicy.isSelectable(transport: transport) &&
                     VirtualAudioDeviceDiagnosticKind.classify(device) == .other
             }
             let builtInDeviceIDs = Set(inputs.compactMap { device in
@@ -3101,7 +3404,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         resumeVirtualAudioOutputIfNeeded(reason: "system_\(event.rawValue)")
         if BluetoothWakeRecoveryPolicy.shouldForceReconnect(event: event, started: started) {
-            recoverBluetoothVoiceLink(reason: "system_wake")
+            recoverBluetoothVoiceLink(reason: "system_wake", trigger: .systemWake)
         } else if BluetoothWakeRecoveryPolicy.shouldRecoverVoiceLinkAfterResume(
             started: started,
             configuredBridgeCount: bluetoothBridges.count,
@@ -3150,6 +3453,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 }
                 self.audioStatus = self.audioOutput.status
                 self.isAudioOutputReady = self.audioOutput.isReadyForTestTone
+                self.logRemoteCardStatusChanges()
                 let reportsReady = AudioConfigurationCompletionPolicy.reportsReady(
                     configured: configured,
                     readyNow: self.isAudioOutputReady
@@ -3700,6 +4004,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         appliedHIDPermissionSnapshot = permissionSnapshot
         if !settings.customMappingEnabled || !permissionSnapshot.accessibilityGranted ||
             !permissionSnapshot.inputMonitoringGranted {
+            chromecastAppSwitcher.cancel(reason: "mapping_or_permission_unavailable")
             remoteNativeKeyMapper.restore()
             siriNativeKeyMapper.restore()
             chromecastNativeKeyMapper.restore()
@@ -3861,6 +4166,14 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
     }
 
+    /// Ends the onboarding trial when the user switches to another control source.
+    /// Keep a previously enabled Siri Remote untouched; restore the original disabled
+    /// state only when onboarding itself turned it on.
+    func endSiriRemoteOnboardingTrialIfNeeded() {
+        guard settings.onboardingSiriRemoteInitiallyEnabled == false else { return }
+        setSiriRemoteEnabled(false)
+    }
+
     func completeOnboarding() {
         // 连接、按键与触摸不看会员，因此不再因为无权益把整个 Siri Remote 支持关掉；
         // 语音是否可用改由按键入口的 `canStartAppleRemoteVoice` 判定。
@@ -3887,11 +4200,26 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         AppLogger.shared.write("SIRI REMOTE ACTIVATION phase=changed enabled=\(enabled)")
     }
 
+    /// 只切换触摸反馈的可见性；指针移动、滚动、点击和悬停确认保持原逻辑。
+    func setSiriRemoteCursorFeedbackVisible(_ visible: Bool) {
+        settings.siriRemoteCursorFeedbackVisible = visible
+        siriRemoteCursorFeedback.setVisualFeedbackEnabled(visible)
+        AppLogger.shared.write(
+            "APPLE REMOTE TOUCH FEEDBACK phase=preference result=\(visible ? "visible" : "hidden")"
+        )
+    }
+
     /// Call only from enable/retry controls, never from startup or device discovery.
     func prepareSiriRemoteFromUserAction() {
 #if SAYALL_SIRI_REMOTE_ENABLED
         guard settings.siriRemoteEnabled else { return }
-        guard activePhysicalVoiceControlSource != .siriRemote else { return }
+        guard activePhysicalVoiceControlSource != .siriRemote || !isSiriRemoteHelperInstalled else {
+            AppLogger.shared.write(
+                "SIRI REMOTE ACTIVATION phase=skipped reason=voice_session_active " +
+                    "component_installed=true"
+            )
+            return
+        }
         settings.siriRemoteNeedsUserAction = false
         if siriRemoteAudioStatus == "disabled" || siriRemoteAudioStatus.hasPrefix("unavailable:") {
             siriRemoteAudioStatus = "preparing_hci"
@@ -3909,26 +4237,44 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     ///   服务还没枚举出来，而重连时蓝牙桥恰好可能还没回到 ready。
     private func scheduleHIDMappingRecoveryIfNeeded(
         restartSiriRemote: Bool = true,
-        requiresReadyBridge: Bool = true
+        requiresReadyBridge: Bool = true,
+        verificationFailed: Bool = false
     ) {
         guard hidMappingRecoveryWorkItem == nil else { return }
+        // 只在新增的校验失败路径上跳过"映射已关闭"：既有两条路径的重排条件保持不变。
+        if verificationFailed, !settings.customMappingEnabled { return }
         let hasMatchingServices = voiceFunctionMapper.hasMatchingServices
-        guard let delay = (requiresReadyBridge
-            ? HIDMappingRecoveryPolicy.retryDelay(
+        let delay: TimeInterval?
+        if verificationFailed {
+            delay = HIDMappingRecoveryPolicy.verificationFailedRetryDelay(
+                forAttempt: hidVerificationRecoveryAttempt,
+                started: started
+            )
+        } else if requiresReadyBridge {
+            delay = HIDMappingRecoveryPolicy.retryDelay(
                 forAttempt: hidMappingRecoveryAttempt,
                 started: started,
                 readyBridgeCount: readyBluetoothBridgeCount,
                 hasMatchingServices: hasMatchingServices
             )
-            : HIDMappingRecoveryPolicy.deviceVerificationRetryDelay(
+        } else {
+            delay = HIDMappingRecoveryPolicy.deviceVerificationRetryDelay(
                 forAttempt: hidMappingRecoveryAttempt,
                 started: started,
                 hasMatchingServices: hasMatchingServices
-            ))
-        else {
-            if started,
-               !hasMatchingServices,
-               hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+            )
+        }
+        guard let delay else {
+            if verificationFailed,
+               started,
+               hidVerificationRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+                AppLogger.shared.write(
+                    "HID MAPPING RECOVERY exhausted attempts=\(hidVerificationRecoveryAttempt) " +
+                        "ready_bridges=\(readyBluetoothBridgeCount) trigger=mapping_not_verified"
+                )
+            } else if started,
+                      !hasMatchingServices,
+                      hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
                 AppLogger.shared.write(
                     "HID MAPPING RECOVERY exhausted attempts=\(hidMappingRecoveryAttempt) " +
                         "ready_bridges=\(readyBluetoothBridgeCount) " +
@@ -3938,16 +4284,22 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             return
         }
 
-        let attempt = hidMappingRecoveryAttempt + 1
-        hidMappingRecoveryAttempt = attempt
+        let attempt = (verificationFailed ? hidVerificationRecoveryAttempt : hidMappingRecoveryAttempt) + 1
+        if verificationFailed {
+            hidVerificationRecoveryAttempt = attempt
+            hidMappingRecoveryVerificationPending = true
+        } else {
+            hidMappingRecoveryAttempt = attempt
+        }
         hidMappingRecoveryGeneration &+= 1
         let generation = hidMappingRecoveryGeneration
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.hidMappingRecoveryGeneration == generation else { return }
             self.hidMappingRecoveryWorkItem = nil
+            self.hidMappingRecoveryVerificationPending = false
             guard self.started,
                   !requiresReadyBridge || self.readyBluetoothBridgeCount > 0,
-                  !self.voiceFunctionMapper.hasMatchingServices
+                  verificationFailed || !self.voiceFunctionMapper.hasMatchingServices
             else {
                 self.cancelHIDMappingRecovery(reason: "conditions_changed")
                 return
@@ -3955,10 +4307,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             AppLogger.shared.write(
                 "HID MAPPING RECOVERY applying attempt=\(attempt) " +
                     "ready_bridges=\(self.readyBluetoothBridgeCount) " +
-                    "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
+                    "trigger=\(verificationFailed ? "mapping_not_verified" : Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
             )
             self.applyHIDSettings(restartSiriRemote: restartSiriRemote)
-            if !self.voiceFunctionMapper.hasMatchingServices {
+            // 校验失败类的重试不在这里自我续排：成功由 connected 状态收尾，
+            // 再次失败由新的回调重新排程，避免与 `completeHIDMappingRecoveryIfNeeded` 互相重置成死循环。
+            if !verificationFailed, !self.voiceFunctionMapper.hasMatchingServices {
                 self.scheduleHIDMappingRecoveryIfNeeded(
                     restartSiriRemote: restartSiriRemote,
                     requiresReadyBridge: requiresReadyBridge
@@ -3969,9 +4323,25 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         AppLogger.shared.write(
             "HID MAPPING RECOVERY scheduled attempt=\(attempt) " +
                 "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount) " +
-                "trigger=\(Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
+                "trigger=\(verificationFailed ? "mapping_not_verified" : Self.hidMappingRecoveryTrigger(requiresReadyBridge))"
         )
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    /// 一次成功接管（含"旁听但已中和"）会收尾校验失败类重试，避免计数跨会话累积。
+    private func noteHIDMappingVerifiedConnected() {
+        guard hidVerificationRecoveryAttempt > 0 else { return }
+        let attempts = hidVerificationRecoveryAttempt
+        hidVerificationRecoveryAttempt = 0
+        if hidMappingRecoveryVerificationPending {
+            hidMappingRecoveryVerificationPending = false
+            hidMappingRecoveryGeneration &+= 1
+            hidMappingRecoveryWorkItem?.cancel()
+            hidMappingRecoveryWorkItem = nil
+        }
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY completed attempts=\(attempts) trigger=mapping_not_verified"
+        )
     }
 
     private static func hidMappingRecoveryTrigger(_ requiresReadyBridge: Bool) -> String {
@@ -4212,6 +4582,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         hidMonitors.values.forEach { $0.stop() }
         discoveryHIDMonitor?.stop()
         hidMonitors.removeAll()
+        remoteButtonReadiness.removeAll()
         discoveryHIDMonitor = nil
         hidEventSuppressor.stop()
         activeRemoteButtons = []
@@ -4282,7 +4653,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         monitor.onNativeMappingVerificationFailed = { [weak self] in
             self?.scheduleHIDMappingRecoveryIfNeeded(
                 restartSiriRemote: false,
-                requiresReadyBridge: false
+                requiresReadyBridge: false,
+                verificationFailed: true
             )
         }
         monitor.claimsRuntimeButton = { [weak self] profileID, button in
@@ -4313,6 +4685,17 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         monitor.onStatus = { [weak self, weak monitor] value in
             guard let self, let monitor else { return }
+            if let profileID = monitor.profileID {
+                self.recordHIDButtonStatus(value, profileID: profileID)
+            }
+            // A bound HID device appearing is evidence of presence, not a voice-key gesture.
+            // It may request recovery, but cannot reset that device's exhausted budget.
+            if value.key.hasPrefix("button_mapping.status.connected"),
+               let profileID = monitor.profileID,
+               let profile = self.settings.remoteDeviceProfiles.first(where: { $0.id == profileID }),
+               !profile.model.usesPrivateAdapter, let identifier = profile.bluetoothIdentifier {
+                self.connectBluetoothIdentifier(identifier, manual: false)
+            }
             if self.settings.selectedRemoteProfile?.model.isAppleSiriRemote == true {
                 return
             }
@@ -4324,6 +4707,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         monitor.onActiveButtons = { [weak self] profileID, buttons in
             guard let self, profileID == self.settings.selectedRemoteProfileID else { return }
             self.activeRemoteButtons = buttons
+        }
+        monitor.onVoiceUsageDown = { [weak self] profileID in
+            self?.handleHIDVoiceUsageDown(profileID: profileID)
         }
         monitor.onButtonPressed = { [weak self, weak monitor] profileID, fingerprint, button in
             guard let self, let monitor else {
@@ -4346,7 +4732,35 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     self.scheduleHIDMonitorRebuildAfterDiscoveryAdoption()
                 }
             }
-            self.selectRemoteProfile(resolvedProfileID)
+            var onboardingDisposition: OnboardingXiaomiEventDisposition?
+            if isOnboardingXiaomiSelectionLocked,
+               let selectedModel = settings.onboardingXiaomiRemoteModel {
+                let disposition = onboardingXiaomiDisposition(
+                    for: resolvedProfileID,
+                    selectedModel: selectedModel
+                )
+                onboardingDisposition = disposition
+                if disposition == .rejectOtherModel {
+                    AppLogger.shared.write(
+                        "ONBOARDING BUTTON ignored reason=\(disposition.logValue)"
+                    )
+                    return (resolvedProfileID, false)
+                }
+                if shouldAdoptOnboardingXiaomiProfile(
+                    resolvedProfileID,
+                    selectedModel: selectedModel
+                ) {
+                    self.selectRemoteProfile(resolvedProfileID)
+                }
+                if disposition == .pendingIdentity {
+                    AppLogger.shared.write(
+                        "ONBOARDING XIAOMI_MODEL result=pending_model_identity"
+                    )
+                }
+            } else {
+                self.selectRemoteProfile(resolvedProfileID)
+            }
+            self.lastRemoteButtonPressProfileID = resolvedProfileID
             self.lastRemoteButtonPress = button
             self.settings.recordButtonPress(
                 control: .remoteButton(button),
@@ -4362,14 +4776,18 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     at: self.settings.onboardingStep,
                     source: self.settings.onboardingControlSource
                 )
-            if suppressConfiguredAction {
+            let holdConfiguredActionForPendingIdentity =
+                onboardingDisposition == .pendingIdentity
+            if suppressConfiguredAction || holdConfiguredActionForPendingIdentity {
                 AppLogger.shared.write(
                     "ONBOARDING CONTROLS button=\(button.rawValue) action=suppressed"
                 )
             }
             return (
                 resolvedProfileID,
-                !self.macroFeature.isEditorActive && !suppressConfiguredAction
+                !self.macroFeature.isEditorActive &&
+                    !suppressConfiguredAction &&
+                    !holdConfiguredActionForPendingIdentity
             )
         }
         monitor.onInternalAction = { [weak self] profileID, action in
@@ -4751,29 +5169,89 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func startBluetoothConnections() {
-        let identifiers = Set(settings.remoteDeviceProfiles.compactMap(\.bluetoothIdentifier))
-        for identifier in identifiers where bluetoothBridges[identifier] == nil {
-            let bridge = XiaomiBluetoothBridge(
-                delegate: self,
-                targetIdentifier: identifier
-            )
-            bluetoothBridges[identifier] = bridge
-            bridge.setSystemSuspended(
-                systemAudioSuspensionState.isSuspended,
-                reason: "bridge_start"
-            )
-            bridge.start()
-        }
         startBluetoothDiscoveryIfNeeded()
     }
 
-    private func startBluetoothDiscoveryIfNeeded() {
-        guard started, discoveryBluetoothBridge == nil else { return }
+    private func connectBluetoothIdentifier(_ identifier: UUID, manual: Bool) {
+        if let bridge = bluetoothBridges[identifier] {
+            if manual { bridge.reconnectNow(manual: true) }
+            else { bridge.start() }
+            return
+        }
+        reconcileStaleRemoteIdentity(for: identifier)
+        let budget = remoteRecoveryBudgets[identifier] ?? RemoteConnectionRecovery()
+        remoteRecoveryBudgets[identifier] = budget
+        let bridge = XiaomiBluetoothBridge(delegate: self, targetIdentifier: identifier, recovery: budget)
+        bluetoothBridges[identifier] = bridge
+        bridge.setSystemSuspended(systemAudioSuspensionState.isSuspended, reason: "bridge_start")
+        bridge.start(manual: manual)
+    }
+
+    /// 发现回调带来新的 BLE identifier 时，先用 HID 指纹确认它是不是已有档案的同一只
+    /// 物理遥控器。只有唯一命中且 identifier 未被其他档案占用时才替换；新设备、重复指纹
+    /// 或语音进行中都保持原状。
+    @discardableResult
+    private func reconcileStaleRemoteIdentity(for identifier: UUID) -> UUID? {
+        guard !bluetoothVoiceActive, pendingBluetoothVoiceStartIdentifier == nil else { return nil }
+        guard settings.profileID(forBluetoothIdentifier: identifier) == nil else { return nil }
+        guard let match = RemoteIdentityReconciliationPolicy.replacement(
+            for: identifier,
+            hidFingerprints: RemoteIdentityFingerprint.candidates(for: identifier),
+            profiles: settings.remoteDeviceProfiles
+        ) else { return nil }
+        guard let previousIdentifier = settings.replaceBluetoothIdentifier(
+            for: match.profileID,
+            with: identifier
+        ) else { return nil }
+        // 旧 identifier 的恢复预算属于旧目标，不能迁移给新 identifier：如果它已经
+        // paused/cancelled，新 bridge 的 begin(manual:) 会直接失败，连 BLE CONNECTING
+        // 都不会出现。这里丢弃两侧旧预算，让 connectBluetoothIdentifier 为新目标创建
+        // 一份全新的恢复预算。
+        let previousStatus = remoteRecoveryBudgets[previousIdentifier]?.status.rawValue
+            ?? "none"
+        let previousShared = settings.remoteDeviceProfiles.filter {
+            $0.id != match.profileID && $0.bluetoothIdentifier == previousIdentifier
+        }.count
+        remoteRecoveryBudgets.removeValue(forKey: previousIdentifier)
+        remoteRecoveryBudgets.removeValue(forKey: identifier)
+        if let staleBridge = bluetoothBridges.removeValue(forKey: previousIdentifier) {
+            staleBridge.stop()
+            // `stop()` 会把 `.stopped` 同步回调给 delegate，并重新写进这张表。移除必须放在
+            // 它之后，否则每次身份修复都会留下一条不会再被回收的孤儿状态；`allStates.first`
+            // 兜底选择连接状态时可能选中它，把卡片文案永久钉在「已停止」。
+            bluetoothBridgeStates.removeValue(forKey: ObjectIdentifier(staleBridge))
+        }
+        remoteRecoveryStates.removeValue(forKey: match.profileID)
+        pendingRemoteBatteryLevels.removeValue(forKey: previousIdentifier)
+        pendingRemotePowerStates.removeValue(forKey: previousIdentifier)
+        pendingRemoteModels.removeValue(forKey: previousIdentifier)
+        let model = settings.remoteDeviceProfiles.first(where: { $0.id == match.profileID })?.model.rawValue
+            ?? "unknown"
+        AppLogger.shared.write(
+            "BLE IDENTITY phase=completed result=replaced reason=hid_fingerprint_match " +
+                "model=\(model) previous_recovery=\(previousStatus) previous_shared=\(previousShared)"
+        )
+        return match.profileID
+    }
+
+    private func startBluetoothDiscoveryIfNeeded(manual: Bool = false) {
+        guard started, discoveryBluetoothBridge == nil,
+              manual || !hasBusyBluetoothTarget else { return }
         let bridge = XiaomiBluetoothBridge(
             delegate: self,
             excludedIdentifiers: { [weak self] in
                 guard let self else { return [] }
-                return Set(self.bluetoothBridges.keys)
+                return Set(self.bluetoothBridges.compactMap { $0.value.isConnectionBusy ? $0.key : nil })
+            },
+            knownIdentifiers: { [weak self] in
+                guard let self else { return [] }
+                return Set(self.settings.remoteDeviceProfiles.filter { !$0.model.usesPrivateAdapter }.compactMap(\.bluetoothIdentifier))
+            },
+            discoveredCandidate: { [weak self] identifier in
+                self?.connectBluetoothIdentifier(identifier, manual: false)
+            },
+            reconcileCandidateIdentifier: { [weak self] identifier in
+                self?.reconcileStaleRemoteIdentity(for: identifier) != nil
             }
         )
         discoveryBluetoothBridge = bridge
@@ -4781,13 +5259,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             systemAudioSuspensionState.isSuspended,
             reason: "bridge_start"
         )
-        bridge.start()
+        bridge.start(manual: manual)
     }
 
     private func registerBluetoothBridgeIfNeeded(_ bridge: XiaomiBluetoothBridge) -> UUID? {
         guard let identifier = bluetoothIdentifier(for: bridge) else { return nil }
         let existingProfileID = settings.profileID(forBluetoothIdentifier: identifier)
+        let profileCount = settings.remoteDeviceProfiles.count
         let profileID = existingProfileID ?? settings.registerBluetoothRemote(identifier: identifier)
+        let profileCreated = settings.remoteDeviceProfiles.count > profileCount
         if discoveryBluetoothBridge === bridge {
             discoveryBluetoothBridge = nil
             bluetoothBridges[identifier] = bridge
@@ -4798,7 +5278,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         applyPendingRemoteTelemetry(identifier: identifier, profileID: profileID)
         AppLogger.shared.write(
             "REMOTE PROFILE phase=completed result=persisted reason=verified_remote_path " +
-                "created=\(existingProfileID == nil)"
+                "created=\(profileCreated)"
         )
         return profileID
     }
@@ -4834,12 +5314,12 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         return settings.profileID(forBluetoothIdentifier: identifier)
     }
 
-    func selectRemoteProfile(_ profileID: UUID) {
+    func selectRemoteProfile(_ profileID: UUID, persistSelection: Bool = true) {
         if buttonGestureLearningProfileID != nil,
            buttonGestureLearningProfileID != profileID {
             cancelButtonGestureLearning(reason: "remote_changed")
         }
-        settings.selectRemoteProfile(profileID)
+        settings.selectRemoteProfile(profileID, persistSelection: persistSelection)
         refreshAppleRemoteHIDStatus()
         refreshBluetoothPresentation()
     }
@@ -5150,15 +5630,17 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             return
         }
+        let persistsFallback = settings.selectedRemoteProfileID == nil
         AppLogger.shared.write(
             "REMOTE MAPPING_DEFAULT phase=completed result=selected " +
-                "reason=previous_remote_absent family=\(profile.model.rawValue) trigger=\(trigger)"
+                "reason=previous_remote_absent family=\(profile.model.rawValue) trigger=\(trigger) " +
+                "persisted=\(persistsFallback)"
         )
         if ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil {
-            settings.selectRemoteProfile(profile.id)
+            settings.selectRemoteProfile(profile.id, persistSelection: persistsFallback)
             return
         }
-        selectRemoteProfile(profile.id)
+        selectRemoteProfile(profile.id, persistSelection: persistsFallback)
     }
 
     private func activateRemoteProfile(for bridge: XiaomiBluetoothBridge) -> UUID? {
@@ -5224,20 +5706,67 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         )
     }
 
+    func recordHIDButtonStatus(_ value: LocalizedMessage, profileID: UUID) {
+        let readiness = RemoteFunctionReadiness.buttons(statusKey: value.key)
+        let previous = remoteButtonReadiness.updateValue(readiness, forKey: profileID)
+        logRemoteCardStatusChanges()
+
+        // 一次成功接管（含"旁听但已中和"）后收尾校验失败类重试。
+        if value.key.hasPrefix("button_mapping.status.connected") {
+            noteHIDMappingVerifiedConnected()
+        }
+
+        guard previous != .ready, readiness == .ready,
+              value.key.hasPrefix("button_mapping.status.connected") else { return }
+
+        // Reconcile after the HID callback returns, using the current BLE and HID evidence.
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.remoteButtonReadiness[profileID] == .ready,
+                  !self.connectedRemoteProfileIDs.isEmpty,
+                  !self.connectedRemoteProfileIDs.contains(profileID)
+            else { return }
+            self.collapseDuplicateRemoteProfiles(readyHIDProfileID: profileID)
+        }
+    }
+
     /// 把被并掉的档案 ID 从运行时映射里搬走。
     ///
     /// 去重时优先保留正在使用的那条，所以被并掉的通常是没有连接的旧档案；但它的
     /// 显示名、电量、设备映射仍可能留在字典里，必须一起迁到保留下来的那条，
     /// 否则下一次渲染会读到一个已经不存在的档案。
-    private func collapseDuplicateRemoteProfiles() {
+    private func collapseDuplicateRemoteProfiles(readyHIDProfileID: UUID? = nil) {
         // `connectedRemoteProfileIDs` 由 `refreshBluetoothPresentation` 汇总，可能还没跟上
         // 刚刚建好的档案，所以这里把各链路自己的连接集合也带上：正在用的那条必须留下。
         var liveProfileIDs = connectedRemoteProfileIDs
         liveProfileIDs.formUnion(connectedAppleRemoteProfileIDs)
         liveProfileIDs.formUnion(connectedChromecastProfileIDs)
-        let replacements = settings.collapseDuplicateRemoteProfiles(
+        var replacements = settings.collapseDuplicateRemoteProfiles(
             preferring: liveProfileIDs
         )
+        var activeHIDProfileIDs = Set(hidMonitors.values.compactMap { monitor -> UUID? in
+            guard monitor.status.key.hasPrefix("button_mapping.status.connected") else {
+                return nil
+            }
+            return monitor.profileID
+        })
+        if let readyHIDProfileID { activeHIDProfileIDs.insert(readyHIDProfileID) }
+        let pairedReplacements = settings.reconcileComplementaryRemoteProfiles(
+            connectedProfileIDs: liveProfileIDs,
+            activeHIDProfileIDs: activeHIDProfileIDs
+        )
+        replacements.merge(pairedReplacements) { existing, _ in existing }
+        func finalProfileID(_ profileID: UUID) -> UUID {
+            var current = profileID
+            var seen = Set<UUID>()
+            while let next = replacements[current], next != current, seen.insert(current).inserted {
+                current = next
+            }
+            return current
+        }
+        replacements = Dictionary(uniqueKeysWithValues: replacements.map {
+            ($0.key, finalProfileID($0.value))
+        })
         guard !replacements.isEmpty else { return }
         for (discarded, kept) in replacements {
             if let name = remoteSystemDeviceNames[discarded], remoteSystemDeviceNames[kept] == nil {
@@ -5247,23 +5776,44 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             if let level = remoteBatteryLevels[discarded], remoteBatteryLevels[kept] == nil {
                 remoteBatteryLevels[kept] = level
             }
+            remoteBatteryLevels.removeValue(forKey: discarded)
             if let state = remotePowerStates[discarded], remotePowerStates[kept] == nil {
                 remotePowerStates[kept] = state
             }
+            remotePowerStates.removeValue(forKey: discarded)
             if let model = pendingRemoteModels[discarded], pendingRemoteModels[kept] == nil {
                 pendingRemoteModels[kept] = model
             }
+            pendingRemoteModels.removeValue(forKey: discarded)
+            if let readiness = remoteButtonReadiness[discarded], remoteButtonReadiness[kept] == nil {
+                remoteButtonReadiness[kept] = readiness
+            }
+            remoteButtonReadiness.removeValue(forKey: discarded)
+            if let recovery = remoteRecoveryStates[discarded], remoteRecoveryStates[kept] == nil {
+                remoteRecoveryStates[kept] = recovery
+            }
+            remoteRecoveryStates.removeValue(forKey: discarded)
+            lastLoggedCardStatuses.removeValue(forKey: discarded)
+            lastLoggedCardReadiness.removeValue(forKey: discarded)
+            screenshotCardStatuses.removeValue(forKey: discarded)
+            screenshotCardStatusDisplayOverrides.removeValue(forKey: discarded)
             for (device, profileID) in appleRemoteProfileIDs where profileID == discarded {
                 appleRemoteProfileIDs[device] = kept
             }
         }
+        connectedRemoteProfileIDs = Set(connectedRemoteProfileIDs.map {
+            replacements[$0] ?? $0
+        })
+        refreshBluetoothPresentation()
         AppLogger.shared.write(
             "REMOTE PROFILES phase=completed result=collapsed merged=\(replacements.count) " +
-                "remaining=\(settings.remoteDeviceProfiles.count)"
+                "remaining=\(settings.remoteDeviceProfiles.count) " +
+                "source=\(readyHIDProfileID == nil ? "metadata_refresh" : "hid_ready")"
         )
     }
 
     private func refreshBluetoothPresentation() {
+        defer { logRemoteCardStatusChanges() }
         let allStates = bluetoothBridgeStates.values
         let connectedBluetoothProfileIDs = Set<UUID>(bluetoothBridges.compactMap { identifier, bridge in
             guard let profileID = settings.profileID(forBluetoothIdentifier: identifier),
@@ -5441,21 +5991,23 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
             return
         }
-        if settings.customMappingEnabled, !siriNativeKeyMapper.isPrepared, event.phase == .began {
-            // 键位中和映射不可用时设备已由适配器独占打开，原生事件不会漏到系统，
-            // 因此继续执行用户配置的动作，不再整键丢弃。
-            AppLogger.shared.write(
-                "APPLE REMOTE ACTION phase=continued result=exclusive_open_isolation " +
-                    "control=\(control.rawValue)"
-            )
+        let profileID = appleRemoteProfileIDs[event.device]
+        let nativeEdge: RemoteEventEdge = event.phase == .began ? .down : .up
+        let needsEventFilter = !siriNativeKeyMapper.isPrepared
+        let ownsMappedInput = profileID != nil && (settings.customMappingEnabled || suppressConfiguredAction)
+        if needsEventFilter, ownsMappedInput {
+            // The session tap can receive a native media event while the main thread
+            // updates settings or publishes UI state for the same physical edge.
+            hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
         }
-        if control == .select {
-            let nativeEdge: RemoteEventEdge = event.phase == .began ? .down : .up
+        if control == .select, !appleRemoteAppSwitcherSession.isActive {
             if !suppressConfiguredAction,
                event.phase == .began,
                siriRemoteCursorFeedback.activateHoveredElementIfAvailable() {
                 appleRemoteHoverClickDevices.insert(event.device)
-                if !siriNativeKeyMapper.isPrepared { hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge) }
+                if needsEventFilter, !ownsMappedInput {
+                    hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
+                }
                 AppLogger.shared.write(
                     "APPLE REMOTE HOVER_CLICK phase=began result=activated action=ax_press"
                 )
@@ -5464,7 +6016,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             if !suppressConfiguredAction,
                event.phase == .ended,
                appleRemoteHoverClickDevices.remove(event.device) != nil {
-                if !siriNativeKeyMapper.isPrepared { hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge) }
+                if needsEventFilter, !ownsMappedInput {
+                    hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
+                }
                 AppLogger.shared.write(
                     "APPLE REMOTE HOVER_CLICK phase=ended result=consumed"
                 )
@@ -5480,7 +6034,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
             return
         }
-        guard let profileID = appleRemoteProfileIDs[event.device] else {
+        guard let profileID else {
             AppLogger.shared.write(
                 "APPLE REMOTE ACTION phase=failed result=profile_unavailable " +
                     "control=\(control.rawValue)"
@@ -5507,10 +6061,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
             return
         }
-        let nativeEdge: RemoteEventEdge = event.phase == .began ? .down : .up
-        if !siriNativeKeyMapper.isPrepared { hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge) }
         AppLogger.shared.write(
-            "APPLE REMOTE NATIVE_EVENT phase=\(siriNativeKeyMapper.isPrepared ? "source_mapped" : "armed") control=\(control.rawValue) " +
+            "APPLE REMOTE NATIVE_EVENT phase=\(needsEventFilter ? "armed" : "source_mapped") control=\(control.rawValue) " +
                 "edge=\(nativeEdge == .down ? "down" : "up") " +
                 "candidates=\(control.nativeEvents.count)"
         )
@@ -5538,6 +6090,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         var buttons = appleRemoteActiveButtons[device, default: []]
         if phase == .press {
             buttons.insert(button)
+            lastRemoteButtonPressProfileID = profileID
             lastRemoteButtonPress = button
         } else {
             buttons.remove(button)
@@ -5586,6 +6139,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 reason: "unrelated_button_\(button.rawValue)",
                 confirmed: false
             )
+            return
         }
 
         if macroFeature.isEditorActive {
@@ -6032,10 +6586,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     "direction=unsupported success=true"
             )
             return true
-        case .tv:
-            return performAppleRemoteAppSwitcher(for: button, trigger: .singleClick)
         default:
-            return false
+            guard settings.action(for: button, profileID: appleRemoteAppSwitcherProfileID) == .appSwitcher
+            else { return false }
+            _ = performAppleRemoteAppSwitcher(for: button, trigger: .singleClick)
+            return true
         }
     }
 
@@ -6849,6 +7404,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             currentState: state
         )
         bluetoothBridgeStates[bridgeObjectID] = state
+        // 目标桥一旦进入连接/重连/ready，自动发现桥就不再需要继续扫描；手动查找窗口保留。
+        if bridge !== discoveryBluetoothBridge, bridge.isConnectionBusy {
+            discoveryBluetoothBridge?.cancelAutomaticDiscovery()
+        }
         if case .ready = state {
             _ = registerBluetoothBridgeIfNeeded(bridge)
             voiceFnTapSession.resume()
@@ -6877,16 +7436,32 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     remotePowerStates.removeValue(forKey: profileID)
                 }
             }
-            let voiceWasActive = identifier == activeBluetoothVoiceDeviceIdentifier
+            if let identifier, identifier == bluetoothVoiceStartupQueueOwner {
+                cancelQueuedBluetoothVoice(reason: "device_disconnected")
+            }
+            let voiceWasActive = identifier.map { $0 == activeBluetoothVoiceDeviceIdentifier } ?? false
             if voiceWasActive {
+                pendingBluetoothVoiceStartIdentifier = nil
+                pendingBluetoothVoiceStopReason = nil
+                cancelPendingBluetoothVoiceAudio(reason: "device_disconnected")
                 cancelVoiceSessionWarningTracking()
                 bluetoothVoiceActive = false
                 activeBluetoothVoiceDeviceIdentifier = nil
-                releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
+                activeBluetoothVoiceDiagnostic = nil
+                activeBluetoothVoiceTraceID = nil
+                releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: heldVoiceKeyMode == .function)
                 endVoiceSessionIfNeeded(flushAudio: false)
             }
-            if longRecordingRequested {
+            if longRecordingRequested, voiceWasActive {
                 finishLongRecording(reason: "bluetooth_not_ready")
+            }
+        }
+        if let profileID = remoteProfileID(for: bridge) {
+            remoteRecoveryStates[profileID] = bridge.recoveryStatus
+            if !bridge.isConnectionBusy, let availableAt = bridge.manualRecoveryAvailableAt {
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0, availableAt - ProcessInfo.processInfo.systemUptime)) { [weak self] in
+                    self?.objectWillChange.send()
+                }
             }
         }
         refreshBluetoothPresentation()
@@ -6921,73 +7496,76 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     func bluetoothBridgeDidStartVoice(_ bridge: XiaomiBluetoothBridge) {
-        guard !macMicrophoneState.isActive else {
-            _ = bridge.requestMicrophoneClose()
-            bridge.audioDiagnostics?.rejectStart(reason: "mac_microphone_busy")
-            AppLogger.shared.write("ATVV STREAM phase=rejected reason=mac_microphone_busy")
+        guard let identifier = bridge.deviceIdentifier, let diagnostic = bridge.audioDiagnostics else { return }
+        if macMicrophoneState.isActive {
+            rejectBluetoothVoice(bridge, diagnostic: diagnostic, reason: "mac_microphone_busy")
             return
         }
-        guard let identifier = bridge.deviceIdentifier else {
-            bridge.audioDiagnostics?.rejectStart(reason: "device_context_unavailable")
+        if let owner = activeBluetoothVoiceDeviceIdentifier ?? bluetoothVoiceStartupQueueOwner,
+           owner != identifier {
+            rejectBluetoothVoice(bridge, diagnostic: diagnostic, reason: "another_session_active")
             return
         }
-        if let pendingIdentifier = pendingBluetoothVoiceStartIdentifier,
-           pendingIdentifier != identifier {
-            _ = bridge.requestMicrophoneClose()
-            bridge.audioDiagnostics?.rejectStart(reason: "pending_start_busy")
-            AppLogger.shared.write("ATVV STREAM rejected_busy reason=pending_start")
+        if pendingBluetoothVoiceStopReason != nil || bluetoothVoiceStartupQueueOwner != nil {
+            guard bluetoothVoiceStartupQueue.begin(diagnostic) else {
+                rejectBluetoothVoice(bridge, diagnostic: diagnostic, reason: "startup_queue_full")
+                return
+            }
+            bluetoothVoiceStartupQueueOwner = identifier
+            diagnostic.awaitsOutputConfiguration = true
+            AppLogger.shared.write(
+                "ATVV STREAM phase=deferred reason=previous_voice_draining operation_id=\(diagnostic.operationID)"
+            )
             return
         }
-        let outputReadyAtStart = audioOutput.isReadyForTestTone
-        if !outputReadyAtStart {
-            let shouldStartConfiguration = pendingBluetoothVoiceStartIdentifier == nil
-            if shouldStartConfiguration {
-                pendingBluetoothVoiceStartIdentifier = identifier
-                pendingBluetoothVoiceAudioDiagnostic = bridge.audioDiagnostics
-                pendingBluetoothVoiceAudio.begin()
+        guard activeBluetoothVoiceDeviceIdentifier == nil else {
+            AppLogger.shared.write("ATVV STREAM phase=ignored reason=duplicate_start")
+            return
+        }
+        startBluetoothVoice(bridge, identifier: identifier, diagnostic: diagnostic)
+    }
+
+    private func rejectBluetoothVoice(
+        _ bridge: XiaomiBluetoothBridge, diagnostic: ATVVAudioDiagnostics, reason: String
+    ) {
+        if bridge.audioDiagnostics === diagnostic { _ = bridge.requestMicrophoneClose() }
+        diagnostic.awaitsOutputConfiguration = false
+        diagnostic.rejectStart(reason: reason)
+        AppLogger.shared.write(
+            "ATVV STREAM phase=rejected reason=\(reason) operation_id=\(diagnostic.operationID)"
+        )
+        recordPublicDiagnosticEvent(
+            component: "voice", action: "session", phase: "rejected",
+            result: "failed", reason: reason, source: "bluetooth", remoteModelFamily: "xiaomi"
+        )
+    }
+
+    private func startBluetoothVoice(
+        _ bridge: XiaomiBluetoothBridge, identifier: UUID, diagnostic: ATVVAudioDiagnostics,
+        replayReleasedVoiceKey: Bool = false
+    ) {
+        if isOnboardingXiaomiSelectionLocked,
+           let selectedModel = settings.onboardingXiaomiRemoteModel,
+           let profileID = registerBluetoothBridgeIfNeeded(bridge) {
+            let disposition = onboardingXiaomiDisposition(
+                for: profileID,
+                selectedModel: selectedModel
+            )
+            if disposition != .accept {
+                if bridge.audioDiagnostics === diagnostic { _ = bridge.requestMicrophoneClose() }
+                diagnostic.rejectStart(
+                    reason: disposition == .pendingIdentity
+                        ? "onboarding_model_identity_pending"
+                        : "onboarding_profile_mismatch"
+                )
+                AppLogger.shared.write(
+                    "ONBOARDING VOICE rejected reason=\(disposition.logValue)"
+                )
+                return
             }
         }
-        if identifier == activeBluetoothVoiceDeviceIdentifier, bluetoothVoiceActive {
-            AppLogger.shared.write("ATVV STREAM ignored_duplicate_start")
-            recordPublicDiagnosticEvent(
-                component: "voice",
-                action: "session",
-                phase: "rejected",
-                result: "duplicate",
-                reason: "duplicate_start",
-                source: "bluetooth",
-                remoteModelFamily: "xiaomi"
-            )
-            return
-        }
-        if voiceKeyLatch.isHeld {
-            // The previous stop may still be waiting for the audio tail to
-            // drain. A new session owns the key now, so release the stale
-            // software hold before beginning the fresh press.
-            _ = releaseVoiceKeyIfNeeded(
-                owner: .bluetooth,
-                forceSoftware: false,
-                audioDiagnostic: bridge.audioDiagnostics
-            )
-            AppLogger.shared.write("VOICE KEY stale_release reason=new_bluetooth_session")
-        }
+        let outputReadyAtStart = audioOutput.isReadyForTestTone
         let profileID = activateRemoteProfile(for: bridge)
-        if let activeBluetoothVoiceDeviceIdentifier,
-           activeBluetoothVoiceDeviceIdentifier != identifier {
-            _ = bridge.requestMicrophoneClose()
-            bridge.audioDiagnostics?.rejectStart(reason: "another_session_active")
-            AppLogger.shared.write("ATVV STREAM rejected_busy")
-            recordPublicDiagnosticEvent(
-                component: "voice",
-                action: "session",
-                phase: "rejected",
-                result: "busy",
-                reason: "another_session_active",
-                source: "bluetooth",
-                remoteModelFamily: "xiaomi"
-            )
-            return
-        }
         if settings.voiceKeyMode != .function || settings.voiceFnTapModeEnabled {
             applyHIDSettings(allowVoiceKeyModeFallback: false)
         }
@@ -6996,8 +7574,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
             isVoiceKeyNeutralized: voiceFunctionMapper.isVoiceKeyNeutralized
         ) else {
-            _ = bridge.requestMicrophoneClose()
-            bridge.audioDiagnostics?.rejectStart(reason: "voice_key_not_neutralized")
+            if bridge.audioDiagnostics === diagnostic { _ = bridge.requestMicrophoneClose() }
+            diagnostic.rejectStart(reason: "voice_key_not_neutralized")
             AppLogger.shared.write(
                 "ATVV STREAM rejected reason=voice_key_not_neutralized " +
                     "mode=\(settings.voiceKeyMode.rawValue)"
@@ -7015,8 +7593,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         }
         if outputReadyAtStart {
             guard ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") else {
-                _ = bridge.requestMicrophoneClose()
-                bridge.audioDiagnostics?.rejectStart(reason: "audio_output_unavailable")
+                if bridge.audioDiagnostics === diagnostic { _ = bridge.requestMicrophoneClose() }
+                diagnostic.rejectStart(reason: "audio_output_unavailable")
                 AppLogger.shared.write("ATVV STREAM rejected_audio_output")
                 recordPublicDiagnosticEvent(
                     component: "voice",
@@ -7030,31 +7608,36 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 return
             }
         }
-        let pendingStartAudio: [Int16]
-        if outputReadyAtStart, pendingBluetoothVoiceStartIdentifier == identifier {
-            pendingStartAudio = pendingBluetoothVoiceAudio.drain()
-            pendingBluetoothVoiceStartIdentifier = nil
-        } else {
-            pendingStartAudio = []
+        if voiceKeyLatch.isHeld {
+            _ = releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false, audioDiagnostic: diagnostic)
+            AppLogger.shared.write("VOICE KEY stale_release reason=new_bluetooth_session")
+        }
+        diagnostic.awaitsOutputConfiguration = !outputReadyAtStart
+        if !outputReadyAtStart {
+            pendingBluetoothVoiceStartIdentifier = identifier
+            pendingBluetoothVoiceAudioDiagnostic = diagnostic
+            pendingBluetoothVoiceAudio.begin()
         }
         cancelPendingCommandVoiceAudio(reason: "new_stream")
         activeBluetoothVoiceDeviceIdentifier = identifier
+        activeBluetoothVoiceDiagnostic = diagnostic
         loggedBluetoothVoiceAudioDeviceIdentifier = nil
         bluetoothVoiceActive = true
         guard updateVoiceKeyState(
             streaming: true,
-            forceSoftware: false,
+            forceSoftware: replayReleasedVoiceKey && !settings.voiceFnTapModeEnabled,
             owner: .bluetooth,
-            audioDiagnostic: bridge.audioDiagnostics
+            audioDiagnostic: diagnostic
         ) else {
-            _ = bridge.requestMicrophoneClose()
+            if bridge.audioDiagnostics === diagnostic { _ = bridge.requestMicrophoneClose() }
             cancelVoiceSessionWarningTracking()
             bluetoothVoiceActive = false
             activeBluetoothVoiceDeviceIdentifier = nil
+            activeBluetoothVoiceDiagnostic = nil
             pendingBluetoothVoiceStartIdentifier = nil
             cancelPendingBluetoothVoiceAudio(reason: "voice_key_press_failed")
-            pendingBluetoothVoiceStopRequested = false
-            bridge.audioDiagnostics?.rejectStart(reason: "voice_key_press_failed")
+            pendingBluetoothVoiceStopReason = nil
+            diagnostic.rejectStart(reason: "voice_key_press_failed")
             AppLogger.shared.write(
                 "ATVV STREAM rejected reason=voice_key mode=\(settings.voiceKeyMode.rawValue)"
             )
@@ -7086,7 +7669,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         bluetoothVoiceTraceRoute = "none"
         bluetoothVoiceTailDiagnostics.reset()
         AppLogger.shared.write(
-            "ATVV STREAM accepted trace=\(bluetoothVoiceTraceCounter) model=\(model.rawValue) operation_id=\(bridge.audioDiagnostics?.operationID ?? 0)"
+            "ATVV STREAM accepted trace=\(bluetoothVoiceTraceCounter) model=\(model.rawValue) operation_id=\(diagnostic.operationID)"
         )
         recordPublicDiagnosticEvent(
             operationID: "voice_bluetooth_\(bluetoothVoiceTraceCounter)",
@@ -7105,9 +7688,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             AppLogger.shared.write("LONG RECORDING started")
         }
         _ = voiceFnTapSession.startVoice()
-        beginVoiceSessionIfNeeded(audioDiagnosticOperationID: bridge.audioDiagnostics?.operationID)
+        beginVoiceSessionIfNeeded(audioDiagnosticOperationID: diagnostic.operationID)
         if !outputReadyAtStart {
-            let configurationDiagnostic = bridge.audioDiagnostics
+            let configurationTraceID = activeBluetoothVoiceTraceID
             AppLogger.shared.write(
                 "SYSTEM AUDIO voice_start_recovery configured=pending " +
                     "suspended=\(systemAudioSuspensionState.isSuspended) " +
@@ -7115,21 +7698,18 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             )
             ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") { [weak self, weak bridge] ready in
                 guard let self, let bridge,
-                      self.pendingBluetoothVoiceStartIdentifier == identifier
+                      self.pendingBluetoothVoiceStartIdentifier == identifier,
+                      self.activeBluetoothVoiceTraceID == configurationTraceID
                 else { return }
-                let stopRequested = self.pendingBluetoothVoiceStopRequested
-                self.pendingBluetoothVoiceStopRequested = false
-                self.pendingBluetoothVoiceStartIdentifier = nil
-                let bufferedAudio = self.pendingBluetoothVoiceAudio.drain()
                 guard ready else {
-                    configurationDiagnostic?.bufferLost(samples: bufferedAudio.count, stage: "configuration", reason: "configuration_failed")
-                    self.cancelPendingBluetoothVoiceAudio(reason: "configuration_failed")
-                    _ = bridge.requestMicrophoneClose()
-                    configurationDiagnostic?.rejectStart(reason: "audio_output_unavailable")
-                    AppLogger.shared.write("ATVV STREAM rejected_audio_output")
-                    self.bluetoothBridgeDidStopVoice(bridge)
+                    self.failBluetoothVoiceConfiguration(bridge, reason: "audio_output_unavailable")
                     return
                 }
+                let stopReason = self.pendingBluetoothVoiceStopReason
+                self.pendingBluetoothVoiceStopReason = nil
+                self.pendingBluetoothVoiceStartIdentifier = nil
+                diagnostic.awaitsOutputConfiguration = false
+                let bufferedAudio = self.pendingBluetoothVoiceAudio.drain()
                 if !bufferedAudio.isEmpty {
                     AppLogger.shared.write(
                         "ATVV AUDIO flush_after_configuration samples=\(bufferedAudio.count)"
@@ -7140,13 +7720,13 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                         identifier: identifier
                     )
                 }
-                if stopRequested {
-                    self.bluetoothBridgeDidStopVoice(bridge)
+                if let stopReason {
+                    self.finishBluetoothVoice(bridge, reason: stopReason)
                 }
             }
         }
         let generation = voiceAudioDeliveryDiagnostic.generation
-        let operationID = bridge.audioDiagnostics?.operationID
+        let operationID = diagnostic.operationID
         if latestBluetoothAudioDiagnosticGeneration == generation {
             sharedBluetoothAudioDiagnosticGenerations.append(generation)
             if sharedBluetoothAudioDiagnosticGenerations.count > 32 {
@@ -7156,7 +7736,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         let initiallyIsolated = audioOutput.diagnosticSnapshot(deliveryGeneration: generation).pendingSamples == 0
         latestBluetoothAudioDiagnosticOperationID = operationID
         latestBluetoothAudioDiagnosticGeneration = generation
-        bridge.audioDiagnostics?.bindOutput(
+        diagnostic.bindOutput(
             generation: generation,
             snapshot: { [weak self] in
                 guard let self else { return nil }
@@ -7172,7 +7752,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 ShortcutEventSequence.hardwareModifierState.functionObservationForDiagnostics
             }
         )
-        bridge.audioDiagnostics?.voiceKeyContext(
+        diagnostic.voiceKeyContext(
             mode: settings.voiceKeyMode,
             fnTapEnabled: settings.voiceFnTapModeEnabled,
             mappingOperationID: voiceFunctionMapper.mappingOperationID,
@@ -7182,47 +7762,42 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             eventTapRunning: hidEventSuppressor.isRunning
         )
         flushPendingCommandVoiceAudio(for: bridge)
-        if !pendingStartAudio.isEmpty {
-            AppLogger.shared.write(
-                "ATVV AUDIO flush_after_configuration samples=\(pendingStartAudio.count)"
-            )
-            routeBluetoothVoiceSamples(
-                pendingStartAudio,
-                from: bridge,
-                identifier: identifier
-            )
-        }
     }
 
     func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge) {
         guard let identifier = bridge.deviceIdentifier else { return }
-        if pendingBluetoothVoiceStartIdentifier == identifier,
-           activeBluetoothVoiceDeviceIdentifier == nil {
-            pendingBluetoothVoiceStartIdentifier = nil
-            cancelPendingBluetoothVoiceAudio(reason: "stop_before_audio_ready")
-            pendingBluetoothVoiceStopRequested = false
-            AppLogger.shared.write("ATVV STREAM stop_before_audio_ready result=cancelled")
+        guard let reason = bridge.lastVoiceStopReason else { return }
+        if bluetoothVoiceStartupQueueOwner == identifier,
+           bluetoothVoiceStartupQueue.stop(bridge.audioDiagnostics, reason: reason) {
             return
         }
+        guard activeBluetoothVoiceDeviceIdentifier == identifier,
+              activeBluetoothVoiceDiagnostic === bridge.audioDiagnostics else { return }
         if pendingBluetoothVoiceStartIdentifier == identifier {
-            pendingBluetoothVoiceStopRequested = true
+            pendingBluetoothVoiceStopReason = reason
+            bluetoothVoiceStartupQueueOwner = identifier
             AppLogger.shared.write(
                 "ATVV STREAM stop_deferred_until_audio_ready result=pending_tail " +
                     "pending_samples=\(pendingBluetoothVoiceAudio.bufferedSampleCount)"
             )
             return
         }
-        guard identifier == activeBluetoothVoiceDeviceIdentifier else { return }
+        finishBluetoothVoice(bridge, reason: reason)
+    }
+
+    private func finishBluetoothVoice(_ bridge: XiaomiBluetoothBridge, reason: BluetoothVoiceStopReason?) {
+        let diagnostic = activeBluetoothVoiceDiagnostic
+        activeBluetoothVoiceDiagnostic = nil
         let voiceKeyMode = heldVoiceKeyMode ?? pendingVoiceKeyMode ?? settings.voiceKeyMode
         if BluetoothVoiceStopPolicy.shouldForceHardwareVoiceKeyRelease(
             mode: voiceKeyMode,
             fnTapEnabled: settings.voiceFnTapModeEnabled,
             isHeldByLatch: voiceKeyLatch.isHeld,
-            reason: bridge.lastVoiceStopReason
+            reason: reason
         ) {
             forceHardwareVoiceKeyRelease(
                 mode: voiceKeyMode,
-                audioDiagnostic: bridge.audioDiagnostics
+                audioDiagnostic: diagnostic
             )
         }
         activeBluetoothVoiceDeviceIdentifier = nil
@@ -7231,7 +7806,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         bluetoothVoiceActive = false
         pendingBluetoothVoiceStartIdentifier = nil
         cancelPendingBluetoothVoiceAudio(reason: "remote_stop")
-        pendingBluetoothVoiceStopRequested = false
+        pendingBluetoothVoiceStopReason = nil
         cancelPendingCommandVoiceAudio(reason: "remote_stop")
         if longRecordingRequested {
             finishLongRecording(reason: "remote_stop")
@@ -7270,7 +7845,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 "flush=\(shouldFlushAudio) audio_ready=\(audioOutput.isReadyForTestTone) " +
                 "expected_batches=\(expectedBatches) " +
                 "coverage_pct=\(String(format: "%.1f", coveragePercent)) " +
-                "operation_id=\(bridge.audioDiagnostics?.operationID ?? 0) " +
+                "operation_id=\(diagnostic?.operationID ?? 0) " +
                 "summary_phase=stop_requested coverage_basis=main_callback_processing " +
                 "identifier_drops=\(bluetoothVoiceIdentifierDropCount) " +
                 "audio_state={\(audioOutput.diagnosticState())}"
@@ -7308,12 +7883,16 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             else { return }
             self.releaseVoiceKeyIfNeeded(
                 owner: .bluetooth,
-                forceSoftware: false,
-                audioDiagnostic: bridge?.audioDiagnostics
+                forceSoftware: self.heldVoiceKeyMode == .function,
+                audioDiagnostic: diagnostic
             )
             AppLogger.shared.write(
                 "VOICE KEY tail_release trace=\(traceID) completion=\(outcome.rawValue)"
             )
+            DispatchQueue.main.async { [weak self, weak bridge] in
+                guard let self, let bridge else { return }
+                self.replayQueuedBluetoothVoice(bridge)
+            }
         }
         let delivery = voiceAudioDeliveryDiagnosticSnapshot()
         let publicVoiceResult: (phase: String, result: String, reason: String) =
@@ -7360,42 +7939,140 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
             return
         }
+        if bluetoothVoiceStartupQueueOwner == identifier,
+           let accepted = bluetoothVoiceStartupQueue.append(samples, to: bridge.audioDiagnostics) {
+            if accepted {
+                bridge.audioDiagnostics?.buffered(samples: samples.count)
+            } else if let entry = bluetoothVoiceStartupQueue.cancelLast(bridge.audioDiagnostics) {
+                abortQueuedBluetoothVoice(entry, reason: "startup_queue_overflow", extraSamples: samples.count)
+                _ = bridge.requestMicrophoneClose()
+            }
+            return
+        }
+        guard activeBluetoothVoiceDeviceIdentifier == identifier,
+              activeBluetoothVoiceDiagnostic === bridge.audioDiagnostics else {
+            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
+            return
+        }
+        acceptBluetoothVoiceSamples(samples, from: bridge, identifier: identifier)
+    }
+
+    private func acceptBluetoothVoiceSamples(
+        _ samples: [Int16], from bridge: XiaomiBluetoothBridge, identifier: UUID
+    ) {
+        let diagnostic = activeBluetoothVoiceDiagnostic
         let configurationSamplesBefore = pendingBluetoothVoiceAudio.bufferedSampleCount
         if identifier == pendingBluetoothVoiceStartIdentifier,
            pendingBluetoothVoiceAudio.appendIfWaiting(samples) {
-            bridge.audioDiagnostics?.bufferLost(
-                samples: configurationSamplesBefore + samples.count - pendingBluetoothVoiceAudio.bufferedSampleCount,
-                stage: "configuration", reason: "overflow"
-            )
-            bridge.audioDiagnostics?.buffered(samples: samples.count)
-            return
-        }
-        guard identifier == activeBluetoothVoiceDeviceIdentifier else {
-            bluetoothVoiceIdentifierDropCount += 1
-            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
-            if !loggedBluetoothVoiceIdentifierDrop {
-                loggedBluetoothVoiceIdentifierDrop = true
-                AppLogger.shared.write(
-                    "ATVV AUDIO dropped reason=identifier_mismatch " +
-                        "active_session=\(activeBluetoothVoiceDeviceIdentifier != nil) " +
-                        "samples=\(samples.count)"
+            let overflow = configurationSamplesBefore + samples.count -
+                pendingBluetoothVoiceAudio.bufferedSampleCount
+            if overflow > 0 {
+                diagnostic?.bufferLost(
+                    samples: overflow, stage: "configuration", reason: "overflow"
                 )
+                failBluetoothVoiceConfiguration(
+                    bridge, reason: "configuration_buffer_overflow", overflowSamples: overflow
+                )
+            } else {
+                diagnostic?.buffered(samples: samples.count)
             }
             return
         }
         let commandSamplesBefore = pendingCommandVoiceAudio.bufferedSampleCount
         if pendingCommandVoiceAudio.appendIfWaiting(samples) {
-            bridge.audioDiagnostics?.bufferLost(
+            diagnostic?.bufferLost(
                 samples: commandSamplesBefore + samples.count - pendingCommandVoiceAudio.bufferedSampleCount,
                 stage: "command", reason: "overflow"
             )
-            bridge.audioDiagnostics?.buffered(samples: samples.count)
+            diagnostic?.buffered(samples: samples.count)
             return
         }
         routeBluetoothVoiceSamples(samples, from: bridge, identifier: identifier)
     }
 
+    private func failBluetoothVoiceConfiguration(
+        _ bridge: XiaomiBluetoothBridge,
+        reason: String,
+        overflowSamples: Int = 0
+    ) {
+        let interruptedSamples = pendingBluetoothVoiceAudio.bufferedSampleCount + overflowSamples
+        let diagnostic = activeBluetoothVoiceDiagnostic
+        let stopReason = pendingBluetoothVoiceStopReason
+        pendingBluetoothVoiceStartIdentifier = nil
+        cancelPendingBluetoothVoiceAudio(reason: reason)
+        if stopReason == nil, bridge.audioDiagnostics === diagnostic {
+            _ = bridge.requestMicrophoneClose()
+        }
+        diagnostic?.rejectStart(reason: reason)
+        AppLogger.shared.write(
+            "ATVV STREAM phase=failed result=failed reason=\(reason) completion=forced " +
+                "operation_id=\(diagnostic?.operationID ?? 0) " +
+                "interrupted_samples=\(interruptedSamples)"
+        )
+        if let current = bluetoothVoiceStartupQueue.entries.last,
+           current.diagnostic === bridge.audioDiagnostics, current.stopReason == nil {
+            _ = bridge.requestMicrophoneClose()
+        }
+        cancelQueuedBluetoothVoice(reason: reason)
+        finishBluetoothVoice(bridge, reason: stopReason)
+    }
+
+    private func replayQueuedBluetoothVoice(_ bridge: XiaomiBluetoothBridge) {
+        guard started, let identifier = bridge.deviceIdentifier,
+              bluetoothVoiceStartupQueueOwner == identifier,
+              activeBluetoothVoiceDeviceIdentifier == nil else { return }
+        guard case .ready = bridge.state, !systemAudioSuspensionState.isSuspended,
+              !isStreaming, !macMicrophoneState.isActive else {
+            cancelQueuedBluetoothVoice(reason: "voice_link_unavailable")
+            return
+        }
+        while let entry = bluetoothVoiceStartupQueue.takeFirst() {
+            if bluetoothVoiceStartupQueue.entries.isEmpty { bluetoothVoiceStartupQueueOwner = nil }
+            startBluetoothVoice(
+                bridge, identifier: identifier, diagnostic: entry.diagnostic,
+                replayReleasedVoiceKey: entry.stopReason != nil
+            )
+            guard activeBluetoothVoiceDiagnostic === entry.diagnostic else {
+                abortQueuedBluetoothVoice(entry, reason: "replay_start_rejected")
+                continue
+            }
+            if !entry.samples.isEmpty {
+                acceptBluetoothVoiceSamples(entry.samples, from: bridge, identifier: identifier)
+            }
+            if let reason = entry.stopReason {
+                if pendingBluetoothVoiceStartIdentifier == identifier {
+                    pendingBluetoothVoiceStopReason = reason
+                } else if activeBluetoothVoiceDiagnostic === entry.diagnostic {
+                    finishBluetoothVoice(bridge, reason: reason)
+                }
+            }
+            return
+        }
+        bluetoothVoiceStartupQueueOwner = nil
+    }
+
+    private func cancelQueuedBluetoothVoice(reason: String) {
+        while let entry = bluetoothVoiceStartupQueue.takeFirst() {
+            abortQueuedBluetoothVoice(entry, reason: reason)
+        }
+        bluetoothVoiceStartupQueueOwner = nil
+    }
+
+    private func abortQueuedBluetoothVoice(
+        _ entry: BluetoothVoiceStartupQueue.Entry, reason: String, extraSamples: Int = 0
+    ) {
+        let interruptedSamples = entry.samples.count + extraSamples
+        entry.diagnostic.bufferLost(samples: interruptedSamples, stage: "configuration", reason: reason)
+        entry.diagnostic.awaitsOutputConfiguration = false
+        entry.diagnostic.rejectStart(reason: reason)
+        AppLogger.shared.write(
+            "ATVV STREAM phase=failed completion=forced reason=\(reason) " +
+                "operation_id=\(entry.diagnostic.operationID) interrupted_samples=\(interruptedSamples)"
+        )
+    }
+
     private func cancelPendingBluetoothVoiceAudio(reason: String) {
+        pendingBluetoothVoiceAudioDiagnostic?.awaitsOutputConfiguration = false
         pendingBluetoothVoiceAudioDiagnostic?.bufferLost(
             samples: pendingBluetoothVoiceAudio.bufferedSampleCount,
             stage: "configuration", reason: "cancelled", cause: reason
@@ -7427,7 +8104,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     ) {
         guard identifier == activeBluetoothVoiceDeviceIdentifier else {
             bluetoothVoiceIdentifierDropCount += 1
-            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
+            activeBluetoothVoiceDiagnostic?.reject(.identifier, samples: samples.count)
             return
         }
         recordingAssetCoordinator.append(samples: samples)
@@ -7450,7 +8127,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             samples: samples,
             route: handledByFnTapMode ? .virtualAudioViaFnTap : .virtualAudioDirect
         )
-        bridge.audioDiagnostics?.routed(samples: samples.count, enqueued: enqueued)
+        activeBluetoothVoiceDiagnostic?.routed(samples: samples.count, enqueued: enqueued)
         bluetoothVoiceDecodedBatchCount += 1
         bluetoothVoiceDecodedSampleCount += samples.count
         bluetoothVoiceTailDiagnostics.append(samples, at: ProcessInfo.processInfo.systemUptime)
@@ -7540,8 +8217,395 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         remotePowerStates[profileID]
     }
 
+    var siriRemoteActivationNeeded: Bool {
+        if let screenshotSiriActivationNeeded { return screenshotSiriActivationNeeded }
+        return SiriRemoteActivationPolicy.needsActivation(
+            enabled: settings.siriRemoteEnabled,
+            needsUserAction: settings.siriRemoteNeedsUserAction,
+            audioStatus: siriRemoteAudioStatus,
+            installerReceiptPresent: OnboardingBuildCapabilities.isSiriRemotePackageInstalled(),
+            helperInstalled: isSiriRemoteHelperInstalled
+        )
+    }
+
+    var isSiriRemoteHelperInstalled: Bool {
+        if let screenshotSiriComponentInstalled { return screenshotSiriComponentInstalled }
+        #if SAYALL_SIRI_REMOTE_ENABLED
+        return AppleRemoteComponentInstallation.isInstalled()
+        #else
+        return true
+        #endif
+    }
+
+    var siriRemoteComponentDiagnosticState: SiriRemoteComponentDiagnosticState {
+        #if SAYALL_SIRI_REMOTE_ENABLED
+        let buildSupported = true
+        #else
+        let buildSupported = false
+        #endif
+        let snapshot = AppleRemoteComponentInstallation.snapshot()
+        return SiriRemoteComponentDiagnosticState(
+            buildSupported: buildSupported,
+            installerReceiptPresent: OnboardingBuildCapabilities.isSiriRemotePackageInstalled(),
+            helperPresent: snapshot.helperPresent,
+            launchDaemonPresent: snapshot.launchDaemonPresent
+        )
+    }
+
+    func logSiriRemoteComponentState(trigger: String, force: Bool = false) {
+        let state = siriRemoteComponentDiagnosticState
+        let signature = "\(state.logFields)|\(settings.siriRemoteEnabled)|" +
+            "\(settings.siriRemoteNeedsUserAction)|\(siriRemoteAudioStatus)"
+        guard force || signature != lastLoggedSiriRemoteComponentState else { return }
+        lastLoggedSiriRemoteComponentState = signature
+        AppLogger.shared.write(
+            "SIRI REMOTE COMPONENT state trigger=\(trigger) \(state.logFields) " +
+                "enabled=\(settings.siriRemoteEnabled) " +
+                "needs_user_action=\(settings.siriRemoteNeedsUserAction) " +
+                "audio_status=\(siriRemoteAudioStatus)"
+        )
+    }
+
+    func installSiriRemoteComponent(source: String = "connection_page") {
+        let state = siriRemoteComponentDiagnosticState
+        logSiriRemoteComponentState(trigger: "install_requested", force: true)
+        // 组件缺失时不能因残留的语音收尾状态挡住安装；已安装时仍避免打断真实会话。
+        guard !isStreaming,
+              activePhysicalVoiceControlSource != .siriRemote || !isSiriRemoteHelperInstalled else {
+            AppLogger.shared.write(
+                "APPLE REMOTE COMPONENT_INSTALL phase=skipped result=deferred " +
+                    "reason=voice_session_active source=\(source) \(state.logFields)"
+            )
+            return
+        }
+        AppLogger.shared.write(
+            "APPLE REMOTE COMPONENT_INSTALL phase=requested action=install " +
+                "source=\(source) \(state.logFields)"
+        )
+        #if SAYALL_SIRI_REMOTE_ENABLED
+        setSiriRemoteEnabled(true)
+        #else
+        AppLogger.shared.write(
+            "APPLE REMOTE COMPONENT_INSTALL phase=failed result=unsupported " +
+                "reason=build_without_siri_remote \(state.logFields)"
+        )
+        #endif
+    }
+
+    func installSiriRemoteComponentForOnboarding() {
+        settings.beginOnboardingSiriRemoteTrial()
+        installSiriRemoteComponent(source: "onboarding")
+    }
+
+    func activateSiriRemoteFromCard() {
+        guard !isStreaming, activePhysicalVoiceControlSource != .siriRemote else { return }
+        AppLogger.shared.write("REMOTE CARD_ACTION phase=requested action=enable source=user")
+        if !OnboardingBuildCapabilities.isSiriRemotePackageInstalled() {
+            // The upgrade path may contain the App but not the optional PKG component.
+            let alert = NSAlert()
+            let localization = LocalizationStore(settings: settings)
+            alert.messageText = localization.text("remote.card.install.title")
+            alert.informativeText = localization.text("remote.card.install.detail")
+            alert.addButton(withTitle: localization.text("about.hardware.download"))
+            alert.addButton(withTitle: localization.text("common.action.cancel"))
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(string: "https://github.com/HD838A/remote-mic-app/releases/latest")!)
+                AppLogger.shared.write("REMOTE CARD_ACTION phase=completed action=enable result=installer_page_opened")
+            } else {
+                AppLogger.shared.write("REMOTE CARD_ACTION phase=cancelled action=enable result=cancelled")
+            }
+            return
+        }
+        setSiriRemoteEnabled(true)
+    }
+
+    private func openRemoteBluetoothSettings() {
+        AppLogger.shared.write("REMOTE CARD_ACTION phase=requested action=connect result=system_settings")
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings")!)
+    }
+
+    func remoteCardStatus(for profile: RemoteDeviceProfile, history: Bool = false) -> RemoteDeviceCardStatus {
+        remoteCardReadiness(for: profile, history: history).status
+    }
+
+    private func remoteCardReadiness(
+        for profile: RemoteDeviceProfile,
+        history: Bool = false
+    ) -> RemoteCardReadinessSnapshot {
+        let hidMonitor = hidMonitors.values.first(where: { $0.profileID == profile.id })
+        let hidMonitorPresent = hidMonitor != nil
+        let buttonReadinessCached = remoteButtonReadiness[profile.id] != nil
+        let appleConnected = connectedAppleRemoteProfileIDs.contains(profile.id)
+        let bridgeState = bluetoothBridgeStateClass(profile.bluetoothIdentifier)
+        let siriAudioClass = siriRemoteAudioStatusClass(siriRemoteAudioStatus)
+
+        func snapshot(
+            status: RemoteDeviceCardStatus,
+            connected: Bool,
+            buttons: RemoteFunctionReadiness,
+            buttonReason: String,
+            voice: RemoteFunctionReadiness,
+            voiceReason: String
+        ) -> RemoteCardReadinessSnapshot {
+            RemoteCardReadinessSnapshot(
+                status: status,
+                model: profile.model.rawValue,
+                connected: connected,
+                history: history,
+                buttons: buttons,
+                buttonReason: buttonReason,
+                voice: voice,
+                voiceReason: voiceReason,
+                profileHasHID: profile.hidFingerprint != nil,
+                profileHasBluetooth: profile.bluetoothIdentifier != nil,
+                hidMonitorPresent: hidMonitorPresent,
+                buttonReadinessCached: buttonReadinessCached,
+                appleConnected: appleConnected,
+                audioStatusKey: audioStatus.key,
+                audioReady: isAudioOutputReady,
+                audioSelected: !settings.selectedAudioDeviceUID.isEmpty,
+                bridgeState: bridgeState,
+                siriAudioClass: siriAudioClass,
+                profileCount: settings.remoteDeviceProfiles.count,
+                connectedProfileCount: connectedRemoteProfileIDs.count
+            )
+        }
+
+        if let status = screenshotCardStatuses[profile.id] {
+            return snapshot(
+                status: status, connected: isRemoteConnected(profile.id),
+                buttons: .unknown, buttonReason: "screenshot_override",
+                voice: .unknown, voiceReason: "screenshot_override"
+            )
+        }
+        guard isRemoteConnected(profile.id) else {
+            let status: RemoteDeviceCardStatus
+            if history, !profile.model.usesPrivateAdapter {
+                switch remoteRecoveryStates[profile.id] {
+                case .recovering: status = .connecting
+                case .notFound: status = .notFound
+                case .paused: status = .paused
+                case .cancelled: status = .cancelled
+                default: status = .disconnected
+                }
+            } else {
+                status = .disconnected
+            }
+            return snapshot(
+                status: status, connected: false,
+                buttons: .unknown, buttonReason: "not_connected",
+                voice: .unknown, voiceReason: "not_connected"
+            )
+        }
+
+        let permissions = appliedHIDPermissionSnapshot ?? .current
+        let buttons: RemoteFunctionReadiness
+        let buttonReason: String
+        if !settings.customMappingEnabled {
+            buttons = .ready
+            buttonReason = "custom_mapping_disabled"
+        } else if !permissions.inputMonitoringGranted || !permissions.accessibilityGranted {
+            buttons = .failed
+            buttonReason = "permission_missing"
+        } else if profile.model.isAppleSiriRemote {
+            buttons = appleConnected ? .ready : .unknown
+            buttonReason = appleConnected ? "apple_connected" : "apple_profile_not_connected"
+        } else if profile.model.isChromecastRemote {
+            buttons = RemoteFunctionReadiness.chromecastButtons(
+                cachedPresent: chromecastHIDIsPresent,
+                livePresent: chromecastFeature.isHIDRemotePresent
+            )
+            if chromecastFeature.isHIDRemotePresent {
+                buttonReason = "chromecast_hid_live"
+            } else if chromecastHIDIsPresent == true {
+                buttonReason = "chromecast_hid_cached"
+            } else {
+                buttonReason = "chromecast_hid_unknown"
+            }
+        } else if let cached = remoteButtonReadiness[profile.id] {
+            buttons = cached
+            buttonReason = "button_cache"
+        } else if let hidMonitor {
+            buttons = .buttons(statusKey: hidMonitor.status.key)
+            buttonReason = "hid_monitor_status"
+        } else {
+            buttons = .unknown
+            buttonReason = "hid_monitor_missing"
+        }
+
+        let voiceRequired = !profile.model.isAppleSiriRemote || membershipFeature.canUseSiriRemoteVoice
+        let voice: RemoteFunctionReadiness
+        let voiceReason: String
+        if !voiceRequired {
+            voice = .ready
+            voiceReason = "voice_not_required"
+        } else if settings.selectedAudioDeviceUID.isEmpty {
+            voice = .failed
+            voiceReason = "audio_selection_empty"
+        } else if audioStatus.key.contains("failed") || audioStatus.key.contains("unavailable") {
+            voice = .failed
+            voiceReason = "audio_status_error"
+        } else if !profile.model.usesPrivateAdapter && !Self.canStartBluetoothVoice(
+            mode: settings.voiceKeyMode, voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            isVoiceKeyNeutralized: voiceFunctionMapper.isVoiceKeyNeutralized
+        ) {
+            if voiceFunctionMapper.voiceMappingReadbackMatched == false {
+                voice = .failed
+                voiceReason = "voice_key_mapping_failed"
+            } else {
+                voice = .checking
+                voiceReason = "voice_key_mapping_checking"
+            }
+        } else if audioStatus.key != "audio.output.current_format" && !isAudioOutputReady {
+            voice = .unknown
+            voiceReason = "audio_not_ready"
+        } else if profile.model.isAppleSiriRemote {
+            switch siriAudioClass {
+            case "ready":
+                voice = .ready
+                voiceReason = "apple_audio_ready"
+            case "unavailable":
+                voice = .failed
+                voiceReason = "apple_audio_unavailable"
+            case "preparing":
+                voice = .checking
+                voiceReason = "apple_audio_preparing"
+            default:
+                voice = .unknown
+                voiceReason = "apple_audio_unknown"
+            }
+        } else if profile.model.isChromecastRemote {
+            voice = chromecastStatus.isConnected ? .ready : .unknown
+            voiceReason = chromecastStatus.isConnected ? "chromecast_connected" : "chromecast_not_connected"
+        } else if profile.bluetoothIdentifier == nil {
+            voice = .unknown
+            voiceReason = "bluetooth_identifier_missing"
+        } else if let bridge = profile.bluetoothIdentifier.flatMap({ bluetoothBridges[$0] }) {
+            if case .ready = bridge.state {
+                voice = .ready
+                voiceReason = "bluetooth_bridge_ready"
+            } else {
+                voice = .unknown
+                voiceReason = "bluetooth_bridge_not_ready"
+            }
+        } else {
+            voice = .unknown
+            voiceReason = "bluetooth_bridge_missing"
+        }
+
+        let status = RemoteDeviceCardStatus.resolve(
+            connected: true, buttons: buttons, voice: voice, voiceRequired: voiceRequired
+        )
+        return snapshot(
+            status: status, connected: true,
+            buttons: buttons, buttonReason: buttonReason,
+            voice: voice, voiceReason: voiceReason
+        )
+    }
+
+    private func bluetoothBridgeStateClass(_ identifier: UUID?) -> String {
+        guard let identifier else { return "missing_identifier" }
+        guard let bridge = bluetoothBridges[identifier] else { return "missing_bridge" }
+        switch bridge.state {
+        case .stopped: return "stopped"
+        case .bluetoothUnavailable: return "unavailable"
+        case .scanning: return "scanning"
+        case .connecting: return "connecting"
+        case .discovering: return "discovering"
+        case .ready: return "ready"
+        case .reconnecting: return "reconnecting"
+        case .failed: return "failed"
+        }
+    }
+
+    private func siriRemoteAudioStatusClass(_ status: String) -> String {
+        if status == "ready" { return "ready" }
+        if status.hasPrefix("unavailable:") { return "unavailable" }
+        if status.hasPrefix("preparing") { return "preparing" }
+        return "unknown"
+    }
+
+    func remoteCardCanRecoverAudio(
+        for profile: RemoteDeviceProfile,
+        status: RemoteDeviceCardStatus,
+        history: Bool = false
+    ) -> Bool {
+        let voiceRequired = !profile.model.isAppleSiriRemote || membershipFeature.canUseSiriRemoteVoice
+        return RemoteVoiceRecoveryPolicy.shouldOfferAudioRecovery(
+            connected: isRemoteConnected(profile.id),
+            history: history,
+            voiceRequired: voiceRequired,
+            cardStatus: status,
+            audioOutputReady: isAudioOutputReady,
+            selectedAudioDeviceUID: settings.selectedAudioDeviceUID,
+            audioStatusKey: audioStatus.key
+        )
+    }
+
+    /// Last-resort recovery from the card. Normal voice starts already retry
+    /// the bounded configuration first; this action is for a user who cannot
+    /// start a new voice session.
+    func recoverRemoteVoiceAudio() {
+        guard !isRemoteVoiceRecoveryInFlight else {
+            AppLogger.shared.write(
+                "REMOTE CARD_ACTION phase=cancelled action=recover_voice result=blocked reason=already_in_flight"
+            )
+            return
+        }
+        guard !isStreaming, !isPlayingTestTone else {
+            AppLogger.shared.write(
+                "REMOTE CARD_ACTION phase=cancelled action=recover_voice result=blocked reason=audio_in_use"
+            )
+            return
+        }
+        isRemoteVoiceRecoveryInFlight = true
+        AppLogger.shared.write("REMOTE CARD_ACTION phase=requested action=recover_voice source=user")
+        ensureVirtualAudioOutputReady(reason: "user_requested_voice_recovery") { [weak self] ready in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isRemoteVoiceRecoveryInFlight = false
+                AppLogger.shared.write(
+                    "REMOTE CARD_ACTION phase=completed action=recover_voice " +
+                        "result=\(ready ? "ready" : "failed")"
+                )
+            }
+        }
+    }
+
+    /// Screenshot-only presentation override; production returns nil and lets
+    /// the live settling policy decide.
+    func remoteCardStatusDisplayOverride(for profileID: UUID) -> RemoteDeviceCardStatusDisplay? {
+        screenshotCardStatusDisplayOverrides[profileID]
+    }
+
+    private func logRemoteCardStatusChanges() {
+        for (index, profile) in settings.remoteDeviceProfiles.enumerated() {
+            let readiness = remoteCardReadiness(for: profile, history: true)
+            let statusChanged = lastLoggedCardStatuses[profile.id] != readiness.status
+            let readinessChanged = lastLoggedCardReadiness[profile.id] != readiness
+            guard statusChanged || readinessChanged else { continue }
+            lastLoggedCardStatuses[profile.id] = readiness.status
+            lastLoggedCardReadiness[profile.id] = readiness
+            cardStatusOperation &+= 1
+            if statusChanged {
+                AppLogger.shared.write(
+                    "REMOTE CARD_STATUS operation_id=card_\(cardStatusOperation) " +
+                        "phase=observed state=\(readiness.status.rawValue) " +
+                        "scope=local_readiness external_result=unknown"
+                )
+            }
+            AppLogger.shared.write(
+                readiness.diagnosticLine(
+                    cardIndex: index,
+                    operationID: cardStatusOperation
+                )
+            )
+        }
+    }
+
     func systemDeviceName(for profile: RemoteDeviceProfile) -> String? {
         remoteSystemDeviceNames[profile.id]
+            ?? profile.lastKnownBluetoothName
             ?? RemoteDeviceNamePolicy.observedSystemName(from: profile.customName)
     }
 
@@ -7610,6 +8674,98 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         remoteSystemDeviceNames = systemNames
         remoteBatteryLevels = batteryLevels
         remotePowerStates = powerStates
+    }
+
+    func configureRemoteRecoveryForSettingsScreenshot(_ scenario: String) {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
+        let first = settings.registerBluetoothRemote(identifier: UUID())
+        let second = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(first, model: .rc003)
+        settings.updateRemoteProfileModel(second, model: .rc001)
+        settings.selectRemoteProfile(first)
+        remoteSystemDeviceNames = [first: "客厅遥控器", second: "书房遥控器"]
+        remoteBatteryLevels = [first: 81]
+        let offline = ["offline", "bluetooth", "permission"].contains(scenario)
+        connectedRemoteProfileIDs = offline ? [] : [first]
+        remoteRecoveryStates = [second: scenario == "failed" ? .notFound : scenario == "paused" ? .paused : scenario == "recovering" ? .recovering : .waiting]
+        if offline { remoteRecoveryStates[first] = .waiting }
+        isConnected = !offline
+        connectionStatus = LocalizedMessage(offline ? "connection.history.empty" : "connection.status.connected_to_device")
+        voiceShortcutStatus = LocalizedMessage("connection.history.voice_key_ready")
+        if scenario == "bluetooth" { screenshotBluetoothConnectionBlock = LocalizedMessage("bluetooth.status.off") }
+        if scenario == "permission" { screenshotBluetoothConnectionBlock = LocalizedMessage("bluetooth.status.permission_denied") }
+    }
+
+    func configureUnifiedRemoteCardsForSettingsScreenshot(_ scenario: String) {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
+        let xiaomi = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(xiaomi, model: .rc003)
+        settings.bindHIDFingerprint("settings-unified-xiaomi", to: xiaomi)
+        let apple = settings.registerAppleSiriRemote(fingerprint: "settings-unified-apple")
+        settings.updateRemoteProfileModel(apple, model: .appleSiriRemoteA2540)
+        let chromecast = settings.registerChromecastRemote()
+        remoteSystemDeviceNames = [xiaomi: "客厅遥控器", apple: "电视遥控器", chromecast: "影音室遥控器"]
+        remoteBatteryLevels = [xiaomi: 81, apple: 73]
+        remotePowerStates = [xiaomi: scenario == "charging" ? .charging : .onBattery]
+        screenshotSiriActivationNeeded = scenario == "activation"
+        settings.siriRemoteEnabled = scenario != "activation"
+        let appleActive = scenario.hasPrefix("apple") || scenario == "member"
+        let active = appleActive ? apple : xiaomi
+        connectedRemoteProfileIDs = scenario == "offline" || scenario == "activation" ? [] : [active]
+        let status: RemoteDeviceCardStatus
+        switch scenario {
+        case "buttons": status = .buttonsFailed
+        case "voice", "apple-voice", "audio": status = .voiceFailed
+        case "device": status = .deviceFailed
+        case "checking": status = .checking
+        case "confirming", "verifying": status = .confirming
+        default: status = .connected
+        }
+        screenshotCardStatuses = [active: connectedRemoteProfileIDs.contains(active) ? status : .disconnected]
+        screenshotCardStatusDisplayOverrides = scenario == "verifying" && connectedRemoteProfileIDs.contains(active)
+            ? [active: .verifyingConnection]
+            : [:]
+        settings.selectRemoteProfile(active)
+        isConnected = !connectedRemoteProfileIDs.isEmpty
+        settings.selectedAudioDeviceUID = "screenshot-output"
+        audioDevices = [AudioDeviceInfo(id: 0, uid: "screenshot-output", name: "SayAll")]
+        if scenario == "audio" {
+            audioStatus = LocalizedMessage("audio.output.selected_unavailable")
+            isAudioOutputReady = false
+        } else {
+            audioStatus = LocalizedMessage("audio.output.current_format", arguments: ["SayAll"])
+            isAudioOutputReady = true
+        }
+        connectionStatus = LocalizedMessage(isConnected ? "common.status.connected" : "connection.history.empty")
+        voiceShortcutStatus = LocalizedMessage("connection.history.voice_key_ready")
+    }
+
+    func configureAppleRemoteComponentEntryForSettingsScreenshot(_ state: String) {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
+        let xiaomi = settings.registerBluetoothRemote(identifier: UUID())
+        settings.updateRemoteProfileModel(xiaomi, model: .rc003)
+        settings.bindHIDFingerprint("settings-component-entry-xiaomi", to: xiaomi)
+        remoteSystemDeviceNames = [
+            xiaomi: settings.applicationLanguage == .english ? "Living Room Remote" : "客厅遥控器",
+        ]
+        remoteBatteryLevels = [xiaomi: 81]
+        remotePowerStates = [xiaomi: .onBattery]
+        connectedRemoteProfileIDs = []
+        screenshotSiriComponentInstalled = state == "installed"
+        settings.siriRemoteEnabled = false
+        settings.selectRemoteProfile(xiaomi)
+        isConnected = false
+        settings.selectedAudioDeviceUID = "screenshot-output"
+        audioDevices = [AudioDeviceInfo(id: 0, uid: "screenshot-output", name: "SayAll")]
+        audioStatus = LocalizedMessage("audio.output.current_format", arguments: ["SayAll"])
+        connectionStatus = LocalizedMessage("connection.history.empty")
+        voiceShortcutStatus = LocalizedMessage("connection.history.voice_key_ready")
+        isAudioOutputReady = true
+    }
+
+    func configureSettingsScreenshotDefaults() {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else { return }
+        screenshotSiriComponentInstalled = true
     }
 
     func isRemoteConnected(_ profileID: UUID) -> Bool {
@@ -7998,7 +9154,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             profileID: profileID,
             button: button,
             trigger: trigger
-        )
+        ) || macroFeature.hasProfileBinding(button: button, trigger: trigger)
+        // APP 级普通按键覆盖优先于键位方案：命中覆盖时必须回落到 configuredAction，
+        // 由它返回该 APP 的动作，而不是让方案先执行。
         guard !settings.applicationButtonOverrideExists(for: button, trigger: trigger) else {
             return false
         }
@@ -8016,7 +9174,13 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             }
         )
         let bindingResult = hasBinding ? "configured" : "missing"
+        #if SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        // 统一按键配置由正常动作路径执行方案绑定；这里的 false 只是旧入口未接管，
+        // 不能记成执行失败。
+        let executionResult = "delegated_to_unified"
+        #else
         let executionResult = handled ? "handled" : "unhandled"
+        #endif
         let sourceKind: String
         if source.hasPrefix("hid:") {
             sourceKind = "hid"
@@ -8080,19 +9244,49 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         KeyboardHoldExecution.shared.end(reason: reason)
     }
 
-    private func performExternalConfiguredAction(_ configured: ConfiguredButtonAction) -> Bool {
-        guard !macroFeature.hasPendingPortableImport else { return false }
+    @discardableResult
+    func performExternalConfiguredAction(_ configured: ConfiguredButtonAction) -> Bool {
+        guard !macroFeature.hasPendingPortableImport else {
+            presentButtonActionFailureNotice()
+            return false
+        }
         if configured.action == .combinationAction {
-            return macroFeature.executeMacro(id: configured.macroID)
+            let handled = macroFeature.executeMacro(id: configured.macroID)
+            if !handled { presentButtonActionFailureNotice() }
+            return handled
         }
         let applicationProfile = settings.customApplicationProfile(
             id: configured.applicationProfileID
         )
+        var customApplicationFocusAllowed = true
         if configured.action == .openCustomApplication {
-            guard let profile = applicationProfile,
-                !settings.portableApplicationRequiresVerification(profile),
-                NSWorkspace.shared.urlForApplication(withBundleIdentifier: profile.bundleIdentifier) != nil
-            else { return false }
+            let requiresVerification = applicationProfile.map {
+                settings.portableApplicationRequiresVerification($0)
+            } ?? false
+            let applicationURL = applicationProfile.flatMap {
+                customApplicationURLResolver($0.bundleIdentifier)
+            }
+            switch CustomApplicationLaunchPlan.resolve(
+                profile: applicationProfile,
+                requiresVerification: requiresVerification,
+                applicationURL: applicationURL
+            ) {
+            case .unavailable:
+                AppLogger.shared.write(
+                    "BUTTON ACTION action=openCustomApplication phase=failed " +
+                        "result=unavailable reason=profile_or_application_missing"
+                )
+                presentButtonActionFailureNotice()
+                return false
+            case .open(let focusAllowed):
+                customApplicationFocusAllowed = focusAllowed
+                if !focusAllowed {
+                    AppLogger.shared.write(
+                        "BUTTON ACTION action=openCustomApplication phase=requested " +
+                            "result=dispatched focus=skipped reason=verification_pending"
+                    )
+                }
+            }
         }
         let requestID = settings.voiceFnTapModeEnabled
             ? VoiceInputDestinationIntent.resolve(
@@ -8100,15 +9294,30 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 applicationProfile: applicationProfile
             ).map { voiceInputDestinationCoordinator.beginTargetSwitch(intent: $0) }
             : nil
-        let handled = KeyboardInjector.send(
+        let handled = externalActionSender(
             configured.action,
-            shortcut: configured.shortcut,
-            applicationProfile: applicationProfile
+            configured.shortcut,
+            applicationProfile,
+            customApplicationFocusAllowed
         )
-        if !handled, let requestID {
-            voiceInputDestinationCoordinator.cancel(requestID: requestID, reason: .actionFailed)
+        if !handled {
+            presentButtonActionFailureNotice()
+            if let requestID {
+                voiceInputDestinationCoordinator.cancel(requestID: requestID, reason: .actionFailed)
+            }
         }
         return handled
+    }
+
+    private func presentButtonActionFailureNotice() {
+        Task { @MainActor in
+            NoticeCenter.shared.show(Notice(
+                tier: .warning,
+                title: noticeLocalized("button_mapping.action_failed.title"),
+                text: noticeLocalized("button_mapping.action_failed.detail"),
+                position: .bottom
+            ))
+        }
     }
 
     private func handleVoiceInputDestinationState(_ state: VoiceInputDestinationState) {
@@ -8170,6 +9379,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         chromecastLongPressTimers.values.forEach { $0.cancel() }
         chromecastLongPressTimers.removeAll()
         chromecastButtonGestureRecognizer.reset()
+        chromecastAppSwitcher.cancel(reason: "common_phrases_opened")
         if appleRemoteAppSwitcherSession.isActive {
             finishAppleRemoteAppSwitcher(reason: "common_phrases_opened", confirmed: false)
         }
@@ -8621,6 +9831,64 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         idleVirtualAudioReleaseWorkItem = nil
     }
 
+    /// 用户停留于 Onboarding 音频页时持有虚拟音频输出的临时租约。
+    ///
+    /// 音乐/语音都没有开始时，正常生命周期只靠 Ready 的蓝牙桥保持输出。遥控器的
+    /// HID 普通按键可用、但语音 BLE 链路尚未连接时，桥的每次重连状态变化都会释放
+    /// 输出，音频页就会在「已选择设备」和「输出未就绪」之间反复，用户只能反复点
+    /// 重试。该租约只在音频页停留期间成立，离开页面、系统挂起或 App 退出都会解除。
+    private var onboardingAudioPreparationActive = false
+
+    /// 进入 Onboarding 音频页时主动配置所选虚拟音频输出。
+    ///
+    /// 正常设置页只在用户改选设备或测试音时配置；音频页是首次使用验收，不能要求
+    /// 用户先点一次「重试音频设置」。配置完成后由页面现有的 Ready 门禁判断，不改变
+    /// 页面元素或文案。
+    func prepareOnboardingAudioOutput(reason: String) {
+        guard started else { return }
+        let selected = !settings.selectedAudioDeviceUID.isEmpty
+        let available = selectedAudioDeviceIsAvailable
+        guard selected, available else {
+            // 设备尚未枚举、被移除或未选择时不能持有租约，否则旧输出会被无必要地保留。
+            endOnboardingAudioPreparation(reason: "\(reason)_unavailable")
+            AppLogger.shared.write(
+                "AUDIO ONBOARDING prepare deferred reason=\(reason) selected=\(selected) " +
+                    "available=\(available) state={\(audioOutput.diagnosticState())}"
+            )
+            return
+        }
+        onboardingAudioPreparationActive = true
+        cancelVirtualAudioReleaseIfPending(trigger: "onboarding_prepare")
+        cancelIdleVirtualAudioRelease()
+        isAudioOutputReady = audioOutput.isReadyForTestTone
+        guard !isAudioOutputReady else {
+            AppLogger.shared.write("AUDIO ONBOARDING prepare ready reason=\(reason)")
+            return
+        }
+        AppLogger.shared.write(
+            "AUDIO ONBOARDING prepare begin reason=\(reason) " +
+                "ready_bridges=\(readyBluetoothBridgeCount) state={\(audioOutput.diagnosticState())}"
+        )
+        configureVirtualAudioOutput(reason: "onboarding_\(reason)") { [weak self] configured in
+            guard let self else { return }
+            AppLogger.shared.write(
+                "AUDIO ONBOARDING prepare finished reason=\(reason) configured=\(configured) " +
+                    "ready=\(self.isAudioOutputReady) state={\(self.audioOutput.diagnosticState())}"
+            )
+        }
+    }
+
+    /// 离开 Onboarding 音频页后解除临时租约。若没有语音、测试音或 Ready 的桥继续
+    /// 需要输出，会走既有释放路径。
+    func endOnboardingAudioPreparation(reason: String) {
+        guard onboardingAudioPreparationActive else { return }
+        onboardingAudioPreparationActive = false
+        AppLogger.shared.write(
+            "AUDIO ONBOARDING prepare end reason=\(reason) state={\(audioOutput.diagnosticState())}"
+        )
+        releaseVirtualAudioOutputIfUnused(reason: "onboarding_\(reason)")
+    }
+
     private var shouldKeepVirtualAudioActive: Bool {
         shouldKeepVirtualAudioActive(allowingIdleBridgeRelease: false)
     }
@@ -8633,7 +9901,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping,
             testToneActive: isPlayingTestTone,
             systemSuspended: systemAudioSuspensionState.isSuspended,
-            idleBridgeReleaseDue: allowingIdleBridgeRelease
+            idleBridgeReleaseDue: allowingIdleBridgeRelease,
+            onboardingPreparationActive: onboardingAudioPreparationActive
         )
     }
 
@@ -9517,10 +10786,15 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             return
         }
         chromecastStatus = status
+        refreshChromecastHIDPresence()
         AppLogger.shared.write("CHROMECAST LINK state=\(status)")
-        if status.isConnected {
+        if case let .connected(displayName) = status {
+            let profileID = ensureChromecastProfile()
+            if let name = RemoteDeviceNamePolicy.observedSystemName(from: displayName) {
+                remoteSystemDeviceNames[profileID] = name
+                settings.updateRemoteProfileSystemName(profileID, name: name)
+            }
             // 与苹果遥控器一致：链路一可用就注册档案，按键页的设备选择器里立刻能选到它。
-            _ = ensureChromecastProfile()
             AppLogger.shared.write("CHROMECAST REMOTE phase=completed result=profile_ready")
             // 音频出口预热：否则首次按键要在「按下」的同时做一轮 REBIND（真机实测 ~30ms），
             // 更关键的是根因 #4 那种「引擎在 startup 时没起来且无人修复」的竞态会在按键瞬间
@@ -9545,6 +10819,17 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         if let profileID = chromecastProfileID { membershipFeature.resetCommonPhrases(source: "chromecast:\(profileID.uuidString)") }
         resetChromecastButtonState(reason: reason)
         refreshBluetoothPresentation()
+    }
+
+    /// 私有包只提供 `isHIDRemotePresent` 快照，没有可靠的 presence 回调。
+    /// 在链路状态变化和按键事件到达时刷新缓存，让卡片与真实按键通道同步。
+    private func refreshChromecastHIDPresence() {
+        let present = chromecastFeature.isHIDRemotePresent
+        guard chromecastHIDIsPresent != present else { return }
+        chromecastHIDIsPresent = present
+        objectWillChange.send()
+        logRemoteCardStatusChanges()
+        AppLogger.shared.write("CHROMECAST HID DEVICE present=\(present) source=snapshot")
     }
 
     private func logChromecastSustain() {
@@ -9923,6 +11208,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     // 一方结束不会清除另一方的状态。
 
     private func handleChromecastControlEvent(_ event: ChromecastRemoteControlEvent) {
+        refreshChromecastHIDPresence()
         let controlID = event.control.canvasControlID
 
         guard event.phase != .cancelled else {
@@ -9962,6 +11248,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     control: .remoteButton(event.control.remoteButton),
                     source: .bluetoothRemote
                 )
+                lastRemoteButtonPressProfileID = profileID
                 lastRemoteButtonPress = event.control.remoteButton
                 AppLogger.shared.write(
                     "ONBOARDING CONTROLS button=\(event.control.remoteButton.rawValue) " +
@@ -9977,10 +11264,9 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
             return
         }
 
-        guard chromecastNativeKeyMapper.isPrepared else {
-            AppLogger.shared.write("CHROMECAST ACTION rejected reason=native_input_not_verified")
-            return
-        }
+        // 私有包已在 handleReport 内部用 nativeInputReady 过滤报告：
+        // 独占成功或原生屏蔽成功时才会发出 onControlEvent。宿主再检查
+        // chromecastNativeKeyMapper.isPrepared 会误杀“独占成功但 service 未枚举”的路径。
         // 使用与画布、键位方案相同的保留策略；当前全部普通键可配置。
         if ChromecastRemoteControl.isSystemManaged(
             event.control,
@@ -10002,6 +11288,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 control: .remoteButton(event.control.remoteButton),
                 source: .bluetoothRemote
             )
+            lastRemoteButtonPressProfileID = profileID
             lastRemoteButtonPress = event.control.remoteButton
         } else {
             chromecastPressedControls.remove(controlID)
@@ -10059,6 +11346,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func resetChromecastButtonState(reason: String) {
+        chromecastAppSwitcher.cancel(reason: reason)
         if chromecastProfileID == buttonGestureLearningProfileID {
             cancelButtonGestureLearning(reason: "chromecast_input_reset")
         }
@@ -10086,6 +11374,11 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         phase: RemoteButtonPhase,
         profileID: UUID
     ) {
+        if chromecastAppSwitcher.handle(
+            phase, button: button,
+            isSwitcherBinding: settings.action(for: button, profileID: profileID) == .appSwitcher
+        ) { return }
+
         if handleButtonGestureLearning(
             phase,
             button: button,
@@ -10207,6 +11500,10 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                     "button=\(button.rawValue) trigger=\(trigger.rawValue)"
             )
             return false
+        }
+        if configured.action == .appSwitcher {
+            cancelConfiguredButtonInteractions(source: "chromecast:\(profileID.uuidString)", reason: "app_switcher_started")
+            return chromecastAppSwitcher.start(button: button)
         }
         guard performExternalConfiguredAction(configured) else {
             AppLogger.shared.write(

@@ -105,9 +105,31 @@ good_zip="$WORK_DIR/SayAll.zip"
 expect_ok "zip is opened and checked" --asset "$good_zip" --expected-commit "$EXPECTED"
 
 # --- 3) DMG ---------------------------------------------------------------------
-good_dmg="$WORK_DIR/SayAll.dmg"
-hdiutil create -quiet -srcfolder "$good_app" -volname "SayAllSourceTest" -format UDZO "$good_dmg"
-expect_ok "dmg is mounted and checked" --asset "$good_dmg" --expected-commit "$EXPECTED"
+# hdiutil can transiently fail on shared runners. Retry only the local fixture
+# creation and mount; a real source-commit mismatch still fails closed.
+dmg_passed=false
+for attempt in 1 2 3; do
+  good_dmg="$WORK_DIR/SayAll-$attempt-$RANDOM.dmg"
+  volname="SayAllSourceTest-$attempt-$-$RANDOM"
+  if ! hdiutil create -quiet -srcfolder "$good_app" -volname "$volname" -format UDZO "$good_dmg" \
+      > "$WORK_DIR/dmg-create-$attempt.log" 2>&1; then
+    print -u2 "dmg create attempt $attempt failed: $(tail -1 "$WORK_DIR/dmg-create-$attempt.log")"
+    sleep 1
+    continue
+  fi
+  if output="$("$VERIFY" --asset "$good_dmg" --expected-commit "$EXPECTED" 2>&1)"; then
+    (( passed += 1 ))
+    print "PASS dmg is mounted and checked (attempt $attempt)"
+    dmg_passed=true
+    break
+  fi
+  print -u2 "dmg verify attempt $attempt failed: $output"
+  if [[ -d "/Volumes/$volname" ]]; then
+    hdiutil detach "/Volumes/$volname" -force >/dev/null 2>&1 || true
+  fi
+  sleep 1
+done
+$dmg_passed || fail "dmg is mounted and checked after 3 attempts"
 
 # --- 4) PKG ---------------------------------------------------------------------
 good_pkg="$WORK_DIR/SayAll.pkg"
@@ -121,5 +143,29 @@ expect_ok "pkg is expanded and checked" --asset "$good_pkg" --expected-commit "$
 # --- 5) 参数校验 ----------------------------------------------------------------
 expect_fail "short sha is rejected" "--expected-commit must be a full 40-character" \
   --asset "$good_app" --expected-commit "abc123"
+
+# The signing runner requires the same embedded proof in the update and installer.
+proof_tests() {
+  local -x REQUIRE_CLIENT_PROOF_KEY=1
+  local -x SAYALL_CLIENT_PROOF_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  expect_fail "required proof absent in update is rejected" "missing the required client proof key" \
+    --asset "$good_zip" --expected-commit "$EXPECTED"
+  expect_fail "required proof absent in installer is rejected" "missing the required client proof key" \
+    --asset "$good_pkg" --expected-commit "$EXPECTED"
+
+  /usr/bin/plutil -insert SayAllClientProofKey -string "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "$good_app/Contents/Info.plist"
+  expect_fail "different proof is rejected" "client proof key does not match" \
+    --asset "$good_app" --expected-commit "$EXPECTED"
+  /usr/bin/plutil -replace SayAllClientProofKey -string "$SAYALL_CLIENT_PROOF_KEY" "$good_app/Contents/Info.plist"
+  proof_zip="$WORK_DIR/SayAll-proof.zip"
+  /usr/bin/ditto -c -k --keepParent "$good_app" "$proof_zip"
+  expect_ok "packaged update with matching proof passes" --asset "$proof_zip" --expected-commit "$EXPECTED"
+  /bin/cp "$good_app/Contents/Info.plist" "$pkg_root/SayAll.app/Contents/Info.plist"
+  proof_pkg="$WORK_DIR/SayAll-proof.pkg"
+  pkgbuild --quiet --ownership preserve --root "$pkg_root" \
+    --identifier com.example.sayall.source-test --version 1.0 "$proof_pkg"
+  expect_ok "packaged installer with matching proof passes" --asset "$proof_pkg" --expected-commit "$EXPECTED"
+}
+proof_tests
 
 print "RESULT passed=$passed failed=0"

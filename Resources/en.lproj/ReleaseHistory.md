@@ -1,5 +1,76 @@
 # Version History
 
+## 2.0.9 (Pre-release)
+
+- Adds Common Phrases: insert frequently used text in one press, with editing and import/export.
+- Adds Button Profiles: save several setups and switch them with the frontmost app.
+- Official support for Apple Remote 6th generation (Lightning, A2540) and 7th generation (Type-C, A2854), with Siri Remote component installation on the connection page.
+- Apple Watch connects more reliably and supports Double Tap to start and stop recording.
+- Control this Mac with the WeChat mini program; the browser version is discontinued.
+- Buy membership with WeChat virtual payment, or redeem a code.
+- Profile is rebuilt with a usage calendar, local leaderboards and sharing, plus a new Recommendations page.
+- The Onboarding connection page is simpler, with a remote pairing animation, separate Xiaomi Bluetooth Remote 2 and 2 Pro model choices, and Fn shortcut guidance for WeChat, Feishu and Doubao.
+- The voice key adds Left and Right Option, for five trigger modes.
+- Xiaomi remotes warn as a single voice session approaches the 60-second limit.
+- Back up and restore a complete configuration.
+- The About page is now Settings, with version information and feedback in one place.
+- Diagnostic logs are encrypted and can be sent on request.
+- Remote cards show the system Bluetooth name; the connection page adds Connect a device, and remote cards add Restore Voice; the menu bar icon can be hidden and dims when nothing is connected; the app icon can be switched.
+- Adds Half Page Up and Half Page Down actions; Siri Remote can hide its on-screen mouse feedback; configured actions use the accent color.
+- The virtual audio device is renamed from MiRemoteV 2ch to SayAll; existing users are unaffected.
+- macOS 27 renames Accessibility to Device Control and Data Access; in-app permission names and notices now match, while older macOS versions still show Accessibility.
+- The Macros page is redesigned and supports Shell and AppleScript scripts.
+- Note: Common Phrases, Button Profiles, Apple Remote voice, and iPhone, Apple Watch and mini program connections require Plus.
+- Fixes some Onboarding failures, including voice tests not ending on release and the audio page not preparing the virtual output.
+- Fixes input focus failures in some apps, and retry after focus is lost.
+- Fixes some shortcut recordings failing, not taking effect, or overwriting another action.
+- Fixes voice keys not recovering after a disconnect or wake, missing sound, dropped first words and a failing second session.
+- Fixes duplicate device entries for Xiaomi remotes, lost selected devices or button mappings, dropped first words in continuous voice sessions, and volume keys repeating after release.
+- Fixes remote cards staying on Confirming Status, disappearing after connection, and briefly showing yellow during fast connections.
+- Fixes a configuration-import security issue, and unclear notices for corrupted or partially imported settings.
+- Fixes notice bubble shadow, wrapping and colors, plus update checks missing new versions, calendar misalignment and clipped interface text.
+- Reduces unnecessary Bluetooth scan work on the connection page for smoother scrolling and response with many nearby devices.
+
+## 2.0.8 (Pre-release)
+
+- Adds Common Phrases: insert frequently used text in one press, with editing and import/export.
+- Macros can run Shell and AppleScript scripts.
+- Adds Button Profiles: save several setups and switch them with the frontmost app.
+- Official support for Apple Remote 6th generation (Lightning, A2540) and 7th generation (Type-C, A2854).
+- Apple Watch connects more reliably and supports Double Tap to start and stop recording.
+- Control this Mac with the WeChat mini program; the browser version is discontinued.
+- Buy membership with WeChat virtual payment, or redeem a code.
+- Profile is rebuilt with a usage calendar, local leaderboards and sharing, plus a new Recommendations page.
+- Onboarding can be configured by an AI agent.
+- The voice key adds Left and Right Option, for five trigger modes.
+- Xiaomi remotes warn as a single voice session approaches the 60-second limit.
+- Back up and restore a complete configuration.
+- About becomes a version center and gains a feedback entry.
+- Diagnostic logs are encrypted and can be sent on request.
+- Remote cards show the system Bluetooth name; the menu bar icon can be hidden and dims when nothing is connected; the app icon can be switched.
+- Installers are now a single Installer PKG with a matching uninstaller.
+- The virtual audio device is renamed from MiRemoteV 2ch to SayAll; existing users are unaffected.
+- Note: Common Phrases, Button Profiles, Apple Remote voice, and iPhone, Apple Watch and mini program connections require Plus.
+- Fixes some Onboarding failures.
+- Fixes input focus failures in some apps, and retry after focus is lost.
+- Fixes some shortcut recordings failing, not taking effect, or overwriting another action.
+- Fixes voice keys not recovering after a disconnect or wake, missing sound, dropped first words and a failing second session.
+- Fixes a configuration-import security issue, and unclear notices for corrupted or partially imported settings.
+- Fixes update checks missing new versions, calendar misalignment and clipped interface text.
+
+## 2.0.6 (Pre-release)
+
+- Remote cards: the buttons page header, the current device on the connection page, and previously connected devices now share one three-line card with the model, Bluetooth name, overall status, and valid battery information.
+- Overall status: Connected means local buttons and the authorized voice path are usable. Confirmed faults show Button Issue, Voice Issue, or Device Issue first. Starting states show Checking or Confirming Status.
+- Previous devices: connection history includes Apple and Chromecast profiles. The last Bluetooth name is kept when a device disconnects or its name cannot be read. An uninstalled Apple component offers Enable, and a voice entry without membership offers Join Plus.
+- Membership: Plus benefits are split into six rows, with separate notes for the iOS app and Apple Watch app. Purchase copy now says one purchase, no automatic renewal.
+- Installer: the license page syncs the November 16, 2026 privacy policy, covering the encrypted cloud relay for the web version and mini program, no recording storage on the relay, and LAN-first nearby connections.
+
+## 2.0.4 (Pre-release)
+
+- Fixed an issue where one failed ordinary button action could disable all remote buttons.
+- Custom apps that still need focus verification now open and show a verification notice.
+
 ## 2.0.3 (Pre-release)
 
 - Remote buttons: fixes ordinary buttons not responding on macOS 27 while the remote remains connected; falls back to the manager report path when device callbacks go silent and rebuilds HID monitors after discovering a new remote; the voice key is unaffected.

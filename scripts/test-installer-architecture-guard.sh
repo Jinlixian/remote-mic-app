@@ -155,6 +155,22 @@ if /usr/bin/grep -Eq 'HCI_SERVICE_DESTINATION=|HCI_SERVICE_PLIST=|launchctl boot
   exit 1
 fi
 /usr/bin/grep -Fq 'queue_owned_hci_service' "$UNINSTALL_POSTINSTALL"
+# 历史版本兼容：新增 App 身份不得删除旧路径或旧 Bundle ID。
+for app_destination in 'Applications/SayAll.app' 'Applications/Remote Mic.app' 'Applications/无线麦.app'; do
+  /usr/bin/grep -Fq "$app_destination" "$UNINSTALL_POSTINSTALL"
+done
+/usr/bin/grep -Fq 'BUNDLE_IDENTIFIER="com.hd838a.RemoteMic"' "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq 'SIRI_REMOTE_PACKAGE_ID="com.hd838a.RemoteMic.siri-remote"' \
+  "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq -- '--forget' "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq 'persistent-apps' "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq '/usr/bin/killall Dock' "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq 'cleanup_siri_receipt' "$UNINSTALL_POSTINSTALL"
+/usr/bin/grep -Fq 'cleanup_dock_tiles' "$UNINSTALL_POSTINSTALL"
+if /usr/bin/grep -Eq 'Library/Preferences|Library/Logs' "$UNINSTALL_POSTINSTALL"; then
+  print -u2 "uninstaller must not target app preferences or logs"
+  exit 1
+fi
 if /usr/bin/grep -Eq '(/bin/)?rm([[:space:]]|$)|unlink|find[[:space:]].*-delete' \
     "$PREINSTALL" "$POSTINSTALL" "$UNINSTALL_POSTINSTALL"; then
   print -u2 "installer scripts must never permanently delete HCI or driver files"
@@ -255,5 +271,7 @@ second_lane="${sign_events[3]#start:}"
 test "${sign_events[2]}" = "end:$first_lane"
 test "${sign_events[4]}" = "end:$second_lane"
 test "$first_lane" != "$second_lane"
+
+"$ROOT/scripts/test-uninstaller-cleanup.sh"
 
 print "INSTALLER ARCHITECTURE GUARD TEST PASS"

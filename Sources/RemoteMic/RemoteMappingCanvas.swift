@@ -130,6 +130,8 @@ struct RemoteMappingCanvas: View {
     var actionDetail: ((RemoteButton, ButtonTrigger) -> String)? = nil
     /// 方案编辑时的动作来源；继承项在窄卡片上用链接图标标记。
     var actionSource: ((RemoteButton, ButtonTrigger) -> RemoteMappingActionSource)? = nil
+    /// 已配置动作的文字使用系统主题色；未配置的“无动作”保持次要文字色。
+    var actionConfigured: ((RemoteButton, ButtonTrigger) -> Bool)? = nil
     let onEdit: (RemoteButton, ButtonTrigger) -> Void
     let onEditHold: (RemoteButton) -> Void
     var onVoiceSettings: () -> Void = {}
@@ -297,6 +299,7 @@ struct RemoteMappingCanvas: View {
 
             HStack(spacing: 4) {
                 ForEach(ButtonTrigger.allCases) { trigger in
+                    let source = actionSource?(button, trigger)
                     Button {
                         selectedButton = button
                         onEdit(button, trigger)
@@ -306,12 +309,19 @@ struct RemoteMappingCanvas: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                             HStack(spacing: 2) {
-                                if actionSource?(button, trigger) == .inherited {
+                                if source == .inherited {
                                     Image(systemName: "link")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(.secondary)
                                         .accessibilityLabel(
                                             Text(localization.text("button_mapping.binding.inherited"))
+                                        )
+                                } else if source == .unavailable {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(.orange)
+                                        .accessibilityLabel(
+                                            Text(localization.text("button_mapping.binding.unavailable_short"))
                                         )
                                 }
                                 Text(actionSummary(button, trigger))
@@ -319,6 +329,11 @@ struct RemoteMappingCanvas: View {
                                         size: 12,
                                         weight: trigger == .singleClick ? .semibold : .regular
                                     ))
+                                    .foregroundStyle(
+                                        actionConfigured?(button, trigger) == true
+                                            ? Color.accentColor
+                                            : Color.secondary
+                                    )
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                             }

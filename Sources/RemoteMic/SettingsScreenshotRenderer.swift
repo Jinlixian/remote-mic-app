@@ -1,5 +1,8 @@
 import AppKit
 import SwiftUI
+#if canImport(SayAllButtonProfiles)
+import SayAllButtonProfiles
+#endif
 
 @MainActor
 enum SettingsScreenshotRenderer {
@@ -297,6 +300,7 @@ enum SettingsScreenshotRenderer {
             transcriptArchiveStore: transcriptStore,
             recordingAssetStore: recordingStore
         )
+        model.configureSettingsScreenshotDefaults()
         if let rawModel = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_MODEL"
         ], let remoteModel = XiaomiRemoteModel(rawValue: rawModel) {
@@ -319,6 +323,17 @@ enum SettingsScreenshotRenderer {
                 batteryLevels: remoteCardBatteryLevels,
                 powerStates: remoteCardPowerStates
             )
+        }
+        if let scenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_REMOTE_RECOVERY"] {
+            model.configureRemoteRecoveryForSettingsScreenshot(scenario)
+        }
+        if let scenario = ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_CARD_SCENARIO"] {
+            model.configureUnifiedRemoteCardsForSettingsScreenshot(scenario)
+        }
+        if let state = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_APPLE_REMOTE_COMPONENT"
+        ] {
+            model.configureAppleRemoteComponentEntryForSettingsScreenshot(state)
         }
         let updateInformation = UpdateInformationStore(userDefaults: defaults)
         seedAvailableUpdate(updateInformation, language: language)
@@ -351,6 +366,57 @@ enum SettingsScreenshotRenderer {
                     copying: nil, bindings: [binding], holdModes: [RemoteButton.ok.rawValue: "once"])
             }
             if mappingScenario == "viewer" { model.macroFeature.updateButtonProfilesAccess(.requiresPlus) }
+            #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+            if mappingScenario == "unavailable" {
+                let device = settings.selectedRemoteProfileID
+                settings.setBaseBinding(
+                    ConfiguredButtonAction(action: .pageUp, shortcut: nil),
+                    for: .up,
+                    trigger: .singleClick,
+                    profileID: device
+                )
+                settings.setBaseBinding(
+                    ConfiguredButtonAction(action: .pageDown, shortcut: nil),
+                    for: .down,
+                    trigger: .singleClick,
+                    profileID: device
+                )
+                let profileID = model.macroFeature.createMappingProfile(
+                    named: language == .english ? "Missing References" : "引用失效",
+                    copying: nil,
+                    bindings: [
+                        .init(
+                            remoteProfileID: nil,
+                            button: .ok,
+                            trigger: .singleClick,
+                            configured: .init(action: .commandCopy, shortcut: nil)
+                        )
+                    ],
+                    holdModes: [:]
+                )
+                if let profileID {
+                    // Both cells point at a shortcut ID that is deliberately absent from
+                    // this isolated fixture. The production view must show the base
+                    // fallback and the repair banner, not a dead "configuration unavailable".
+                    model.macroFeature.setRawProfileBinding(
+                        .shortcut(profileKey: "shortcut.screenshot-missing"),
+                        profile: profileID,
+                        button: .up,
+                        trigger: .singleClick
+                    )
+                    model.macroFeature.setRawProfileBinding(
+                        .shortcut(profileKey: "shortcut.screenshot-missing"),
+                        profile: profileID,
+                        button: .down,
+                        trigger: .singleClick
+                    )
+                    seededProfileID = profileID
+                }
+            }
+            #endif
+        }
+        if membershipAccess == "allowed" {
+            model.membershipFeature.applyScreenshotState(isFeatureVisible: true, accessDecision: .allowed(validUntil: .distantFuture))
         }
         if membershipAccess == "requiresPlus" {
             model.macroFeature.updateButtonProfilesAccess(.requiresPlus)
@@ -430,7 +496,7 @@ enum SettingsScreenshotRenderer {
             window.isMovableByWindowBackground = false
             window.hidesOnDeactivate = false
             window.isReleasedWhenClosed = false
-            window.minSize = NSSize(width: 1020, height: 772)
+            window.minSize = size
             window.contentViewController = controller
             window.setContentSize(size)
             window.center()
@@ -530,15 +596,35 @@ enum SettingsScreenshotRenderer {
         section: SettingsSection,
         localization: LocalizationStore
     ) {
-        guard fixture == "profile-created", section == .mapping else { return }
-        NoticeCenter.shared.show(Notice(
-            tier: .tip,
-            title: localization.text("button_mapping.profile.created"),
-            text: localization.text("button_mapping.profile.created.detail"),
-            dismissal: .manual,
-            position: .bottom,
-            dismissible: false
-        ))
+        guard section == .mapping, let fixture else { return }
+        switch fixture {
+        case "profile-created":
+            NoticeCenter.shared.show(Notice(
+                tier: .tip,
+                title: localization.text("button_mapping.profile.created"),
+                text: localization.text("button_mapping.profile.created.detail"),
+                dismissal: .manual,
+                position: .bottom,
+                dismissible: false
+            ))
+        case "button-action-failed":
+            NoticeCenter.shared.show(Notice(
+                tier: .warning,
+                title: localization.text("button_mapping.action_failed.title"),
+                text: localization.text("button_mapping.action_failed.detail"),
+                dismissal: .manual,
+                position: .bottom,
+                dismissible: false
+            ))
+        case "common-phrase-input-unavailable":
+            NoticeCenter.shared.show(Notice(
+                tier: .error,
+                title: localization.text("common_phrases.error.input_unavailable"),
+                dismissal: .manual
+            ))
+        default:
+            return
+        }
     }
 
     private static func seedMixedHistory(

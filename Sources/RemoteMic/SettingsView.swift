@@ -646,6 +646,9 @@ struct SettingsView: View {
     @State private var selectedChromecastControlID = "select"
     @State private var selectedStatisticsDate: Date?
     @State private var mappingEditingTarget: ShortcutEditingTarget?
+    /// 当前动作编辑状态属于哪台遥控器。跨型号切换会替换整个页面子树，
+    /// 这个设备标识让旧编辑区在清理完成前也不会显示到新遥控器页面上。
+    @State private var mappingPageStateDeviceID: UUID?
     @State private var mappingHoldEditingButton: RemoteButton?
     /// Clicking the same hold entry twice must still bring the editor into view, so the
     /// scroll is driven by a request token instead of the selection identity.
@@ -692,6 +695,8 @@ struct SettingsView: View {
     @State private var isMappingPermissionAlertPresented = false
     @State private var isWaitingForMappingPermissions = false
     @State private var expandedShareSection: SettingsSection?
+    @State private var showsPreviouslyConnectedDevices = true
+    @State private var isNewDeviceRowHovered = false
     @State private var versionTapRevealCounter = VersionTapRevealCounter()
 
     init(
@@ -790,6 +795,7 @@ struct SettingsView: View {
                 ShortcutEditingTarget(button: $0, trigger: initialMappingEditingTrigger)
             } : nil
         )
+        _mappingPageStateDeviceID = State(initialValue: model.settings.selectedRemoteProfileID)
         _mappingHoldEditingButton = State(initialValue: initialMappingHoldEditingButton)
         _isMappingVoiceSettingsPresented = State(initialValue: initialMappingVoiceSettingsPresented)
         _applicationButtonSettingsProfileID = State(initialValue: initialApplicationButtonSettingsProfileID)
@@ -822,7 +828,6 @@ struct SettingsView: View {
             guard url == URL(string: "sayall://membership") else { return .systemAction }
             guard membershipFeature.isFeatureVisible else { return .discarded }
             selectedSection = .membership
-            membershipFeature.refreshIfNeeded()
             return .handled
         })
         .frame(
@@ -840,7 +845,6 @@ struct SettingsView: View {
             refreshPermissionStates()
             loginItemService.refresh()
             macroFeature.setEditorActive(false)
-            membershipFeature.refreshIfNeeded()
             routePendingButtonProfileImportIfNeeded()
             if ButtonProfileMacroRefreshPolicy.shouldRefresh(section: selectedSection) {
                 macroFeature.reloadButtonProfileMacroLibrary()
@@ -879,6 +883,12 @@ struct SettingsView: View {
                 macroFeature.reloadButtonProfileMacroLibrary()
             }
         }
+        // 监听器必须挂在会跨型号页面替换保留的父层。按键页按型号在小米、Siri 和
+        // Chromecast 页面之间切换，挂在页内的 onChange 在跨型号切换时会被移除。
+        .onChange(of: settings.selectedRemoteProfileID) { _ in
+            guard !mappingInteractionBelongsToSelectedRemote else { return }
+            resetMappingPageForRemoteChange()
+        }
         .onDisappear {
             model.setMappingPageVisible(false)
             endMacMicrophoneShortcutCapture()
@@ -889,7 +899,6 @@ struct SettingsView: View {
             refreshPermissionStates()
             loginItemService.refresh()
             resumeCustomMappingIfPermissionsGranted()
-            membershipFeature.refreshIfNeeded()
         }
         .onReceive(privateFeature.$isFeatureVisible.removeDuplicates()) { isVisible in
             if !isVisible, selectedSection == .privateFeature {
@@ -958,7 +967,6 @@ struct SettingsView: View {
             membershipRequiredView: membershipFeature.membershipRequiredView(remoteAuthorizationDenied: true) {
                 isWebRemoteSessionPresented = false
                 selectedSection = .membership
-                membershipFeature.refreshIfNeeded()
             },
             onDiagnostic: { AppLogger.shared.write($0) }
         )
@@ -1156,8 +1164,13 @@ struct SettingsView: View {
                             } else {
                                 selectMappingProfile(nil)
                             }
-                            // 只打开动作编辑器；按住是独立分类，不随跳转展开。
+                            // 跳转明确选择的是新设备；父层设备监听不得把这次编辑目标清掉。
+                            mappingPageStateDeviceID = settings.selectedRemoteProfileID
+                            mappingEditingTarget = nil
                             mappingHoldEditingButton = nil
+                            isMappingVoiceSettingsPresented = false
+                            shortcutCaptureTarget = nil
+                            applicationShortcutCaptureProfileID = nil
                             mappingActionFilter = mappingFilterForConfiguredAction(
                                 button: button,
                                 trigger: trigger
@@ -1190,7 +1203,11 @@ struct SettingsView: View {
                             settings: settings,
                             holdSummaryProvider: { profileID, buttonRaw in
                                 guard let button = RemoteButton(rawValue: buttonRaw) else { return "" }
-                                return mappingHoldSummary(for: button, profileID: profileID)
+                                return profileHoldSummary(for: button, profileID: profileID)
+                            },
+                            holdModeProvider: { profileID, buttonRaw in
+                                guard let button = RemoteButton(rawValue: buttonRaw) else { return nil }
+                                return profileHoldMode(for: button, profileID: profileID)
                             },
                             onChooseApplication: { completion in
                                 chooseApplicationForProfile(completion)
@@ -1208,7 +1225,6 @@ struct SettingsView: View {
                             chromecastReservedControlIDs: buttonProfilesChromecastReservedControls,
                             membershipNotice: membershipFeature.membershipRequiredView(forButtonProfiles: true) {
                                 selectedSection = .membership
-                                membershipFeature.refreshIfNeeded()
                             }
                         )
                     }
@@ -1225,6 +1241,7 @@ struct SettingsView: View {
         case .membership:
             if membershipFeature.isFeatureVisible {
                 membershipFeature.settingsView()
+                    .onAppear { membershipFeature.refreshIfNeeded() }
             } else {
                 aboutPage
             }
@@ -1251,14 +1268,12 @@ struct SettingsView: View {
                 membershipFeature.commonPhrasesSettingsView(
                     onOpenMembership: {
                         selectedSection = .membership
-                        membershipFeature.refreshIfNeeded()
                     },
                     onReturn: { selectedSection = .mapping }
                 )
             } else {
                 membershipFeature.membershipRequiredView {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
             }
         case .transcripts:
@@ -1324,22 +1339,83 @@ struct SettingsView: View {
             }
             CompatibilityGlassContainer(spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
-                    connectionDevicePanel
-                        .frame(width: 230)
+                    VStack(spacing: 14) {
+                        connectionDevicePanel
+                        devicesPanel
+#if SAYALL_SIRI_REMOTE_ENABLED
+                        if showsAppleRemoteComponentInstallation {
+                            appleRemoteComponentInstallation
+                        }
+#endif
+                    }
+                        .frame(width: SettingsPageBehavior.mappingRemoteCardWidth + 32, alignment: .top)
                     VStack(spacing: 14) {
                         phoneConnectionsPanel
                         audioSettingsPanel
-                        // Chromecast 连接卡片已按产品要求移除：启用开关默认常开，
-                        // 语音键模式在语音键设置面板内，状态见侧边栏「连接」的设备列表。
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
             }
         }
         .onAppear {
+            model.refreshRemoteDiscovery()
             model.refreshVoiceKeyCompatibilityWarning()
         }
     }
+
+#if SAYALL_SIRI_REMOTE_ENABLED
+    /// Upgrade users can have the App without the optional PKG component.
+    /// This module only installs the component; it does not touch remote cards.
+    private var showsAppleRemoteComponentInstallation: Bool {
+        !model.isSiriRemoteHelperInstalled
+    }
+
+    private var appleRemoteComponentInstallation: some View {
+        let showsRetry = settings.siriRemoteNeedsUserAction
+            || model.siriRemoteAudioStatus.hasPrefix("unavailable:authorization_helper_upgrade")
+        let isInstalling = settings.siriRemoteEnabled && model.siriRemoteAudioStatus == "preparing_hci"
+        return GlassPanel {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("connection.siri_remote_component.title")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("connection.siri_remote_component.detail")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if showsRetry {
+                    Text("connection.siri_remote_component.retry_detail")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if isInstalling {
+                    HStack(spacing: 7) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("connection.siri_remote_component.installing")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button {
+                        model.installSiriRemoteComponent()
+                    } label: {
+                        Text(
+                            showsRetry
+                                ? "connection.siri_remote_component.retry"
+                                : "connection.siri_remote_component.install"
+                        )
+                    }
+                    .compatibilityButtonStyle(.standard)
+                    .controlSize(.small)
+                    .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
+                    .accessibilityIdentifier("apple-remote-component-install")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+#endif
 
     private func voiceKeyCompatibilityWarningPanel(
         _ warning: VoiceKeyCompatibilityWarning
@@ -1410,7 +1486,6 @@ struct SettingsView: View {
     private var connectionMembershipRequiredView: some View {
         membershipFeature.membershipRequiredView {
             selectedSection = .membership
-            membershipFeature.refreshIfNeeded()
         }
     }
 
@@ -1606,42 +1681,167 @@ struct SettingsView: View {
     private var connectionDevicePanel: some View {
         GlassPanel {
             VStack(spacing: 16) {
+                if settings.remoteDeviceProfiles.contains(where: { model.isRemoteConnected($0.id) }) {
                 remoteDeviceSelector(vertical: true)
 
                 connectionRemotePhoto
 
-                VStack(alignment: .leading, spacing: 9) {
-                    connectionStatusLine(
-                        symbol: "antenna.radiowaves.left.and.right",
-                        text: model.connectionStatusText(using: localization),
-                        tint: connectionTint
-                    )
-                    connectionStatusLine(
-                        symbol: "waveform",
-                        text: localization.text(
-                            model.isStreaming
-                                ? "connection.status.voice_streaming"
-                                : "connection.status.voice_ready"
-                        ),
-                        tint: model.isStreaming ? .orange : .blue
-                    )
-                    connectionStatusLine(
-                        symbol: "mic.fill",
-                        text: model.voiceShortcutStatus.text(using: localization),
-                        tint: .blue
-                    )
+                if let profile = settings.selectedRemoteProfile,
+                   model.isRemoteConnected(profile.id) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        connectionStatusLine(
+                            symbol: "antenna.radiowaves.left.and.right",
+                            text: model.connectionStatusText(using: localization),
+                            tint: connectionTint
+                        )
+                        connectionStatusLine(
+                            symbol: "waveform",
+                            text: localization.text(
+                                model.isStreaming
+                                    ? "connection.status.voice_streaming"
+                                    : "connection.status.voice_ready"
+                            ),
+                            tint: model.isStreaming ? .orange : .blue
+                        )
+                        connectionStatusLine(
+                            symbol: "mic.fill",
+                            text: model.voiceShortcutStatus.text(using: localization),
+                            tint: .blue
+                        )
+                    }
                 }
+
+                } else {
+                    Image(systemName: "appletvremote.gen4.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(.secondary)
+                    Text("connection.history.empty")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("connection.history.keep_configuration")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    if previouslyConnectedProfiles.isEmpty {
+                        Text(model.connectionStatusText(using: localization))
+                            .font(.system(size: 12))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(model.remoteDiscoveryIsActive ? "connection.history.cancel" : "connection.history.find") {
+                            if model.remoteDiscoveryIsActive { model.cancelRemoteDiscovery() }
+                            else { model.findRemoteDevices() }
+                        }
+                        .compatibilityButtonStyle(.standard)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var previouslyConnectedProfiles: [RemoteDeviceProfile] {
+        RemoteDeviceNamePolicy.sortedForCards(
+            settings.remoteDeviceProfiles.filter { profile in
+                profile.bluetoothIdentifier != nil || profile.hidFingerprint != nil || profile.model.usesPrivateAdapter
+            }, modelName: remoteModelName, systemName: { model.systemDeviceName(for: $0) }
+        )
+    }
+
+    private var devicesPanel: some View {
+        let profiles = previouslyConnectedProfiles.filter { !model.isRemoteConnected($0.id) }
+        return GlassPanel {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("connection.devices.title")
+                    .font(.system(size: 13, weight: .semibold))
 
                 Button {
-                    model.reconnect()
+                    AppLogger.shared.write(
+                        "CONNECTION NEW DEVICE phase=requested action=restart_onboarding source=connection_page"
+                    )
+                    settings.restartOnboarding()
                 } label: {
-                    Text("connection.action.reconnect")
-                        .foregroundStyle(.white)
+                    HStack(spacing: 10) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 28, height: 28)
+                            .background(
+                                Color.accentColor.opacity(0.12),
+                                in: Circle()
+                            )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("connection.devices.new.title")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("connection.devices.new.detail")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 4)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        isNewDeviceRowHovered ? Color.primary.opacity(0.045) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
                 }
-                    .compatibilityButtonStyle(.prominent)
-                    .compatibilityRoundedButtonBorderShape(radius: 10)
-                    .frame(maxWidth: .infinity)
+                .buttonStyle(.plain)
+                .onHover { isNewDeviceRowHovered = $0 }
+                .accessibilityIdentifier("connection-connect-new-device")
+                .accessibilityLabel(Text("connection.devices.new.title"))
+                .accessibilityHint(Text("connection.devices.new.detail"))
 
+                Divider()
+
+                if profiles.isEmpty {
+                    Text("connection.history.title")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    if previouslyConnectedProfiles.isEmpty {
+                        Text("connection.devices.history.empty")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("connection.history.all_connected")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button { showsPreviouslyConnectedDevices.toggle() } label: {
+                        HStack {
+                            Text("connection.history.title")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 4)
+                            Image(systemName: showsPreviouslyConnectedDevices ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 12))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityValue(
+                        localization.text(
+                            showsPreviouslyConnectedDevices
+                                ? "connection.history.expanded"
+                                : "connection.history.collapsed"
+                        )
+                    )
+                    if showsPreviouslyConnectedDevices {
+                        ForEach(profiles) { profile in
+                            remoteDeviceCard(profile, history: true)
+                        }
+                    }
+                }
+
+                if let block = model.bluetoothConnectionBlock {
+                    Text(block.text(using: localization)).font(.system(size: 12)).foregroundStyle(.orange)
+                    Button("connection.history.open_bluetooth") { model.openBluetoothPrivacySettings() }
+                        .compatibilityButtonStyle(.standard)
+                }
             }
         }
     }
@@ -1891,70 +2091,159 @@ struct SettingsView: View {
     #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
     private var siriRemoteMappingPage: some View {
         hardwareMappingPage(includeSiriScrollArrow: true) {
-            SiriRemoteMappingCanvas(
-                selectedControlID: $selectedSiriRemoteControlID,
-                activeControlIDs: model.activeAppleRemoteControlIDs,
-                voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
-                labels: SiriRemoteMappingCanvas.Labels(
-                    voiceTitle: localization.text("siri_remote.mapping.voice.title"),
-                    voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
-                    voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
-                    missingPhoto: localization.text("siri_remote.mapping.photo.missing")
-                ),
-                buttonTitle: { controlID in
-                    siriRemoteButton(for: controlID)?.displayName(using: localization)
-                        ?? controlID
-                },
-                triggerTitle: { triggerID in
-                    ButtonTrigger(rawValue: triggerID)?.displayName(using: localization)
-                        ?? triggerID
-                },
-                actionSummary: { controlID, triggerID in
-                    guard let button = siriRemoteButton(for: controlID),
-                          let trigger = ButtonTrigger(rawValue: triggerID)
-                    else { return localization.text("action.disabled") }
-                    return mappingActionSummary(for: button, trigger: trigger)
-                },
-                holdSummary: { controlID in
-                    guard let button = siriRemoteButton(for: controlID) else {
-                        return localization.text("button_mapping.hold.entry")
-                    }
-                    return mappingHoldSummary(for: button)
-                },
-                reservedControlIDs: profileScopeReservedSiriControlIDs,
-                onEdit: { controlID, triggerID in
-                    guard let button = siriRemoteButton(for: controlID),
-                          let trigger = ButtonTrigger(rawValue: triggerID)
-                    else { return }
-                    selectedSiriRemoteControlID = controlID
-                    selectedRemoteButton = button
-                    mappingActionFilter = mappingFilterForConfiguredAction(
-                        button: button,
-                        trigger: trigger
-                    )
-                    // 重复点同一颗键时 mappingEditingTarget 不变，光靠 onChange 不会再滚，
-                    // 所以每次都单独发一次滚动请求。
-                    mappingFilterScrollRequest &+= 1
-                    // 点按键只打开它的动作编辑器；按住是独立分类，不能连带展开。
-                    mappingHoldEditingButton = nil
-                    mappingEditingTarget = ShortcutEditingTarget(
-                        button: button,
-                        trigger: trigger
-                    )
-                },
-                onEditHold: { controlID in
-                    guard let button = siriRemoteButton(for: controlID) else { return }
-                    selectedSiriRemoteControlID = controlID
-                    selectedRemoteButton = button
-                    mappingEditingTarget = nil
-                    shortcutCaptureTarget = nil
-                    applicationShortcutCaptureProfileID = nil
-                    mappingHoldEditingButton = button
-                    requestMappingEditorScroll(focusHold: true)
-                },
-                onVoiceSettings: presentMappingVoiceSettings
-            )
+            siriRemoteMappingCanvas
         }
+    }
+
+    #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+    /// 与宿主共享画布同一套来源/主题色语义；旧私有组件没有这些闭包时走下面的兼容分支。
+    private var siriRemoteMappingCanvas: some View {
+        SiriRemoteMappingCanvas(
+            selectedControlID: $selectedSiriRemoteControlID,
+            activeControlIDs: model.activeAppleRemoteControlIDs,
+            voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
+            labels: siriRemoteMappingLabels,
+            buttonTitle: siriRemoteCanvasButtonTitle,
+            triggerTitle: siriRemoteCanvasTriggerTitle,
+            actionSummary: siriRemoteCanvasActionSummary,
+            holdSummary: siriRemoteCanvasHoldSummary,
+            actionConfigured: siriRemoteCanvasActionConfigured,
+            actionSource: siriRemoteCanvasActionSource,
+            reservedControlIDs: profileScopeReservedSiriControlIDs,
+            onEdit: editSiriRemoteControl,
+            onEditHold: editSiriRemoteHold,
+            onVoiceSettings: presentMappingVoiceSettings
+        )
+    }
+    #else
+    private var siriRemoteMappingCanvas: some View {
+        SiriRemoteMappingCanvas(
+            selectedControlID: $selectedSiriRemoteControlID,
+            activeControlIDs: model.activeAppleRemoteControlIDs,
+            voiceActive: model.activeAppleRemoteControlIDs.contains("siri"),
+            labels: siriRemoteMappingLabels,
+            buttonTitle: siriRemoteCanvasButtonTitle,
+            triggerTitle: siriRemoteCanvasTriggerTitle,
+            actionSummary: siriRemoteCanvasActionSummary,
+            holdSummary: siriRemoteCanvasHoldSummary,
+            reservedControlIDs: profileScopeReservedSiriControlIDs,
+            onEdit: editSiriRemoteControl,
+            onEditHold: editSiriRemoteHold,
+            onVoiceSettings: presentMappingVoiceSettings
+        )
+    }
+    #endif
+
+    private var siriRemoteMappingLabels: SiriRemoteMappingCanvas.Labels {
+        #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+        return SiriRemoteMappingCanvas.Labels(
+            voiceTitle: localization.text("siri_remote.mapping.voice.title"),
+            voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
+            voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
+            missingPhoto: localization.text("siri_remote.mapping.photo.missing"),
+            inherited: localization.text("button_mapping.binding.inherited"),
+            unavailable: localization.text("button_mapping.binding.unavailable_short")
+        )
+        #else
+        return SiriRemoteMappingCanvas.Labels(
+            voiceTitle: localization.text("siri_remote.mapping.voice.title"),
+            voiceFixed: localization.text("siri_remote.mapping.voice.fixed"),
+            voiceDetail: localization.text("siri_remote.mapping.voice.detail"),
+            missingPhoto: localization.text("siri_remote.mapping.photo.missing")
+        )
+        #endif
+    }
+
+    private var siriRemoteCanvasButtonTitle: (String) -> String {
+        { controlID in
+            siriRemoteButton(for: controlID)?.displayName(using: localization)
+                ?? controlID
+        }
+    }
+
+    private var siriRemoteCanvasTriggerTitle: (String) -> String {
+        { triggerID in
+            ButtonTrigger(rawValue: triggerID)?.displayName(using: localization)
+                ?? triggerID
+        }
+    }
+
+    private var siriRemoteCanvasActionSummary: (String, String) -> String {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return localization.text("action.disabled") }
+            return mappingActionSummary(for: button, trigger: trigger)
+        }
+    }
+
+    private var siriRemoteCanvasHoldSummary: (String) -> String {
+        { controlID in
+            guard let button = siriRemoteButton(for: controlID) else {
+                return localization.text("button_mapping.hold.entry")
+            }
+            return mappingHoldSummary(for: button)
+        }
+    }
+
+    #if SAYALL_SIRI_PROFILE_ACTION_STYLE
+    private var siriRemoteCanvasActionConfigured: (String, String) -> Bool {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return false }
+            return mappingActionIsConfigured(for: button, trigger: trigger)
+        }
+    }
+
+    private var siriRemoteCanvasActionSource:
+        (String, String) -> SiriRemoteMappingCanvas.ActionSource {
+        { controlID, triggerID in
+            guard let button = siriRemoteButton(for: controlID),
+                  let trigger = ButtonTrigger(rawValue: triggerID)
+            else { return .base }
+            switch mappingActionSource(for: button, trigger: trigger) {
+            case .base: return .base
+            case .inherited: return .inherited
+            case .explicit: return .explicit
+            case .unavailable: return .unavailable
+            }
+        }
+    }
+    #endif
+
+    private func editSiriRemoteControl(_ controlID: String, _ triggerID: String) {
+        guard let button = siriRemoteButton(for: controlID),
+              let trigger = ButtonTrigger(rawValue: triggerID)
+        else { return }
+        selectedSiriRemoteControlID = controlID
+        selectedRemoteButton = button
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingActionFilter = mappingFilterForConfiguredAction(
+            button: button,
+            trigger: trigger
+        )
+        // 重复点同一颗键时 mappingEditingTarget 不变，光靠 onChange 不会再滚，
+        // 所以每次都单独发一次滚动请求。
+        mappingFilterScrollRequest &+= 1
+        // 点按键只打开它的动作编辑器；按住是独立分类，不能连带展开。
+        mappingHoldEditingButton = nil
+        mappingEditingTarget = ShortcutEditingTarget(
+            button: button,
+            trigger: trigger
+        )
+    }
+
+    private func editSiriRemoteHold(_ controlID: String) {
+        guard let button = siriRemoteButton(for: controlID) else { return }
+        selectedSiriRemoteControlID = controlID
+        selectedRemoteButton = button
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingEditingTarget = nil
+        shortcutCaptureTarget = nil
+        applicationShortcutCaptureProfileID = nil
+        mappingHoldEditingButton = button
+        requestMappingEditorScroll(focusHold: true)
     }
 
     private func siriRemoteButton(for controlID: String) -> RemoteButton? {
@@ -2031,6 +2320,7 @@ struct SettingsView: View {
                     else { return }
                     selectedChromecastControlID = controlID
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingActionFilter = mappingFilterForConfiguredAction(
                         button: button,
                         trigger: trigger
@@ -2049,6 +2339,7 @@ struct SettingsView: View {
                     guard let button = chromecastButton(for: controlID) else { return }
                     selectedChromecastControlID = controlID
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingEditingTarget = nil
                     shortcutCaptureTarget = nil
                     applicationShortcutCaptureProfileID = nil
@@ -2105,7 +2396,41 @@ struct SettingsView: View {
     /// 语音键没有可配置的单击/双击/长按动作，所以它不打开普通按键的编辑器；反之，打开普通按键
     /// 或按住编辑器时也会收起本面板（见 `hardwareMappingPage` 的 onChange），保证点击之后页面上
     /// 只有这一份与语音键有关的设置。再点一次语音键卡片收起。
+    /// 旧遥控器的编辑状态在新页面出现前不得参与布局或滚动。
+    private var mappingInteractionBelongsToSelectedRemote: Bool {
+        mappingPageStateDeviceID == settings.selectedRemoteProfileID
+    }
+
+    /// 切换到另一台遥控器后，按键页必须从干净状态开始：旧编辑目标、胶囊筛选、
+    /// 方案选择、语音面板和快捷键捕获都属于上一台设备，不能带到新页面。
+    /// 设备切换后固定在页面顶部；每个遥控器独立滚动位置留待后续单独实现。
+    private func resetMappingPageForRemoteChange() {
+        model.cancelButtonGestureLearning(reason: "remote_changed")
+        loadGestureTimingDraft()
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
+        mappingEditingTarget = nil
+        mappingHoldEditingButton = nil
+        isMappingVoiceSettingsPresented = false
+        shortcutCaptureTarget = nil
+        applicationShortcutCaptureProfileID = nil
+        mappingActionFilter = .all
+        mappingMacroSearch = ""
+        mappingActionSave = .init()
+        mappingHoldSave = .init()
+        mappingProfileCreation = nil
+        shortcutCaptureFeedback = nil
+        gestureTimingSaveConfirmed = false
+        mappingContentIsScrolled = false
+        mappingEditorScrollTarget = "mapping-action-editor"
+        selectedRemoteButton = .ok
+        selectedSiriRemoteControlID = "select"
+        selectedChromecastControlID = "select"
+        // 方案属于具体设备；切换后回到基础映射，避免旧方案胶囊或作用域提示串到新设备。
+        editingMappingProfileID = nil
+    }
+
     private func presentMappingVoiceSettings() {
+        mappingPageStateDeviceID = settings.selectedRemoteProfileID
         mappingEditingTarget = nil
         mappingHoldEditingButton = nil
         shortcutCaptureTarget = nil
@@ -2134,8 +2459,32 @@ struct SettingsView: View {
     private func mappingConfiguration(for button: RemoteButton, trigger: ButtonTrigger) -> ConfiguredButtonAction {
         switch mappingDisplayConfiguration(for: button, trigger: trigger) {
         case let .explicit(value): return value.configured ?? .disabled
-        case .inherited: return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
-        case .unavailable: return .disabled
+        case .inherited, .unavailable:
+            // 失效引用在运行时回退基础映射，编辑器和按住判断必须使用同一个实际动作。
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+        }
+    }
+
+    /// 按指定方案解析动作。方案总览可能正在查看 A 方案，而按键页正在编辑 B 方案；
+    /// 任何方案作用域的摘要都必须显式传入要解析的方案。
+    private func mappingConfiguration(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?
+    ) -> ConfiguredButtonAction {
+        guard let profileID, macroFeature.supportsProfileButton(button.rawValue) else {
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+        }
+        switch macroFeature.displayProfileBinding(
+            device: settings.selectedRemoteProfileID,
+            profile: profileID,
+            button: button,
+            trigger: trigger
+        ) {
+        case let .explicit(value):
+            return (value.configured ?? .disabled).normalizedForExecution
+        case .inherited, .unavailable:
+            return settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
         }
     }
 
@@ -2144,7 +2493,9 @@ struct SettingsView: View {
         switch mappingDisplayConfiguration(for: button, trigger: trigger) {
         case let .explicit(value): return value.isEditable
         case .inherited: return true
-        case .unavailable: return false
+        // A stale reference must be replaceable without clearing it first. The
+        // write goes through the same profile API as any other explicit value.
+        case .unavailable: return true
         }
     }
 
@@ -2232,6 +2583,34 @@ struct SettingsView: View {
         profileScopeItems
             .map { $0.displayName(using: localization) }
             .joined(separator: localization.text("common.list.separator"))
+    }
+
+    /// 当前方案里已存在原始绑定、但引用目标无法解析的按键手势。
+    /// 只有原始绑定存在时才允许批量清理；整份方案读取失败或组件不可用不能被误报成“失效覆盖”。
+    private var unavailableProfileBindings: [(button: RemoteButton, trigger: ButtonTrigger)] {
+        #if canImport(SayAllButtonProfiles) && SAYALL_UNIFIED_BUTTON_CONFIGURATION
+        guard let profile = editingMappingProfileID else { return [] }
+        return RemoteButton.allCases
+            .filter { macroFeature.supportsProfileButton($0.rawValue) }
+            .flatMap { button in
+                ButtonTrigger.allCases.compactMap { trigger in
+                    guard macroFeature.rawProfileBinding(
+                        device: settings.selectedRemoteProfileID,
+                        profile: profile,
+                        button: button,
+                        trigger: trigger
+                    ) != nil,
+                        case .unavailable = mappingDisplayConfiguration(
+                            for: button,
+                            trigger: trigger
+                        )
+                    else { return nil }
+                    return (button, trigger)
+                }
+            }
+        #else
+        return []
+        #endif
     }
 
     #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
@@ -2616,7 +2995,6 @@ struct SettingsView: View {
                     "MEMBERSHIP ENTRY source=mapping_profile_toolbar state=\(editingMappingProfileID == nil ? "create" : "copy") phase=requested result=requested"
                 )
                 selectedSection = .membership
-                membershipFeature.refreshIfNeeded()
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "crown.fill")
@@ -2746,8 +3124,12 @@ struct SettingsView: View {
                 holdSummary: { button in mappingHoldSummary(for: button) },
                 actionDetail: { button, trigger in mappingActionDetail(for: button, trigger: trigger) },
                 actionSource: { button, trigger in mappingActionSource(for: button, trigger: trigger) },
+                actionConfigured: { button, trigger in
+                    mappingActionIsConfigured(for: button, trigger: trigger)
+                },
                 onEdit: { button, trigger in
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingActionFilter = mappingFilterForConfiguredAction(
                         button: button,
                         trigger: trigger
@@ -2764,6 +3146,7 @@ struct SettingsView: View {
                 },
                 onEditHold: { button in
                     selectedRemoteButton = button
+                    mappingPageStateDeviceID = settings.selectedRemoteProfileID
                     mappingEditingTarget = nil
                     shortcutCaptureTarget = nil
                     applicationShortcutCaptureProfileID = nil
@@ -2825,10 +3208,12 @@ struct SettingsView: View {
                             }
                             configurationImportBanner
                             corruptedSettingsBanner
+                            mappingProfileUnavailableBanner
 
                             hardwareCanvas()
 
-                            if let target = mappingEditingTarget {
+                            if mappingInteractionBelongsToSelectedRemote,
+                               let target = mappingEditingTarget {
                                 // 分类胶囊和语音键、按键速度两块全局面板都不属于某一颗按键，
                                 // 因此放在编辑面板外面：胶囊在上，全局面板在面板之后。
                                 VStack(alignment: .leading, spacing: 16) {
@@ -2850,14 +3235,16 @@ struct SettingsView: View {
                                             .id("mapping-button-speed-tab")
                                     }
                                 }
-                            } else if let button = mappingHoldEditingButton {
+                            } else if mappingInteractionBelongsToSelectedRemote,
+                                      let button = mappingHoldEditingButton {
                                 mappingHoldEditorPanel(button)
                                     .id("mapping-hold-editor")
                             }
 
                             // 语音键的设置只在点击语音键之后出现，而且是页面上唯一的编辑面板：
                             // 选普通按键会收起它，点它会收起普通按键的编辑器。
-                            if isMappingVoiceSettingsPresented {
+                            if mappingInteractionBelongsToSelectedRemote,
+                               isMappingVoiceSettingsPresented {
                                 mappingVoiceSettingsPanel(includeSiriScrollArrow: includeSiriScrollArrow)
                                     .id("mapping-voice-settings")
                             }
@@ -2887,19 +3274,6 @@ struct SettingsView: View {
                     .id(settings.selectedRemoteProfileID)
                     .compatibilityScrollEdgeEffect()
                 }
-                .onChange(of: settings.selectedRemoteProfileID) { _ in
-                    model.cancelButtonGestureLearning(reason: "remote_changed")
-                    loadGestureTimingDraft()
-                    // 编辑器属于上一只遥控器；切换设备后不得把旧编辑区带到新页面。
-                    mappingEditingTarget = nil
-                    mappingHoldEditingButton = nil
-                    isMappingVoiceSettingsPresented = false
-                    shortcutCaptureTarget = nil
-                    applicationShortcutCaptureProfileID = nil
-                    DispatchQueue.main.async {
-                        proxy.scrollTo("mapping-page-top", anchor: .top)
-                    }
-                }
                 .onChange(of: settings.selectedRemoteProfile?.model) { _ in
                     model.cancelButtonGestureLearning(reason: "remote_model_changed")
                     loadGestureTimingDraft()
@@ -2911,22 +3285,23 @@ struct SettingsView: View {
                             proxy.scrollTo("mapping-gesture-timing", anchor: .top)
                         }
                     }
-                    guard mappingEditingTarget != nil
-                        || mappingHoldEditingButton != nil
-                        || isMappingVoiceSettingsPresented
-                    else { return }
-                    // The hold editor has its own anchor; scrolling to the action editor
-                    // would land on the page top when only the hold editor is open.
-                    let anchor = isMappingVoiceSettingsPresented
+                    // 只恢复属于当前遥控器的编辑区。跨型号切换时旧状态可能还没被父层清理，
+                    // 设备标识会先把它挡在布局和滚动之外，避免“先到顶部再滚下去”。
+                    guard mappingInteractionBelongsToSelectedRemote else { return }
+                    let wantsVoice = isMappingVoiceSettingsPresented
+                    let wantsAction = mappingEditingTarget != nil
+                    let wantsHold = mappingHoldEditingButton != nil
+                    guard wantsVoice || wantsAction || wantsHold else { return }
+                    let anchor = wantsVoice
                         ? "mapping-voice-settings"
-                        : (mappingEditingTarget == nil ? "mapping-hold-editor" : "mapping-action-filter")
+                        : (wantsAction ? "mapping-action-filter" : "mapping-hold-editor")
                     DispatchQueue.main.async {
                         proxy.scrollTo(anchor, anchor: .top)
                     }
                 }
                 .onChange(of: mappingEditingTarget?.id) { targetID in
                     mappingActionSave = .init()
-                    guard targetID != nil else { return }
+                    guard targetID != nil, mappingInteractionBelongsToSelectedRemote else { return }
                     isMappingVoiceSettingsPresented = false
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -2937,7 +3312,7 @@ struct SettingsView: View {
                 }
                 .onChange(of: mappingHoldEditingButton?.rawValue) { buttonID in
                     clearMappingHoldFeedbackForChangedButton()
-                    guard buttonID != nil else { return }
+                    guard buttonID != nil, mappingInteractionBelongsToSelectedRemote else { return }
                     isMappingVoiceSettingsPresented = false
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -2961,6 +3336,7 @@ struct SettingsView: View {
                     }
                 }
                 .onChange(of: mappingVoiceSettingsRequest) { _ in
+                    guard mappingInteractionBelongsToSelectedRemote else { return }
                     // 面板是这一刻才插进视图树的，锚点要等下一轮布局完成才可滚动。
                     DispatchQueue.main.async {
                         withAnimation(.easeInOut(duration: 0.25)) {
@@ -3070,6 +3446,45 @@ struct SettingsView: View {
         }
     }
 
+    /// 方案覆盖引用的快捷键/动作已不存在时，页面必须明确指出并给出批量恢复入口。
+    /// 执行路径已经回退基础映射，这里不能继续用笼统的「配置不可用」让用户以为整颗键失效。
+    @ViewBuilder
+    private var mappingProfileUnavailableBanner: some View {
+        let bindings = unavailableProfileBindings
+        if !bindings.isEmpty {
+            GlassPanel {
+                HStack(alignment: .top, spacing: 11) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.orange)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(String(
+                            format: localization.text("button_mapping.profile_unavailable.title"),
+                            bindings.count
+                        ))
+                        .font(.system(size: 13, weight: .semibold))
+                        Text(localization.text("button_mapping.profile_unavailable.detail"))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if !isMappingProfilePreviewOnly {
+                        Button {
+                            clearUnavailableProfileBindings(bindings)
+                        } label: {
+                            Text(localization.text("button_mapping.profile_unavailable.clear"))
+                                .font(.system(size: 12))
+                        }
+                        .compatibilityButtonStyle(.standard)
+                        .controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
     private var mappingHeaderToggle: some View {
         Toggle("button_mapping.toggle.enabled", isOn: Binding(
             get: { settings.customMappingEnabled },
@@ -3114,13 +3529,15 @@ struct SettingsView: View {
                 Text(localization.text("button_mapping.save.unknown")).foregroundStyle(.red)
                     .help(localization.text("button_mapping.save.unknown"))
             } else if unavailable {
-                Text(localization.text("button_mapping.save.unavailable")).foregroundStyle(.red)
+                // 具体原因和基础回退由下方状态行说明；标题只保留短状态，避免再次变成
+                // 一个无法定位失败的笼统「配置不可用」。
+                Text(localization.text("button_mapping.binding.unavailable_short"))
+                    .foregroundStyle(.orange)
             } else if !canWrite {
                 if editingMappingProfileID != nil && membershipCanUnlock {
                     Text(localization.text("button_mapping.save.read_only"))
                     Button(localization.text("button_mapping.save.membership")) {
                         selectedSection = .membership
-                        membershipFeature.refreshIfNeeded()
                     }.buttonStyle(.link)
                 } else if incompatible {
                     Text(localization.text("button_mapping.save.unsupported"))
@@ -3298,13 +3715,16 @@ struct SettingsView: View {
                     Divider()
                     mappingVoiceFnTapControl
                 }
-                // 触摸面（滑动箭头/光标）只有具备触摸面的遥控器才显示，页面请求之外再加一道能力门禁。
+                // 触摸面（滑动箭头/光标反馈）只有具备触摸面的遥控器才显示，页面请求之外再加一道能力门禁。
                 if TouchSurfaceControlApplicability.isApplicable(
                     capabilities: capabilities,
                     pageRequestsControl: includeSiriScrollArrow
                 ) {
                     Divider()
-                    siriRemoteScrollArrowControl
+                    HStack(alignment: .top, spacing: 28) {
+                        siriRemoteScrollArrowControl
+                        siriRemoteCursorFeedbackControl
+                    }
                 }
                 HStack {
                     Spacer(minLength: 0)
@@ -3315,18 +3735,55 @@ struct SettingsView: View {
     }
 
     private var siriRemoteScrollArrowControl: some View {
-        Toggle(isOn: $settings.siriRemoteScrollArrowReversed) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(localization.text("siri_remote.scroll_arrow.reverse.title"))
-                    .font(.system(size: 13, weight: .medium))
-                Text(localization.text("siri_remote.scroll_arrow.reverse.detail"))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        siriRemoteTouchToggle(
+            icon: "arrow.up.arrow.down",
+            titleKey: "siri_remote.scroll_arrow.reverse.title",
+            detailKey: "siri_remote.scroll_arrow.reverse.detail",
+            helpKey: "siri_remote.scroll_arrow.reverse.help",
+            isOn: $settings.siriRemoteScrollArrowReversed
+        )
+    }
+
+    private var siriRemoteCursorFeedbackControl: some View {
+        siriRemoteTouchToggle(
+            icon: "computermouse",
+            titleKey: "siri_remote.cursor_feedback.visible.title",
+            detailKey: "siri_remote.cursor_feedback.visible.detail",
+            helpKey: "siri_remote.cursor_feedback.visible.help",
+            isOn: Binding(
+                get: { settings.siriRemoteCursorFeedbackVisible },
+                set: { model.setSiriRemoteCursorFeedbackVisible($0) }
+            )
+        )
+    }
+
+    private func siriRemoteTouchToggle(
+        icon: String,
+        titleKey: String,
+        detailKey: String,
+        helpKey: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: isOn) {
+                Label {
+                    Text(localization.text(titleKey))
+                        .font(.system(size: 13, weight: .medium))
+                } icon: {
+                    Image(systemName: icon)
+                        .frame(width: 18, height: 18)
+                        .foregroundStyle(Color.accentColor)
+                }
             }
+            .toggleStyle(.switch)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(localization.text(helpKey))
+            Text(localization.text(detailKey))
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .toggleStyle(.switch)
-        .help(localization.text("siri_remote.scroll_arrow.reverse.help"))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var mappingVoiceKeyModeControl: some View {
@@ -3413,12 +3870,10 @@ struct SettingsView: View {
         let visibleProfiles = RemoteDeviceNamePolicy.cardsWithoutRepeatedSerial(
             RemoteDeviceNamePolicy.sortedForCards(
                 settings.remoteDeviceProfiles.filter { profile in
-                    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-                    // Keep the activation entry available while the Apple adapter is stopped.
-                    model.isRemoteConnected(profile.id) || profile.model.isAppleSiriRemote
-                    #else
+                    // 私有遥控器离线时仍保留在按键页选择器中：画布不依赖蓝牙连接，
+                    // 用户从连接页选中 Chromecast 后必须能在顶部继续看到并切换回它。
                     model.isRemoteConnected(profile.id)
-                    #endif
+                        || (!vertical && profile.model.usesPrivateAdapter)
                 },
                 modelName: remoteModelName,
                 systemName: { model.systemDeviceName(for: $0) }
@@ -3432,7 +3887,7 @@ struct SettingsView: View {
         } else if vertical {
             VStack(spacing: 8) {
                 ForEach(visibleProfiles) { profile in
-                    remoteDeviceCard(profile, fillsWidth: true)
+                    remoteDeviceCard(profile)
                 }
             }
         } else {
@@ -3561,222 +4016,57 @@ struct SettingsView: View {
 
     private func remoteDeviceCard(
         _ profile: RemoteDeviceProfile,
-        fillsWidth: Bool = false
+        history: Bool = false
     ) -> some View {
-        let selected = settings.selectedRemoteProfileID == profile.id
         let connected = model.isRemoteConnected(profile.id)
-        let batteryLevel = model.batteryLevel(for: profile.id)
-        let powerState = model.powerState(for: profile.id)
-        let modelName = remoteModelName(profile)
-        let systemName = remoteSystemName(profile)
-        let showsBattery = RemoteBatteryPresentationPolicy.shouldShowBattery(
-            model: profile.model,
-            level: batteryLevel,
-            powerState: powerState
+        let status = model.remoteCardStatus(for: profile, history: history)
+        let recovering = status == .connecting
+        let appleNeedsEnable = profile.model.isAppleSiriRemote && model.siriRemoteActivationNeeded
+        let canRecoverVoice = !appleNeedsEnable && model.remoteCardCanRecoverAudio(
+            for: profile,
+            status: status,
+            history: history
         )
-        let siriRemoteMembershipRequired = requiresSiriRemoteMembership(for: profile)
-        return HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 5) {
-                Button {
-                    model.noteManualRemoteProfileSelection()
-                    model.selectRemoteProfile(profile.id)
-                } label: {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(modelName)
-                            .help(modelName)
-                            .font(.system(size: 13, weight: .semibold))
-                            .lineLimit(1)
-                        Text(systemName)
-                            .help(systemName)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                .buttonStyle(.plain)
-                // 卡片行放得下时不再滚动，窗口的初始键盘焦点会落到这张标题按钮上，
-                // 画出一个只框住标题的焦点环，看起来像选中态渲染坏了。
-                // 卡片本身是点击选择的，这里不画焦点环；卡片里的其它按钮不受影响。
-                .modifier(CompatibilityFocusEffectDisabledModifier())
-                .accessibilityLabel(Text("\(modelName), \(systemName)"))
-                .accessibilityAddTraits(selected ? .isSelected : [])
-                HStack(spacing: 7) {
-                    remoteConnectionLabel(connected: connected)
-                    if showsBattery {
-                        remoteBatteryLabel(level: batteryLevel, powerState: powerState)
-                    }
-                    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-                    if profile.model.isAppleSiriRemote {
-                        // 会员入口与启用/停用都排在这一行里，卡片不额外开一列。
-                        siriRemoteCardActions(
-                            profile,
-                            showsVoiceMembershipHint: siriRemoteMembershipRequired
-                        )
-                        .fixedSize()
-                    }
-                    #endif
-                }
-                .font(.system(size: 12))
-                .lineLimit(1)
+        let level = connected ? model.batteryLevel(for: profile.id) : nil
+        let power = connected ? model.powerState(for: profile.id) : nil
+        return RemoteDeviceCard(
+            modelName: remoteModelName(profile), systemName: remoteSystemName(profile),
+            status: status,
+            statusDetail: localization.text("remote.card.detail.\(status.rawValue)"),
+            statusDisplayOverride: model.remoteCardStatusDisplayOverride(for: profile.id),
+            settlesTransientStatus: !history && !SettingsVisualRenderingPolicy.isScreenshotHarness,
+            selected: !history && settings.selectedRemoteProfileID == profile.id,
+            batteryLevel: level, powerState: power,
+            showsBattery: connected && (level != nil || power == .charging || power == .externalPower)
+                && RemoteBatteryPresentationPolicy.shouldShowBattery(model: profile.model, level: level, powerState: power),
+            enableTitle: appleNeedsEnable ? localization.text("siri_remote.activation.enable") : nil,
+            membershipTitle: requiresSiriRemoteMembership(for: profile) ? localization.text("remote.card.open_membership") : nil,
+            voiceRecoveryTitle: canRecoverVoice ? localization.text("remote.card.recover_voice") : nil,
+            voiceRecoveryHelp: canRecoverVoice ? localization.text("remote.card.recover_voice.help") : nil,
+            connectionTitle: history ? localization.text(recovering ? "connection.history.cancel" : "connection.history.connect") : nil,
+            actionsDisabled: model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote,
+            voiceRecoveryDisabled: model.isStreaming
+                || model.activePhysicalVoiceControlSource == .siriRemote
+                || model.isRemoteVoiceRecoveryInFlight,
+            connectionDisabled: !recovering && !model.canConnectRemoteProfile(profile.id),
+            onSelect: {
+                model.noteManualRemoteProfileSelection()
+                model.selectRemoteProfile(profile.id)
+            },
+            onEnable: { model.activateSiriRemoteFromCard() },
+            onMembership: {
+                selectedSection = .membership
+            },
+            onRecoverVoice: { model.recoverRemoteVoiceAudio() },
+            onConnect: {
+                if recovering { model.cancelRemoteConnection(profile.id) }
+                else { model.connectRemoteProfile(profile.id) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .frame(
-            width: fillsWidth ? nil : SettingsPageBehavior.mappingRemoteCardWidth,
-            alignment: .leading
         )
-        .frame(maxWidth: fillsWidth ? .infinity : nil, alignment: .leading)
-        .background {
-            // The background handles padding; foreground buttons keep their own actions.
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(selected ? Color.accentColor.opacity(0.13) : Color.primary.opacity(0.045))
-                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .onTapGesture {
-                    model.noteManualRemoteProfileSelection()
-                    model.selectRemoteProfile(profile.id)
-                }
-                .accessibilityHidden(true)
-        }
-        .overlay {
-            // 卡片行在放不下时会横向滚动，卡片贴着滚动容器的左边缘；
-            // `.stroke` 有一半在形状外，会被裁成半条边，改用画在内侧的 `strokeBorder`。
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(selected ? Color.accentColor.opacity(0.65) : Color.secondary.opacity(0.18))
-                .allowsHitTesting(false)
-        }
     }
 
-    /// 苹果遥控器只有**语音**需要会员；这里只决定是否给出「开通会员」提示，
-    /// 不再用来隐藏启用/停用，因为连接、按键与触摸都不看会员。
     private func requiresSiriRemoteMembership(for profile: RemoteDeviceProfile) -> Bool {
-        guard profile.model.isAppleSiriRemote else { return false }
-        switch membershipFeature.buttonProfilesAccessDecision {
-        case .allowed, .temporarilyOffline, .authorized:
-            return false
-        case .requiresPlus, .unavailable:
-            return true
-        }
-    }
-
-    #if SAYALL_SIRI_REMOTE_ENABLED && canImport(SayAllSiriRemote)
-    /// 第三行内联的紧凑操作：语音会员入口 + 启用/重试/准备中。
-    ///
-    /// 卡片正文固定三行（型号、系统名称、连接状态与电量），所以这些操作不再单独占一列，
-    /// 而是紧跟在连接状态与电量后面同一行显示。
-    private func siriRemoteCardActions(
-        _ profile: RemoteDeviceProfile,
-        showsVoiceMembershipHint: Bool = false
-    ) -> some View {
-        HStack(spacing: 8) {
-            if showsVoiceMembershipHint {
-                Button(localization.text("siri_remote.activation.open_membership")) {
-                    model.selectRemoteProfile(profile.id)
-                    selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .help(localization.text("siri_remote.mapping.voice.detail"))
-            }
-            if !settings.siriRemoteEnabled {
-                Button(localization.text("siri_remote.activation.enable")) {
-                    model.selectRemoteProfile(profile.id)
-                    model.setSiriRemoteEnabled(true)
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
-            } else if model.siriRemoteAudioStatus.hasPrefix("unavailable:") {
-                Button(localization.text("siri_remote.activation.retry")) {
-                    model.selectRemoteProfile(profile.id)
-                    model.prepareSiriRemoteFromUserAction()
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(Color.accentColor)
-                .disabled(model.isStreaming || model.activePhysicalVoiceControlSource == .siriRemote)
-            } else if model.siriRemoteAudioStatus != "ready" {
-                Button(localization.text("siri_remote.activation.preparing")) {}
-                    .buttonStyle(.borderless)
-                    .disabled(true)
-            }
-        }
-        .lineLimit(1)
-    }
-    #endif
-
-    private func remoteConnectionLabel(connected: Bool) -> some View {
-        Label(
-            localization.text(connected ? "common.status.connected" : "remote.device.disconnected"),
-            systemImage: "circle.fill"
-        )
-        .foregroundStyle(connected ? Color.green : Color.secondary)
-    }
-
-    private func remoteBatteryLabel(
-        level: Int?,
-        powerState: RemotePowerState?
-    ) -> some View {
-        HStack(spacing: 4) {
-            ZStack(alignment: .bottomTrailing) {
-                Image(systemName: batterySymbol(for: level))
-                    .font(.system(size: 13, weight: .medium))
-                if powerState == .charging || powerState == .externalPower {
-                    Image(systemName: "bolt.fill")
-                        .font(.system(size: 7, weight: .bold))
-                        .foregroundStyle(Color.green)
-                        .padding(2)
-                        .background(Color(nsColor: .windowBackgroundColor), in: Circle())
-                        .offset(x: 3, y: 3)
-                }
-            }
-            .frame(width: 20)
-
-            Text(level.map { "\($0)%" } ?? "—")
-        }
-        .foregroundStyle(batteryColor(for: level))
-        .help(remoteBatteryHelp(level: level, powerState: powerState))
-    }
-
-    private func batterySymbol(for level: Int?) -> String {
-        guard let level else { return "battery.0percent" }
-        switch level {
-        case 76...: return "battery.100percent"
-        case 51...: return "battery.75percent"
-        case 26...: return "battery.50percent"
-        case 11...: return "battery.25percent"
-        default: return "battery.0percent"
-        }
-    }
-
-    private func batteryColor(for level: Int?) -> Color {
-        guard let level else { return .secondary }
-        if level <= 10 { return .red }
-        if level <= 25 { return .orange }
-        return .secondary
-    }
-
-    private func remoteBatteryHelp(
-        level: Int?,
-        powerState: RemotePowerState?
-    ) -> String {
-        switch powerState {
-        case .charging:
-            return localization.text("remote.device.power.charging")
-        case .externalPower:
-            return localization.text("remote.device.power.external")
-        case .onBattery:
-            return level == nil
-                ? localization.text("remote.device.battery_unavailable")
-                : localization.text("remote.device.power.battery")
-        case .unknown:
-            return localization.text("remote.device.power.unknown")
-        case nil:
-            return level == nil
-                ? localization.text("remote.device.battery_unavailable")
-                : localization.text("remote.device.power.battery")
-        }
+        profile.model.isAppleSiriRemote && !membershipFeature.canUseSiriRemoteVoice
     }
 
     private func remoteModelName(_ profile: RemoteDeviceProfile) -> String {
@@ -3812,8 +4102,15 @@ struct SettingsView: View {
                 }
                 .font(.system(size: 12))
             case .unavailable:
-                HStack(spacing: 8) {
-                    Text(localization.text("button_mapping.save.unavailable")).foregroundStyle(.red)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(String(
+                        format: localization.text("button_mapping.binding.unavailable_detail"),
+                        baseMappingActionSummary(for: button, trigger: trigger)
+                    ))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
                     if !isMappingProfilePreviewOnly {
                         Button(localization.text("button_mapping.binding.clear_override")) {
                             clearMappingOverride(button: button, trigger: trigger)
@@ -3828,7 +4125,8 @@ struct SettingsView: View {
 
     private func explicitProfileBindingLabel(_ value: MappingBindingDisplay) -> String {
         if value.configured?.action == .disabled {
-            return localization.text("button_mapping.action.profile_disabled")
+            // 方案里的 disabled 表示“本方案不设置动作”，不是禁用按键。
+            return localization.text("button_mapping.action.profile_not_set")
         }
         guard value.isEditable, let configured = value.configured else {
             return localization.text("button_mapping.save.read_only")
@@ -3871,6 +4169,59 @@ struct SettingsView: View {
             NoticeCenter.shared.show(Notice(tier: .error, title: title))
         }
         AppLogger.shared.write("BUTTON CONFIGURATION operation_id=\(operationID) action=clear_override phase=completed result=\(String(describing: outcome)) reason=\(outcome == .saved ? "storage_confirmed" : outcome == .unknown ? "reload_failed" : "storage_failed")")
+    }
+
+    /// 一次清除当前方案里所有引用失效的覆盖。单键失败不回滚已成功项，页面按剩余数量继续提示。
+    private func clearUnavailableProfileBindings(
+        _ bindings: [(button: RemoteButton, trigger: ButtonTrigger)]
+    ) {
+        guard let profile = editingMappingProfileID, !isMappingProfilePreviewOnly else { return }
+        let operationID = UUID().uuidString
+        AppLogger.shared.write(
+            "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                "action=clear_unavailable phase=requested result=requested count=\(bindings.count)"
+        )
+        var cleared = 0
+        for item in bindings {
+            if macroFeature.writeProfileBinding(
+                nil,
+                profile: profile,
+                button: item.button,
+                trigger: item.trigger,
+                displayName: nil
+            ) {
+                cleared += 1
+            }
+        }
+        let reloaded = macroFeature.reloadMappingProfiles()
+        guard reloaded else {
+            NoticeCenter.shared.show(Notice(
+                tier: .error,
+                title: String(
+                    format: localization.text("button_mapping.profile_unavailable.reload_failed"),
+                    cleared
+                )
+            ))
+            AppLogger.shared.write(
+                "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                    "action=clear_unavailable phase=completed result=unknown " +
+                    "reason=reload_failed cleared=\(cleared)"
+            )
+            return
+        }
+        let remaining = unavailableProfileBindings.count
+        let titleKey = remaining == 0
+            ? "button_mapping.profile_unavailable.cleared"
+            : "button_mapping.profile_unavailable.clear_failed"
+        NoticeCenter.shared.show(Notice(
+            tier: remaining == 0 ? .tip : .error,
+            title: String(format: localization.text(titleKey), cleared)
+        ))
+        AppLogger.shared.write(
+            "BUTTON PROFILE REPAIR operation_id=\(operationID) scope=profile " +
+                "action=clear_unavailable phase=completed result=" +
+                "\(remaining == 0 ? "cleared" : "partial") cleared=\(cleared) remaining=\(remaining)"
+        )
     }
 
     private func mappingTriggerEditor(
@@ -4025,8 +4376,7 @@ struct SettingsView: View {
         if let profile = editingMappingProfileID, macroFeature.supportsProfileButton(button.rawValue) {
             switch macroFeature.displayProfileHoldMode(profile: profile, button: button) {
             case let .explicit(mode): return mode
-            case .unavailable: return .once
-            case .inherited: break
+            case .unavailable, .inherited: break
             }
         }
         return settings.interactionSettings.mode(for: button) ?? .once
@@ -4042,8 +4392,7 @@ struct SettingsView: View {
         if let profileID, macroFeature.supportsProfileButton(button.rawValue) {
             switch macroFeature.displayProfileHoldMode(profile: profileID, button: button) {
             case let .explicit(value): mode = value
-            case .inherited: mode = settings.interactionSettings.mode(for: button)
-            case .unavailable: return localization.text("button_mapping.save.unavailable")
+            case .unavailable, .inherited: mode = settings.interactionSettings.mode(for: button)
             }
         } else { mode = settings.interactionSettings.mode(for: button) }
         guard let mode, mode != .once else {
@@ -4059,18 +4408,76 @@ struct SettingsView: View {
         case .repeatSingle, .once: "button_mapping.hold.repeat_prefix"
         }
         return localization.text(prefixKey) +
-            mappingHoldActionSummary(for: button, trigger: trigger)
+            mappingHoldActionSummary(for: button, trigger: trigger, profileID: profileID)
+    }
+
+    /// 方案页正在查看的方案可能与按键页正在编辑的方案不同。
+    /// 按住标签的模式和动作都必须按传入的方案解析。
+    private func profileHoldPresentation(
+        for button: RemoteButton,
+        profileID: UUID
+    ) -> ProfileHoldPresentation? {
+        ProfileHoldPresentationResolver.resolve(
+            button: button,
+            profileID: profileID,
+            profileMode: { profile, button in
+                macroFeature.displayProfileHoldMode(profile: profile, button: button)
+            },
+            baseMode: { button in
+                settings.interactionSettings.mode(for: button)
+            },
+            profileAction: { profile, button, trigger in
+                mappingConfiguration(for: button, trigger: trigger, profileID: profile)
+            },
+            baseAction: { button, trigger in
+                settings.configuredBaseAction(for: button, trigger: trigger).normalizedForExecution
+            }
+        )
+    }
+
+    private func profileHoldSummary(for button: RemoteButton, profileID: UUID) -> String {
+        guard let presentation = profileHoldPresentation(for: button, profileID: profileID) else {
+            return ""
+        }
+        return presentation.summary(
+            actionSummary: { configured in
+                if configured.action == .disabled {
+                    return localization.text("button_mapping.action.profile_not_set")
+                }
+                return holdActionSummary(configured)
+            },
+            text: { localization.text($0) }
+        )
+    }
+
+    private func profileHoldMode(for button: RemoteButton, profileID: UUID) -> String? {
+        profileHoldPresentation(for: button, profileID: profileID)?.rawMode
     }
 
     /// 按住提示里的动作摘要：方向类动作统一用符号，不再随宽度在「方向左 / ←」之间摇摆。
     private func mappingHoldActionSummary(for button: RemoteButton, trigger: ButtonTrigger) -> String {
-        let configured = mappingConfiguration(for: button, trigger: trigger)
+        mappingHoldActionSummary(
+            for: button,
+            trigger: trigger,
+            profileID: editingMappingProfileID
+        )
+    }
+
+    private func mappingHoldActionSummary(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID?
+    ) -> String {
+        holdActionSummary(mappingConfiguration(for: button, trigger: trigger, profileID: profileID))
+    }
+
+    private func holdActionSummary(_ configured: ConfiguredButtonAction) -> String {
         switch configured.action {
         case .arrowUp: return "↑"
         case .arrowDown: return "↓"
         case .arrowLeft: return "←"
         case .arrowRight: return "→"
-        default: return mappingActionSummary(for: button, trigger: trigger)
+        default: return actionSummary(configured)
         }
     }
 
@@ -4887,7 +5294,6 @@ struct SettingsView: View {
             if !membershipFeature.canUseCommonPhrases {
                 membershipFeature.membershipRequiredView {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
                 .frame(minWidth: 170)
                 .accessibilityIdentifier("common-phrases-membership")
@@ -4898,7 +5304,6 @@ struct SettingsView: View {
                     selectedSection = .commonPhrases
                 } else {
                     selectedSection = .membership
-                    membershipFeature.refreshIfNeeded()
                 }
             } label: {
                 mappingActionLabel(
@@ -6592,14 +6997,18 @@ struct SettingsView: View {
             case let .explicit(value):
                 if let configured = value.configured {
                     if configured.action == .disabled {
-                        return localization.text("button_mapping.action.profile_disabled")
+                        // 方案里的 disabled 是“未设置动作”，不是禁用按键。
+                        return localization.text("button_mapping.action.profile_not_set")
                     }
                     // 卡片宽度固定：显式动作只显示动作名，来源在编辑区头部
                     // 用「本方案 · <动作>」完整呈现，避免长动作名被前缀挤掉。
                     return profileActionSummary(configured)
                 }
                 return value.compact
-            case .unavailable: return localization.text("button_mapping.save.unavailable")
+            case .unavailable:
+                // 失效引用在执行路径回退基础映射；卡片显示实际会执行的动作，
+                // 由右上角警告图标和悬停详情说明来源，而不是让整格看起来不可用。
+                return baseMappingActionSummary(for: button, trigger: trigger)
             case .inherited:
                 // 窄卡片不拼接「默认 ·」文字前缀：英文会把动作名挤成
                 // 「Default · No…」。来源由卡片上的链接图标和悬停帮助表达。
@@ -6642,6 +7051,14 @@ struct SettingsView: View {
         )
     }
 
+    /// 失效引用显示的虽然是可执行的基础动作，但来源仍是警告态，不能和显式配置同样使用主题色。
+    private func mappingActionIsConfigured(for button: RemoteButton, trigger: ButtonTrigger) -> Bool {
+        if case .unavailable = mappingDisplayConfiguration(for: button, trigger: trigger) {
+            return false
+        }
+        return mappingConfiguration(for: button, trigger: trigger).action != .disabled
+    }
+
     /// 悬停用的完整形态，和 `mappingActionSummary` 同一来源。
     private func mappingActionSource(for button: RemoteButton,
                                      trigger: ButtonTrigger) -> RemoteMappingActionSource {
@@ -6665,6 +7082,9 @@ struct SettingsView: View {
                     baseMappingActionSummary(for: button, trigger: trigger)
             case let .explicit(value):
                 guard let configured = value.configured else { return value.detailed }
+                if configured.action == .disabled {
+                    return localization.text("button_mapping.action.profile_not_set")
+                }
                 let summary = profileActionSummary(configured)
                 let source = String(
                     format: localization.text("button_mapping.source.profile"),
@@ -6673,7 +7093,10 @@ struct SettingsView: View {
                 return value.detailed.isEmpty || value.detailed == summary
                     ? source : source + " · " + value.detailed
             case .unavailable:
-                return localization.text("button_mapping.save.unavailable")
+                return String(
+                    format: localization.text("button_mapping.binding.unavailable_detail"),
+                    baseMappingActionSummary(for: button, trigger: trigger)
+                )
             }
         }
         if case let .explicit(value) = display {
@@ -8463,7 +8886,7 @@ private struct ShortcutCaptureView: NSViewRepresentable {
     }
 }
 
-private enum CompatibilityButtonStyle {
+enum CompatibilityButtonStyle {
     case standard
     case prominent
 }
@@ -8497,7 +8920,7 @@ private struct CompatibilityGlassContainer<Content: View>: View {
     }
 }
 
-private struct CompatibilityButtonStyleModifier: ViewModifier {
+struct CompatibilityButtonStyleModifier: ViewModifier {
     let style: CompatibilityButtonStyle
 
     @ViewBuilder
@@ -8531,7 +8954,7 @@ private struct CompatibilityScrollEdgeEffectModifier: ViewModifier {
     }
 }
 
-private struct CompatibilityFocusEffectDisabledModifier: ViewModifier {
+struct CompatibilityFocusEffectDisabledModifier: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if #available(macOS 14.0, *) {
@@ -8581,11 +9004,13 @@ private struct CompatibilityTintedGlassModifier<GlassShape: Shape>: ViewModifier
     }
 }
 
-private extension View {
+extension View {
     func compatibilityButtonStyle(_ style: CompatibilityButtonStyle) -> some View {
         modifier(CompatibilityButtonStyleModifier(style: style))
     }
+}
 
+private extension View {
     func compatibilityScrollEdgeEffect() -> some View {
         modifier(CompatibilityScrollEdgeEffectModifier())
     }

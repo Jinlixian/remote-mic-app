@@ -161,13 +161,16 @@ enum RemoteMicApp {
         }
         let bundleIdentifier = Bundle.main.bundleIdentifier
             ?? ApplicationInstanceGuard.fallbackBundleIdentifier
-        let existingInstances = NSRunningApplication.runningApplications(
+        // runningApplications includes this process; expose the other-instance count
+        // explicitly so a normal existing_instances=1 is not mistaken for a duplicate.
+        let runningInstances = NSRunningApplication.runningApplications(
             withBundleIdentifier: bundleIdentifier
         ).count
+        let otherInstances = max(0, runningInstances - 1)
         AppLogger.shared.write(
             "APP INSTANCE phase=launch bundle_id=\(bundleIdentifier) " +
                 "pid=\(ProcessInfo.processInfo.processIdentifier) " +
-                "existing_instances=\(existingInstances)"
+                "existing_instances=\(runningInstances) other_instances=\(otherInstances)"
         )
         var instanceLock: ApplicationInstanceLock?
         if let lockURL = ApplicationInstanceGuard.defaultLockURL() {
@@ -289,6 +292,15 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         ).publicEvent {
             AppLogger.shared.record(environmentEvent)
         }
+        let accessibilityGranted = KeyboardInjector.isAccessibilityTrusted
+        let inputMonitoringGranted = HIDRemoteMonitor.isInputMonitoringGranted
+        FnKeyDiagnostics.logSnapshot(
+            source: "launch",
+            voiceKeyMode: model.settings.voiceKeyMode.rawValue,
+            voiceFnTap: model.settings.voiceFnTapModeEnabled,
+            voiceTool: model.settings.onboardingVoiceTool.rawValue,
+            accessibilityGranted: accessibilityGranted
+        )
         let currentBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
         let completedUpdate = model.settings.recordLaunchAndDetectCompletedUpdate(
             currentBuild: currentBuild,
@@ -310,7 +322,6 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         installWorkspaceAudioLifecycleObservers()
         model.privateFeature.refreshAccessIfNeeded()
         model.macroFeature.refreshAccessIfNeeded()
-        model.membershipFeature.refreshIfNeeded()
         if OnboardingLaunchPolicy.shouldStartRuntime(
             isComplete: model.settings.isOnboardingComplete,
             step: model.settings.onboardingStep
@@ -328,14 +339,14 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
             isOnboardingComplete: model.settings.isOnboardingComplete,
             completedUpdate: completedUpdate,
             bluetoothGranted: CBManager.authorization == .allowedAlways,
-            inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
-            accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
+            inputMonitoringGranted: inputMonitoringGranted,
+            accessibilityGranted: accessibilityGranted
         )
         if shouldOpenPermissionRepair {
             AppLogger.shared.write(
                 "UPDATE PERMISSION_REPAIR bluetooth=\(CBManager.authorization == .allowedAlways) " +
-                    "input=\(HIDRemoteMonitor.isInputMonitoringGranted) " +
-                    "accessibility=\(KeyboardInjector.isAccessibilityTrusted)"
+                    "input=\(inputMonitoringGranted) " +
+                    "accessibility=\(accessibilityGranted)"
             )
         }
         refreshMenuStatus()
@@ -371,8 +382,23 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        let accessibilityGranted = KeyboardInjector.isAccessibilityTrusted
+        FnKeyDiagnostics.logSnapshot(
+            source: "terminate_begin",
+            voiceKeyMode: model.settings.voiceKeyMode.rawValue,
+            voiceFnTap: model.settings.voiceFnTapModeEnabled,
+            voiceTool: model.settings.onboardingVoiceTool.rawValue,
+            accessibilityGranted: accessibilityGranted
+        )
         model.privateFeature.hideHUDImmediately()
         model.stop()
+        FnKeyDiagnostics.logSnapshot(
+            source: "terminate_end",
+            voiceKeyMode: model.settings.voiceKeyMode.rawValue,
+            voiceFnTap: model.settings.voiceFnTapModeEnabled,
+            voiceTool: model.settings.onboardingVoiceTool.rawValue,
+            accessibilityGranted: accessibilityGranted
+        )
         model.settings.discardOnboardingVoiceTrial()
         updateCheckTask?.cancel()
         terminationSignalSources.forEach { $0.cancel() }
@@ -389,10 +415,10 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        model.refreshRemoteDiscovery()
         model.refreshRemoteDeviceNames(reason: .foreground)
         model.privateFeature.refreshAccessIfNeeded()
         model.macroFeature.refreshAccessIfNeeded()
-        model.membershipFeature.refreshIfNeeded()
         model.refreshHIDAfterPermissionChange()
     }
 
@@ -471,7 +497,6 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
                     if event == .systemDidWake {
                         self.model.privateFeature.refreshAccessIfNeeded()
                         self.model.macroFeature.refreshAccessIfNeeded()
-                        self.model.membershipFeature.refreshIfNeeded()
                     }
                 }
             }

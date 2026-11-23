@@ -161,11 +161,23 @@ enum OnboardingScreenshotRenderer {
             )
             settings.updateRemoteProfileModel(profileID, model: remoteModel)
             settings.selectRemoteProfile(profileID)
+            if let onboardingModel = OnboardingXiaomiRemoteModel(rawValue: remoteModel.rawValue) {
+                settings.setOnboardingXiaomiRemoteModel(onboardingModel, source: "screenshot")
+            }
         }
         if controlSource == .siriRemote {
             settings.setOnboardingAppleRemoteGeneration(
                 requestedAppleRemoteGeneration ?? .generation7
             )
+        }
+        if controlSource == .xiaomiRemote {
+            if ProcessInfo.processInfo.environment[
+                "REMOTE_MIC_ONBOARDING_SCREENSHOT_XIAOMI_MODEL"
+            ] == "none" {
+                settings.setOnboardingXiaomiRemoteModel(nil)
+            } else if settings.onboardingXiaomiRemoteModel == nil {
+                settings.setOnboardingXiaomiRemoteModel(.rc003, source: "screenshot_default")
+            }
         }
         let screenshotAudioName = ProcessInfo.processInfo.environment[
             "REMOTE_MIC_ONBOARDING_SCREENSHOT_AUDIO_NAME"
@@ -235,6 +247,9 @@ enum OnboardingScreenshotRenderer {
                 remoteInputDiagnosticOverride: remoteInputDiagnostic,
                 siriRemotePackageInstalledOverride: ProcessInfo.processInfo.environment[
                     "REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_REMOTE_INSTALLED"
+                ].map { $0 == "1" },
+                siriRemoteComponentInstalledOverride: ProcessInfo.processInfo.environment[
+                    "REMOTE_MIC_ONBOARDING_SCREENSHOT_SIRI_COMPONENT_INSTALLED"
                 ].map { $0 == "1" },
                 // 离屏渲染没有前台会话，周期权限刷新照常执行，保持与生产一致的状态。
                 permissionRefreshInForegroundOverride: true,

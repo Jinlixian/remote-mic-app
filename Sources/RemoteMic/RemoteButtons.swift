@@ -859,6 +859,23 @@ struct CustomApplicationProfile: Codable, Equatable, Identifiable {
     }
 }
 
+enum CustomApplicationLaunchPlan: Equatable {
+    case open(focusAllowed: Bool)
+    case unavailable
+
+    static func resolve(
+        profile: CustomApplicationProfile?,
+        requiresVerification: Bool,
+        applicationURL: URL?
+    ) -> Self {
+        guard profile != nil, applicationURL != nil else { return .unavailable }
+        // The portable-import marker protects the unverified focus target. It
+        // must not block opening the app; skip the automatic focus until the
+        // user verifies it.
+        return .open(focusAllowed: !requiresVerification)
+    }
+}
+
 enum ApplicationFocusStrategy: Equatable {
     case accessibilityComposer
     case cmuxSurfaceAPI
@@ -1042,6 +1059,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
     case scrollDown
     case pageUp
     case pageDown
+    case pageUpHalf
+    case pageDownHalf
     case scrollToTop
     case scrollToBottom
     case deleteBackward
@@ -1123,6 +1142,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
         case .scrollDown: return localization.text("action.scroll_down")
         case .pageUp: return localization.text("action.page_up")
         case .pageDown: return localization.text("action.page_down")
+        case .pageUpHalf: return localization.text("action.page_up_half")
+        case .pageDownHalf: return localization.text("action.page_down_half")
         case .scrollToTop: return localization.text("action.scroll_to_top")
         case .scrollToBottom: return localization.text("action.scroll_to_bottom")
         case .deleteBackward: return localization.text("action.delete_backspace")
@@ -1316,7 +1337,8 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
              .commandMinimize, .toggleFullScreen, .commandNewTab, .commandPreviousTab,
              .commandNextTab, .commandNextWindow, .commandHide, .commandNew,
              .arrowUp, .arrowDown, .arrowLeft, .arrowRight, .scrollUp, .scrollDown,
-             .pageUp, .pageDown, .scrollToTop, .scrollToBottom, .deleteBackward:
+             .pageUp, .pageDown, .pageUpHalf, .pageDownHalf,
+             .scrollToTop, .scrollToBottom, .deleteBackward:
             return .basicKeys
         case .showDesktop, .contextMenu, .appSwitcher, .missionControl, .applicationWindows,
              .spaceLeft, .spaceRight, .lockScreen, .screenshot,
@@ -1388,7 +1410,7 @@ enum ButtonAction: String, CaseIterable, Codable, Identifiable {
 
     /// 翻页要靠辅助功能扫描滚动容器，比行滚动贵得多；按住重复时按更长的间隔执行。
     var isPageScroll: Bool {
-        self == .pageUp || self == .pageDown
+        [.pageUp, .pageDown, .pageUpHalf, .pageDownHalf].contains(self)
     }
 
     var isDirectionalOrDeleteBackward: Bool {
