@@ -5,9 +5,15 @@
 ```governance-policy
 G-DOC.entry=DOCUMENTATION.md
 G-DOC.authority=chinese
+G-WORK.branch=every-task-wt
+G-WORK.main-worktree=read-only-sync
 ```
 
 - 本文件只定义全仓不可绕过的治理门禁和各专项规范的入口，不替代专项文件中的完整步骤。
+- **任何任务都必须使用 Worktrunk 创建独立分支和持久化 worktree，并在该分支中完成新建、运行和修改。** 这里的新建包括代码、测试、文档、配置、规范、调查记录和其他文件；功能、Bug、发布准备、治理变更和临时诊断均不例外。先执行 `git fetch origin main`，再用 `wt switch --create <任务分支> --base origin/main` 从当时最新的主线创建；不得使用会在仓库旁生成兄弟目录的 `git worktree add`。`main` 工作区只用于同步 `origin/main` 和只读检查，不直接创建、编辑、运行或测试任务内容。
+- Worktrunk 使用现有用户级配置 `worktree-path = "~/worktrees/{{ repo }}/{{ branch | sanitize }}"`，任务 worktree 统一位于 `~/worktrees/remote-mic-app/<分支名>/`；不得把新任务 worktree 放在仓库旁的兄弟目录或用 `--path` 绕过集中目录。自动化 Agent 开始任何任务前先识别当前 worktree、分支和未提交改动；发现当前位于 `main` 时，先按 [`BRANCH_MANAGEMENT.md`](BRANCH_MANAGEMENT.md) 建立任务分支并切换过去。唯一的分支复用例外是同一已批准工作项继续在既有任务分支上修改，以及 `BRANCH_MANAGEMENT.md` 明确规定的 `codex/todo_list` 和 Hotfix 流程；不得借复用例外把无关工作或主工作区当基线。
+- 分支创建后，所有命令的工作目录都必须是该任务 worktree。构建、测试、脚本、截图和本地安装等运行活动不得写入 `main` 工作区；确需在仓库外保存运行产物时，记录路径和用途，不得把临时工具入库。
+- 任务完成只由维护者确认；在明确确认前，不合并、不清理、不删除 worktree 或分支，也不还原工作区中的待验收现场。
 - 分支、worktree、提交、PR 与合并以 [`BRANCH_MANAGEMENT.md`](BRANCH_MANAGEMENT.md) 为唯一流程规范；新功能开发以 [`FEATURE_DEVELOPMENT.md`](FEATURE_DEVELOPMENT.md) 为流程入口；文件命名、日志、发布和 macOS 设计分别以 [`FILE_NAMING.md`](FILE_NAMING.md)、[`LOGGING.md`](LOGGING.md)、[`RELEASING.md`](RELEASING.md) 和中文 [`design-qa.md`](design-qa.md) 为专项权威。
 - 功能目录中的 `PRODUCT_SPEC.md` 定义该功能的产品行为，平台附件只能映射平台差异。跨硬件共同语义由 [`Testing/HardwareCompatibilityContract.md`](Testing/HardwareCompatibilityContract.md) 和 [`Testing/HardwareVoiceAudioContract.md`](Testing/HardwareVoiceAudioContract.md) 定义：前者拥有设备身份、能力、按键与触摸等一致性边界，后者拥有语音音频低延迟、完整性和会话隔离边界；它们不能覆盖具体功能流程，也不能被普通测试手册降低。
 - 除上述两份跨平台合同外，根目录 `Testing/` 手册只定义验证方法和通过/失败证据，不得反向新增、覆盖或降低产品规则。`TODO.md`、`Bugs/`、功能 README、`feature/*/development.md`、`feature/*/testing.md` 以及带日期、版本号或候选分支的段落属于计划或历史证据，不是现行规范；它们与权威规范冲突时必须更新或明确标记为历史，不得据此改变产品行为。

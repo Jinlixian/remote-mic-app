@@ -2,9 +2,7 @@ name: Update Star History
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "23 * * * *"
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 concurrency:
   group: update-star-history
   cancel-in-progress: false

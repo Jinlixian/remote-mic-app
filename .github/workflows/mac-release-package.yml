@@ -26,7 +26,7 @@ on:
         required: false
         default: false
         type: boolean
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 concurrency:
   group: mac-release-staging-${{ inputs.mode }}-${{ inputs.expected_commit }}
   cancel-in-progress: false

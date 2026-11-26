@@ -3,9 +3,8 @@ name: SayAll Agent Cancel
 run-name: SayAll Agent cancel ${{ github.event.client_payload.run_id || github.run_id }}
 
 on:
-  repository_dispatch:
-    types: [sayall-agent-cancel]
-
+  workflow_dispatch:
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions: {}
 
 jobs:

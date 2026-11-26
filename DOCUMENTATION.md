@@ -5,9 +5,10 @@
 ## AI 与开发者阅读顺序
 
 1. 先完整阅读 [`AGENTS.md`](AGENTS.md)，确认当前任务适用的硬门禁和规范入口。
-2. 涉及分支、worktree、提交、PR 或合并时，阅读 [`BRANCH_MANAGEMENT.md`](BRANCH_MANAGEMENT.md)。
-3. 开发新功能时，阅读 [`FEATURE_DEVELOPMENT.md`](FEATURE_DEVELOPMENT.md) 和目标功能目录中的 `PRODUCT_SPEC.md`。
-4. 根据任务范围继续读取下方对应的专项规范、平台附件、测试手册或历史记录；不要把历史记录当成现行规则。
+2. 开始任何任务时，先用 `git fetch origin main` 同步基线，再用 `wt switch --create <任务分支> --base origin/main` 创建 Worktrunk 分支和 worktree；worktree 位于 `~/worktrees/remote-mic-app/<分支名>/`。新建、运行和修改都留在任务 worktree 中，`main` 主工作区只做同步和只读检查。
+3. 涉及分支、worktree、提交、PR 或合并时，阅读 [`BRANCH_MANAGEMENT.md`](BRANCH_MANAGEMENT.md)。
+4. 开发新功能时，阅读 [`FEATURE_DEVELOPMENT.md`](FEATURE_DEVELOPMENT.md) 和目标功能目录中的 `PRODUCT_SPEC.md`。
+5. 根据任务范围继续读取下方对应的专项规范、平台附件、测试手册或历史记录；不要把历史记录当成现行规则。
 
 ## 稳定规范入口
 

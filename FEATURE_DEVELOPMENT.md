@@ -26,9 +26,12 @@ gh pr list --state open --limit 200
 
 ```governance-policy
 G-MAIN.reference=BRANCH_MANAGEMENT.md
+G-WORK.branch=every-task-wt
+G-WORK.main-worktree=read-only-sync
 ```
 
 - 分支、worktree、提交、PR 目标和 Hotfix 例外必须遵守 [`BRANCH_MANAGEMENT.md`](BRANCH_MANAGEMENT.md)。普通新功能 PR 的目标分支只能是 `main`。
+- 新功能的查重、设计、实现、构建、测试、截图和文档修改全部在新建的独立任务 worktree 中执行；不得先在主工作区试验再补建分支，也不得把主工作区生成的改动复制进任务分支。
 - 开发开始时必须基于最新 `origin/main`。创建 PR 前再次 fetch；如果主线前进，检查新增 diff、冲突及共享依赖影响。存在相关变化时同步主线并重新运行受影响验证；无关且无冲突时，记录最新 SHA 和判断依据即可。发布仍锁定精确主线。
 - 不得用旧分支整体覆盖主线，也不得为了减少冲突绕过当前架构、测试或产品规范。
 - PR 合入前必须确认变更仍然只包含本功能，并且没有夹带其他 worktree 或用户未提交的修改。

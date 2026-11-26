@@ -57,7 +57,7 @@ if [[ -n "$base_ref" && "$base_ref" != 0000000000000000000000000000000000000000 
   while IFS= read -r path; do
     [[ -n "$path" ]] || continue
     case "$path" in
-      AGENTS.md|BRANCH_MANAGEMENT.md|FEATURE_DEVELOPMENT.md|.github/PULL_REQUEST_TEMPLATE.md|.github/workflows/repository-governance.yml|scripts/verify-repository-governance.sh)
+      AGENTS.md|BRANCH_MANAGEMENT.md|FEATURE_DEVELOPMENT.md|.github/PULL_REQUEST_TEMPLATE.md|.github/workflows/*.yml|scripts/verify-repository-governance.sh)
         governance_changed=true
         ;;
     esac
@@ -70,7 +70,7 @@ if [[ -n "$base_ref" && "$base_ref" != 0000000000000000000000000000000000000000 
     while IFS= read -r path; do
       [[ -n "$path" ]] || continue
       case "$path" in
-        AGENTS.md|BRANCH_MANAGEMENT.md|DOCUMENTATION.md|TECHNICAL.md|TECHNICAL.en.md|FEATURE_DEVELOPMENT.md|FILE_NAMING.md|LOGGING.md|RELEASING.md|README.md|design-qa.md|design-qa.en.md|Bugs/README.md|Testing/*.md|feature/*/PRODUCT_SPEC.md|feature/*/platform-*.md|feature/*/testing.md|.github/PULL_REQUEST_TEMPLATE.md|.github/workflows/repository-governance.yml|scripts/verify-repository-governance.sh)
+        AGENTS.md|BRANCH_MANAGEMENT.md|DOCUMENTATION.md|TECHNICAL.md|TECHNICAL.en.md|FEATURE_DEVELOPMENT.md|FILE_NAMING.md|LOGGING.md|RELEASING.md|README.md|design-qa.md|design-qa.en.md|Bugs/README.md|Testing/*.md|feature/*/PRODUCT_SPEC.md|feature/*/platform-*.md|feature/*/testing.md|.github/PULL_REQUEST_TEMPLATE.md|.github/workflows/*.yml|scripts/verify-repository-governance.sh)
           ;;
         *)
           scope_violation=true
@@ -122,6 +122,7 @@ policies = {
     "BRANCH_MANAGEMENT.md": {
         "G-MAIN.start": "latest-origin-main", "G-MAIN.sync": "impact-based",
         "G-MAIN.release": "exact-approved-main", "G-WORK.pr": "single",
+        "G-WORK.branch": "every-task-wt", "G-WORK.main-worktree": "read-only-sync",
         "G-DUP.scan": "all-open-titles-labels", "G-DUP.inspect": "relevant-description-files-diff",
         "G-AUDIT.inventory": "required", "G-AUDIT.cleanup": "separate-authorization",
         "G-TODO.branch": "codex/todo_list", "G-TODO.delivery": "batch-or-draft",
@@ -136,6 +137,7 @@ policies = {
     },
     "AGENTS.md": {
         "G-DOC.entry": "DOCUMENTATION.md", "G-DOC.authority": "chinese",
+        "G-WORK.branch": "every-task-wt", "G-WORK.main-worktree": "read-only-sync",
         "G-TOOL.temporary": "forbidden", "G-TOOL.testing-executable": "forbidden",
         "G-TOOL.permanent-helper": "declared-purpose",
         "G-LOCAL.public": "developer-self-use",
@@ -157,6 +159,7 @@ policies = {
     },
     "FEATURE_DEVELOPMENT.md": {
         "G-MAIN.reference": "BRANCH_MANAGEMENT.md", "G-CI.reference": "BRANCH_MANAGEMENT.md",
+        "G-WORK.branch": "every-task-wt", "G-WORK.main-worktree": "read-only-sync",
     },
     "RELEASING.md": {"G-NOTES.content": "user-visible", "G-NOTES.unpublished": "excluded"},
 }

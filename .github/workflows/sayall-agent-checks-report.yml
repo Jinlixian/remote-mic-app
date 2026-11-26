@@ -1,10 +1,8 @@
 name: SayAll Agent Checks Report
 
 on:
-  workflow_run:
-    workflows: ["macOS CI"]
-    types: [completed]
-
+  workflow_dispatch:
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions: {}
 
 jobs:

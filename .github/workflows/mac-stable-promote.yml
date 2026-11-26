@@ -8,7 +8,7 @@ on:
         description: Existing public Preview tag to promote, for example v1.9.11
         required: true
         type: string
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 concurrency:
   # Every promotion mutates the single releases/latest pointer; serialize all
   # candidate promotions, not just repeated attempts for one Tag.
