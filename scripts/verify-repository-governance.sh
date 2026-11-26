@@ -124,7 +124,7 @@ policies = {
         "G-MAIN.release": "exact-approved-main", "G-WORK.pr": "single",
         "G-WORK.branch": "every-task-wt", "G-WORK.main-worktree": "read-only-sync",
         "G-DUP.scan": "all-open-titles-labels", "G-DUP.inspect": "relevant-description-files-diff",
-        "G-AUDIT.inventory": "required", "G-AUDIT.cleanup": "separate-authorization",
+        "G-AUDIT.inventory": "required", "G-AUDIT.cleanup": "current-task-after-merge",
         "G-TODO.branch": "codex/todo_list", "G-TODO.delivery": "batch-or-draft",
         "G-TODO.product": "forbidden", "G-WORK.commit": "single",
         "G-ASSET.threshold": "5MB", "G-ASSET.authorization": "file-or-bounded-budget",

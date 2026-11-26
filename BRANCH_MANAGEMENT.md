@@ -35,7 +35,7 @@ G-WORK.main-worktree=read-only-sync
 5. **创建 PR**：通过下方“PR 创建门禁”后 Push 分支并创建目标为远端 `main` 的 PR。可以提前创建 Draft PR 供审查。默认须完成本地验证、必要文档和必需 CI 才能 Ready 或合入；用户明确授权的 CI 例外见下方“用户明确授权的 CI 例外”，其他验收门禁仍适用。
 6. **更新基线**：PR 准备 Ready 前重新 fetch `origin/main`。主线前进时检查新增 diff 和合并冲突。存在冲突、共享依赖或相关行为变化时，先同步主线并重跑受影响验证；仅有无关变化时可保留分支基线，在 PR 记录最新主线 SHA、无冲突检查及影响判断。发布仍使用精确的最新已批准主线。
 7. **合入**：功能和 Bug 工作默认在 PR 审查完成且所有必需检查通过后合入 `main`；用户明确授权的 CI 例外按下节执行，合并方式遵守本文件的 PR 合并策略。
-8. **合入后收尾**：合入完成后 fetch 远端，将本地 `main` 快进到 `origin/main`，确认两者 SHA 一致并记录合入 commit。已合入分支和 worktree 先标记为已完成，清理或删除必须单独确认，不能借整理之名删除未核对的工作。
+8. **合入后收尾**：用户要求合并到主分支且合并成功后，必须立即清理本次新建的任务分支、任务 worktree、本次生成的编译垃圾和临时痕迹；先精确核对目标确属本次任务，再删除本地分支和 worktree，不得残留“已完成”的临时现场。若 `main` 尚未 Push，仍应清理本次任务分支，但不能因此自动 Push、删除远端分支或扩大到其他历史 worktree。非本次任务、用户已有工作或其他分支的编译产物保持原样。
 
 ## 用户明确授权的 CI 例外
 
@@ -74,11 +74,11 @@ G-DUP.inspect=relevant-description-files-diff
 
 ```governance-policy
 G-AUDIT.inventory=required
-G-AUDIT.cleanup=separate-authorization
+G-AUDIT.cleanup=current-task-after-merge
 ```
 
 - worktree 数量多、分支落后或存在未合入分支，不等于当前功能代码未提交；但每次开始新任务前必须识别当前 worktree、分支、基线和未提交改动，不能把历史 worktree 当作当前任务的干净基线。
-- 规则文档不能自动修复历史分支和 worktree。发现 `ahead/behind`、未跟踪文件、未提交改动或已合入但仍保留的旧 worktree 时，先建立清单和归属，再按用户批准的方案逐项处理。
+- 用户要求合并到主分支且合并成功后，属于本次任务的分支、worktree、编译产物和临时痕迹必须立即清理；不属于本次任务的 `ahead/behind`、未跟踪文件、未提交改动或历史 worktree 仍须先建立清单和归属，再按用户批准的方案逐项处理。
 - 未经核对不得批量删除、清空、reset、rebase 或强制 Push 分支；尤其不能为了让列表变短而破坏仍可能包含用户工作的 worktree。
 
 ## TODO-only 工作流程
