@@ -13,6 +13,7 @@
 ## 新功能开发基线与查重
 
 - [ ] 不适用：此 PR 不是新功能。
+- [ ] 本 PR 的全部新建、运行和修改均在使用 `wt switch --create <任务分支> --base origin/main` 创建的独立任务 worktree 中完成；worktree 位于 `~/worktrees/remote-mic-app/<分支名>/`，`main` 工作区只用于同步或只读检查。
 - [ ] 已执行 `git fetch origin main`，并从最新 `origin/main` 创建本功能的独立分支和持久化 worktree。
 - [ ] 已在提交 PR 前检查最新 `origin/main`，记录影响判断，并按需同步和验证。
 - [ ] 已扫描全部 Open PR 标题和标签，详细检查相关候选的描述、文件和必要 Diff。

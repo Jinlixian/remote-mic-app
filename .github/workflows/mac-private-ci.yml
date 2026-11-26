@@ -2,7 +2,7 @@ name: macOS private integration CI
 
 on:
   workflow_dispatch:
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions:
   contents: read
 

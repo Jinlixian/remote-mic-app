@@ -3,9 +3,8 @@ name: SayAll Agent Develop
 run-name: SayAll Agent develop ${{ github.event.client_payload.run_id || github.run_id }}
 
 on:
-  repository_dispatch:
-    types: [sayall-agent-develop]
-
+  workflow_dispatch:
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions: {}
 
 concurrency:

@@ -12,10 +12,14 @@ PR 的 `governance` 块使用稳定字段。每个字段只出现一次；填写
 G-MAIN.start=latest-origin-main
 G-MAIN.sync=impact-based
 G-MAIN.release=exact-approved-main
+G-WORK.branch=every-task-wt
+G-WORK.main-worktree=read-only-sync
 ```
 
-- 开始任何操作前执行 git fetch origin main，并记录 origin/main 的完整 SHA。
-- main 工作区只用于同步已合入的远端主线，不直接开发、保存临时改动或准备版本元数据。
+- 开始任何操作前执行 `git fetch origin main`，记录 `origin/main` 的完整 SHA，并用 Worktrunk 执行 `wt switch --create <任务分支> --base origin/main`。任务 worktree 必须由 Worktrunk 按用户集中目录配置创建在 `~/worktrees/remote-mic-app/<分支名>/`；不得用 `git worktree add` 在仓库旁创建兄弟目录，也不得用 `--path` 绕过集中目录。
+- **每个任务都必须创建独立分支和持久化 worktree，并在该分支中完成新建、运行和修改。** 任务包括功能、Bug、文档、规范、配置、发布准备、自动化调查和临时诊断；不得因为规模小、只改一个文件或只运行一次脚本而豁免。分支必须从当时最新的 `origin/main` 创建，不能从 `main` 工作区、旧任务分支或另一个任务的中途状态派生。
+- main 工作区只用于同步已合入的远端主线，不直接开发、保存临时改动或准备版本元数据，也不在其中执行会生成、修改或删除仓库文件的构建、测试、脚本和工具。只读的 `git` 查询、文档阅读和状态审计不在此限。
+- 同一已批准工作项可以在既有任务分支继续修改，不必为每个步骤重复建分支；复用前必须确认分支仍属于同一工作项、基线仍然适用且工作区没有夹带其他任务。`codex/todo_list` 与 Hotfix 仍按本文件下方专用流程执行。
 - 功能、Bug、发布流程和文档改动都在独立分支和持久化 worktree 中完成；分支创建点必须是当时最新的 origin/main。唯一例外是下方 TODO-only 流程使用长期共享分支 `codex/todo_list`，但仍必须通过 PR 合入 `main`。
 - 除 Hotfix 的临时审核 PR 外，PR 的目标分支只能是远端 main。合入后再次 fetch，确认本地 main 与 origin/main 精确一致。
 - `main` 必须始终处于可发布状态；未完成必要验收的功能不得先合入再等待发布分支筛选。

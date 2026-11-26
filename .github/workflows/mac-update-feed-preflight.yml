@@ -8,7 +8,7 @@ on:
         description: Existing public tag for a no-deployment readiness check
         required: true
         type: string
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions:
   contents: read
 

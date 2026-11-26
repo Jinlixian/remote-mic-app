@@ -1,12 +1,8 @@
 name: Sync release history labels
 
 on:
-  release:
-    types: [published, prereleased, released, edited]
-  schedule:
-    - cron: "41 3 */3 * *"
   workflow_dispatch:
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 concurrency:
   group: release-history-labels
   cancel-in-progress: false

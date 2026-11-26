@@ -12,7 +12,7 @@ on:
         description: Base64-encoded real Sparkle UI attestation
         required: true
         type: string
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 concurrency:
   group: mac-preview-publication-${{ inputs.source_run_id }}
   cancel-in-progress: false

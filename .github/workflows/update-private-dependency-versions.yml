@@ -2,9 +2,7 @@ name: Update private dependency versions
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * 1"
-
+  # temporary: all automatic triggers disabled; manual dispatch retained
 permissions:
   contents: write
   pull-requests: write
